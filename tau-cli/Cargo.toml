@@ -1,0 +1,23 @@
+[package]
+name = "tau-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "tau — command-line entrypoint (daemon + clients)"
+
+[[bin]]
+name = "tau"
+path = "src/main.rs"
+
+[dependencies]
+tau-core.workspace = true
+tau-server.workspace = true
+tau-client.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true

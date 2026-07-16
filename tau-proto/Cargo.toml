@@ -1,0 +1,12 @@
+[package]
+name = "tau-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "tau — JSON-RPC 2.0 wire protocol (shared by server and clients)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

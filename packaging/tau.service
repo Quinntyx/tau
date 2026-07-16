@@ -1,0 +1,20 @@
+# systemd USER service for the tau daemon.
+# Install to: ~/.config/systemd/user/tau.service
+# Enable with: systemctl --user enable --now tau.service
+#
+# This is the first-class daemon deployment path (see ROADMAP.md).
+# Type=notify (sd_notify READY=1) and socket-activation arrive in M14.
+
+[Unit]
+Description=tau agent daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/tau serve
+# Default socket resolves to $XDG_RUNTIME_DIR/tau.sock (fallback ~/.tau/tau.sock).
+# Override with: ExecStart=%h/bin/tau serve --socket %h/.tau/tau.sock
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

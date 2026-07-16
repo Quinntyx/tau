@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    "tau-core",
+    "tau-proto",
+    "tau-server",
+    "tau-client",
+    "tau-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0"
+authors = ["Henry"]
+repository = "https://github.com/henry/tau"
+
+[workspace.dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "io-util",
+    "sync",
+    "time",
+    "fs",
+] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "handshake",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+fd-lock = "4"
+tempfile = "3"
+toml = "0.8"
+keyring = "3"
+
+# internal
+tau-proto = { path = "tau-proto", version = "0.1.0" }
+tau-core = { path = "tau-core", version = "0.1.0" }
+tau-client = { path = "tau-client", version = "0.1.0" }
+tau-server = { path = "tau-server", version = "0.1.0" }

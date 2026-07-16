@@ -1,0 +1,24 @@
+[package]
+name = "tau-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "tau — long-running agent daemon (axum WebSocket JSON-RPC)"
+
+[dependencies]
+tau-proto.workspace = true
+tau-core.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+fd-lock.workspace = true
+
+[dev-dependencies]
+tau-client.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
