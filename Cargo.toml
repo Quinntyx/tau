@@ -44,6 +44,9 @@ fd-lock = "4"
 tempfile = "3"
 toml = "0.8"
 keyring = "3"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6"
+uuid = { version = "1", features = ["v4"] }
 
 # internal
 tau-proto = { path = "tau-proto", version = "0.1.0" }

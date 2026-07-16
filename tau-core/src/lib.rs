@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod credentials;
+pub mod db;
 
 use std::path::PathBuf;
 

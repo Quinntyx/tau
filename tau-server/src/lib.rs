@@ -26,18 +26,24 @@ use tokio::net::UnixListener;
 pub struct AppState {
     started: Instant,
     config: Arc<tau_core::config::Config>,
+    db: Arc<tau_core::db::Db>,
 }
 
 impl AppState {
-    pub fn new(config: Arc<tau_core::config::Config>) -> Self {
+    pub fn new(config: Arc<tau_core::config::Config>, db: tau_core::db::Db) -> Self {
         Self {
             started: Instant::now(),
             config,
+            db: Arc::new(db),
         }
     }
 
     pub fn config(&self) -> &tau_core::config::Config {
         &self.config
+    }
+
+    pub fn db(&self) -> &tau_core::db::Db {
+        &self.db
     }
 
     pub fn started(&self) -> Instant {
@@ -47,7 +53,9 @@ impl AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new(Arc::new(tau_core::config::Config::default()))
+        let db = tau_core::db::Db::open_in_memory()
+            .expect("AppState::default must open an in-memory database");
+        Self::new(Arc::new(tau_core::config::Config::default()), db)
     }
 }
 
@@ -128,7 +136,19 @@ pub async fn run(socket_path: PathBuf) -> Result<()> {
             tau_core::config::Config::default()
         }
     };
-    let state = AppState::new(Arc::new(config));
+    let state = {
+        let db = match tau_core::db::Db::open(&tau_core::db::default_db_path()?) {
+            Ok(d) => {
+                tracing::info!("database opened");
+                d
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to open database");
+                return Err(e);
+            }
+        };
+        AppState::new(Arc::new(config), db)
+    };
 
     // Stale-socket cleanup is safe: we hold the single-instance lock, so any
     // pre-existing socket file cannot belong to another live daemon.

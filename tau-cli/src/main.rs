@@ -38,6 +38,8 @@ enum Command {
     Gui,
     /// Edit configuration (not yet implemented).
     Config,
+    /// Resume a previous session (not yet implemented).
+    Resume,
 }
 
 #[derive(Subcommand)]
@@ -113,5 +115,6 @@ async fn main() -> Result<()> {
         Command::Tui => bail!("`tau tui` is not implemented yet"),
         Command::Gui => bail!("`tau gui` is not implemented yet"),
         Command::Config => bail!("`tau config` is not implemented yet"),
+        Command::Resume => bail!("`tau resume` is not implemented yet"),
     }
 }
