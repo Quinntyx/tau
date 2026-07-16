@@ -16,6 +16,7 @@ keyring.workspace = true
 rusqlite.workspace = true
 rusqlite_migration.workspace = true
 uuid.workspace = true
+strum.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

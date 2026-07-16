@@ -15,10 +15,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use tau_proto::{
-    HealthResult, Id, JsonRpc, METHOD_HEALTH, METHOD_NOT_FOUND, METHOD_PING, PARSE_ERROR, Request,
-    Response,
-};
+use tau_proto::prelude::*;
 use tokio::net::UnixListener;
 
 /// Per-process server state shared with every connection.

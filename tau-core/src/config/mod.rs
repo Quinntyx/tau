@@ -31,15 +31,14 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
 }
 
-/// Default config file path: `$XDG_CONFIG_HOME/tau/config.toml` (or
-/// `~/.config/tau/config.toml`).
+/// Default config file path: `$XDG_CONFIG_HOME/tau/config.toml`.
 pub fn config_path() -> Result<PathBuf> {
     let base = dirs::config_dir().context("could not determine config directory")?;
     Ok(base.join("tau").join("config.toml"))
 }
 
 impl Config {
-    /// Load config from the default path. Missing file ⇒ defaults (not an error).
+    /// Load config from the default path. Missing file ⇒ defaults.
     pub fn load() -> Result<Config> {
         let path = config_path()?;
         Self::load_from(&path)
@@ -60,50 +59,4 @@ impl Config {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_file_is_default() {
-        let cfg = Config::load_from(Path::new("/nonexistent/tau/config.toml")).unwrap();
-        assert!(cfg.model.is_none());
-        assert!(cfg.providers.is_empty());
-    }
-
-    #[test]
-    fn parses_minimal() {
-        let text = r#"
-            model = "claude-opus"
-            default_agent = "plan"
-
-            [providers.anthropic]
-            api_base = "https://custom.example.com"
-            api_key_env = "MY_ANTHROPIC_KEY"
-        "#;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("config.toml");
-        std::fs::write(&p, text).unwrap();
-        let cfg = Config::load_from(&p).unwrap();
-        assert_eq!(cfg.model.as_deref(), Some("claude-opus"));
-        assert_eq!(cfg.default_agent.as_deref(), Some("plan"));
-        let anthropic = cfg.providers.get("anthropic").unwrap();
-        assert_eq!(
-            anthropic.api_base.as_deref(),
-            Some("https://custom.example.com")
-        );
-        assert_eq!(anthropic.api_key_env.as_deref(), Some("MY_ANTHROPIC_KEY"));
-    }
-
-    #[test]
-    fn unknown_fields_ignored() {
-        let text = r#"
-            model = "x"
-            future_field = "ignored"
-        "#;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("config.toml");
-        std::fs::write(&p, text).unwrap();
-        let cfg = Config::load_from(&p).unwrap();
-        assert_eq!(cfg.model.as_deref(), Some("x"));
-    }
-}
+mod tests;

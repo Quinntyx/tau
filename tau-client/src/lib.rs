@@ -10,9 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use tau_proto::{
-    HealthResult, Id, JsonRpc, METHOD_HEALTH, METHOD_PING, Notification, Request, Response,
-};
+use tau_proto::prelude::*;
 use tokio::net::UnixStream;
 use tokio_tungstenite::WebSocketStream;
 
