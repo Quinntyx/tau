@@ -33,6 +33,26 @@ pub enum ToolError {
     InvalidInput(String),
     #[error("tool serialization failed: {0}")]
     Serialization(String),
+    #[error("stale file revision for {path}: expected {expected}, actual {actual}")]
+    StaleRevision {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("stale hashline reference for {path}: {message}")]
+    StaleReference { path: PathBuf, message: String },
+    #[error("invalid edit: {0}")]
+    InvalidEdit(String),
+    #[error("overlapping edit operations")]
+    OverlappingEdit,
+    #[error("directory is not empty: {0}")]
+    DirectoryNotEmpty(PathBuf),
+    #[error("target already exists: {0}")]
+    AlreadyExists(PathBuf),
+    #[error("command timed out after {0} seconds")]
+    CommandTimeout(u64),
+    #[error("snapshot failed: {0}")]
+    Snapshot(String),
 }
 
 pub(crate) fn io(

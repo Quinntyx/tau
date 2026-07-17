@@ -68,10 +68,13 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn with_builtins() -> Result<Self, ToolError> {
         let mut registry = Self::default();
+        registry.register(super::bash::BashTool)?;
+        registry.register(super::edit::EditTool)?;
         registry.register(super::glob::GlobTool)?;
         registry.register(super::grep::GrepTool)?;
         registry.register(super::list::ListTool)?;
         registry.register(super::read::ReadTool)?;
+        registry.register(super::write::WriteTool)?;
         Ok(registry)
     }
 

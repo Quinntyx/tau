@@ -85,10 +85,11 @@ fn read_file(
         path: path.to_path_buf(),
         mime,
     })?;
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     let offset = input.offset.unwrap_or(1);
     let limit = input.limit.unwrap_or(context.limits.read_lines);
     let rendered = hashline::render_file(
-        &raw,
+        raw,
         path,
         offset,
         limit,
@@ -96,7 +97,7 @@ fn read_file(
         context.limits.read_bytes,
     )
     .map_err(ToolError::InvalidInput)?;
-    let parsed = hashline::parse_file(&raw);
+    let parsed = hashline::parse_file(raw);
     let start = offset.saturating_sub(1).min(parsed.lines.len());
     let end = (start + limit).min(parsed.lines.len());
     Ok(ReadOutput::File(FileRead {
@@ -138,6 +139,9 @@ pub(crate) fn directory_entries(path: &Path) -> Result<Vec<DirectoryEntry>, Tool
     for entry in std::fs::read_dir(path).map_err(|e| io("list", path, e))? {
         let entry = entry.map_err(|e| io("list", path, e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".tau" {
+            continue;
+        }
         let kind = entry_kind(&entry.path()).map_err(|e| io("stat", entry.path(), e))?;
         names.push((name, kind));
     }

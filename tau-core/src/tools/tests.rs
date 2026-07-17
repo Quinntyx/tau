@@ -1,10 +1,25 @@
 use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use tempfile::tempdir;
 
 use super::hashline::{anchor_hash, line_hash, parse_ref, render_directory, render_file};
 use super::*;
+
+fn local_fixture(name: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("m5-fixtures")
+        .join(format!("{name}-{}-{stamp}", std::process::id()));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
 
 #[test]
 fn default_limits_match_m4_contract() {
@@ -204,5 +219,167 @@ fn builtin_registry_exposes_all_m4_tools() {
         .into_iter()
         .map(|descriptor| descriptor.name)
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["glob", "grep", "list", "read"]);
+    assert_eq!(
+        names,
+        vec!["bash", "edit", "glob", "grep", "list", "read", "write"]
+    );
+}
+
+#[test]
+fn edit_validates_hashlines_and_preserves_crlf_and_bom() {
+    let root = local_fixture("edit-file");
+    let path = root.join("file.txt");
+    fs::write(&path, b"\xef\xbb\xbfone\r\ntwo\r\n").unwrap();
+    let context = ToolContext::new(&root).unwrap();
+    let read = match ReadTool
+        .execute(
+            ReadInput {
+                file_path: "file.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            &context,
+        )
+        .unwrap()
+    {
+        ReadOutput::File(read) => read,
+        _ => panic!("expected text file"),
+    };
+    let reference = read
+        .rendered
+        .lines()
+        .find(|line| line.starts_with("#HL 1#"))
+        .unwrap()
+        .split('|')
+        .next()
+        .unwrap()
+        .to_string();
+    EditTool
+        .execute(
+            EditInput {
+                path: "file.txt".into(),
+                content: Some("#HL REV:ignored\n#HL 1#ignored#ignored|updated".into()),
+                reference: Some(reference),
+                start_ref: None,
+                end_ref: None,
+                file_rev: Some(read.rev),
+                safe_reapply: None,
+                operations: None,
+            },
+            &context,
+        )
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfupdated\r\ntwo\r\n");
+}
+
+#[test]
+fn edit_rejects_stale_revision_and_supports_directory_operations() {
+    let root = local_fixture("edit-directory");
+    let directory = root.join("workspace");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("old.txt"), "old").unwrap();
+    let context = ToolContext::new(&root).unwrap();
+    let read = match ReadTool
+        .execute(
+            ReadInput {
+                file_path: "workspace".into(),
+                offset: None,
+                limit: None,
+            },
+            &context,
+        )
+        .unwrap()
+    {
+        ReadOutput::Directory(read) => read,
+        _ => panic!("expected directory"),
+    };
+    let reference = read
+        .rendered
+        .lines()
+        .find(|line| line.contains("|01|old.txt"))
+        .unwrap()
+        .split('|')
+        .next()
+        .unwrap()
+        .to_string();
+    EditTool
+        .execute(
+            EditInput {
+                path: "workspace".into(),
+                content: None,
+                reference: None,
+                start_ref: None,
+                end_ref: None,
+                file_rev: Some(read.rev.clone()),
+                safe_reapply: None,
+                operations: Some(vec![EditOperation {
+                    op: Some("rename".into()),
+                    reference: Some(reference),
+                    start_ref: None,
+                    end_ref: None,
+                    content: None,
+                    parent: None,
+                    name: Some("new.txt".into()),
+                    kind: None,
+                }]),
+            },
+            &context,
+        )
+        .unwrap();
+    assert!(directory.join("new.txt").exists());
+    assert!(!directory.join("old.txt").exists());
+
+    fs::write(root.join("stale.txt"), "one\ntwo\n").unwrap();
+    let stale = EditTool.execute(
+        EditInput {
+            path: "stale.txt".into(),
+            content: Some("changed".into()),
+            reference: Some("#HL 1#000#000".into()),
+            start_ref: None,
+            end_ref: None,
+            file_rev: Some("00000000".into()),
+            safe_reapply: None,
+            operations: None,
+        },
+        &context,
+    );
+    assert!(matches!(stale, Err(ToolError::StaleRevision { .. })));
+}
+
+#[test]
+fn write_is_atomic_and_bash_reports_classification() {
+    let root = local_fixture("write-bash");
+    let context = ToolContext::new(&root).unwrap();
+    let written = WriteTool
+        .execute(
+            WriteInput {
+                path: "nested/file.txt".into(),
+                content: "hello".into(),
+            },
+            &context,
+        )
+        .unwrap();
+    assert!(!written.existed);
+    assert_eq!(
+        fs::read_to_string(root.join("nested/file.txt")).unwrap(),
+        "hello"
+    );
+    assert!(root.join(".tau/snapshots").exists());
+
+    let output = BashTool
+        .execute(
+            BashInput {
+                command: "printf 'hello'".into(),
+                workdir: None,
+                timeout: Some(5),
+            },
+            &context,
+        )
+        .unwrap();
+    assert_eq!(output.stdout, "hello");
+    assert_eq!(output.classification, CommandClass::ReadOnly);
+    assert_eq!(
+        classify_command("sed -i 's/a/b/' file.txt"),
+        CommandClass::PotentialMutation
+    );
 }

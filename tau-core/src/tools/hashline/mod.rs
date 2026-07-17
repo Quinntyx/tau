@@ -92,6 +92,39 @@ pub fn parse_file(raw: &str) -> ParsedFile {
     }
 }
 
+pub fn stringify_file(parsed: &ParsedFile, lines: &[String]) -> String {
+    let mut text = lines.join(parsed.eol);
+    if parsed.ends_with_newline {
+        text.push_str(parsed.eol);
+    }
+    text
+}
+
+pub fn replacement_lines(content: &str) -> Vec<String> {
+    let content = strip_references(content).replace("\r\n", "\n");
+    let mut lines = content.split('\n').map(str::to_owned).collect::<Vec<_>>();
+    if content.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+}
+
+pub fn strip_references(content: &str) -> String {
+    content
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with("#HL REV:") {
+                return None;
+            }
+            if let Some(rest) = line.strip_prefix("#HL ") {
+                return rest.split_once('|').map(|(_, text)| text.to_string());
+            }
+            Some(line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn parse_ref(reference: &str) -> Result<ParsedRef, String> {
     let text = reference
         .trim()
@@ -216,17 +249,7 @@ pub fn render_directory(
     limit: usize,
 ) -> RenderedDirectory {
     let width = entries.len().max(10).to_string().len();
-    let raw_lines = entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "{:0width$}|{}",
-                entry.id,
-                display_entry(entry),
-                width = width
-            )
-        })
-        .collect::<Vec<_>>();
+    let raw_lines = directory_lines_with_width(entries, width);
     let raw = raw_lines.join("\n");
     let rev = compute_file_rev(&raw);
     let hash_length = adaptive_hash_length(entries.len());
@@ -276,6 +299,25 @@ pub fn render_directory(
         total_entries: entries.len(),
         truncated,
     }
+}
+
+pub fn directory_lines(entries: &[DirectoryEntry]) -> Vec<String> {
+    let width = entries.len().max(10).to_string().len();
+    directory_lines_with_width(entries, width)
+}
+
+fn directory_lines_with_width(entries: &[DirectoryEntry], width: usize) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{:0width$}|{}",
+                entry.id,
+                display_entry(entry),
+                width = width
+            )
+        })
+        .collect()
 }
 
 fn display_entry(entry: &DirectoryEntry) -> String {

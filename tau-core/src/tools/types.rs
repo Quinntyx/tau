@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::mutation::MutationCoordinator;
 use super::policy::AccessPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +14,9 @@ pub struct ToolLimits {
     pub glob_results: usize,
     pub directory_entries: usize,
     pub binary_bytes: usize,
+    pub bash_lines: usize,
+    pub bash_bytes: usize,
+    pub bash_timeout_seconds: u64,
 }
 
 impl Default for ToolLimits {
@@ -25,6 +29,9 @@ impl Default for ToolLimits {
             glob_results: 100,
             directory_entries: 2_000,
             binary_bytes: 50 * 1024,
+            bash_lines: 2_000,
+            bash_bytes: 50 * 1024,
+            bash_timeout_seconds: 120,
         }
     }
 }
@@ -34,6 +41,7 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     pub policy: AccessPolicy,
     pub limits: ToolLimits,
+    pub mutation: MutationCoordinator,
 }
 
 impl ToolContext {
@@ -43,6 +51,7 @@ impl ToolContext {
             policy: AccessPolicy::for_cwd(&cwd)?,
             cwd,
             limits: ToolLimits::default(),
+            mutation: MutationCoordinator::default(),
         })
     }
 
