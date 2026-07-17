@@ -1,8 +1,9 @@
 //! tau — command-line entrypoint.
 //!
 //! `tau serve` runs the long-running daemon. `tau ping` / `tau health` are
-//! debug helpers that connect via `tau-client`. The TUI/GUI/auth/config
-//! subcommands are stubbed so the dispatcher shape exists for later milestones.
+//! debug helpers that connect via `tau-client`. The TUI/auth/config subcommands
+//! remain staged for later milestones; `tau gui` launches the local model-turn
+//! browser client.
 
 use std::path::PathBuf;
 
@@ -34,7 +35,7 @@ enum Command {
     },
     /// Launch the TUI (not yet implemented).
     Tui,
-    /// Launch the GUI (not yet implemented).
+    /// Launch the local model-turn GUI.
     Gui,
     /// Edit configuration (not yet implemented).
     Config,
