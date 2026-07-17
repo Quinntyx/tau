@@ -25,7 +25,7 @@ pub use list::{ListInput, ListTool};
 pub use mutation::MutationCoordinator;
 pub use policy::{AccessPolicy, ResolvedPath};
 pub use read::{ReadInput, ReadTool};
-pub use registry::{Tool, ToolDescriptor, ToolRegistry, ToolResult};
+pub use registry::{Tool, ToolDescriptor, ToolRegistry, ToolResult, schema_for};
 pub use snapshot::{SnapshotCapture, SnapshotStore};
 pub use types::{
     BinaryRead, DirectoryEntry, DirectoryRead, EntryKind, FileRead, GlobOutput, GrepMatch,
