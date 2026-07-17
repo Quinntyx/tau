@@ -147,6 +147,15 @@ pub enum TurnEvent {
         turn_id: String,
         output: BoundedOutput,
     },
+    PermissionRequested {
+        turn_id: String,
+        tool: String,
+        description: String,
+    },
+    QuestionAsked {
+        turn_id: String,
+        question: String,
+    },
     ArtifactCreated {
         turn_id: String,
         artifact: ArtifactReference,

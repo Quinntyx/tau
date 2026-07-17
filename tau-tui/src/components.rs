@@ -73,11 +73,17 @@ fn picker(frame: &mut Frame, s: &AppState) {
             .map(|m| ListItem::new(format!("{} {}", if m.favorite { "★" } else { " " }, m.id)))
             .collect()
     } else if s.picker == Picker::Commands {
-        ["/agent <name>", "/agents", "/model <id>", "/help", "/replay"]
-            .iter()
-            .filter(|command| s.picker_query.is_empty() || command.contains(&s.picker_query))
-            .map(|command| ListItem::new(*command))
-            .collect()
+        [
+            "/agent <name>",
+            "/agents",
+            "/model <id>",
+            "/help",
+            "/replay",
+        ]
+        .iter()
+        .filter(|command| s.picker_query.is_empty() || command.contains(&s.picker_query))
+        .map(|command| ListItem::new(*command))
+        .collect()
     } else {
         s.agents
             .iter()
@@ -86,8 +92,8 @@ fn picker(frame: &mut Frame, s: &AppState) {
             .collect()
     };
     let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(list, area);
 }
 fn permission(frame: &mut Frame, p: &Permission) {

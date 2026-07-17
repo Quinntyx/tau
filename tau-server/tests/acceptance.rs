@@ -192,7 +192,7 @@ async fn websocket_protocol_negotiation_and_scripted_provider_round_trip() -> Re
     assert_eq!(provider.calls, ["plan?"]);
 
     let fixture = fixtures::ServerFixture::start().await?;
-    let mut client = fixtures::client(&fixture).await?;
+    let client = fixtures::client(&fixture).await?;
     assert_eq!(client.ping().await?, "pong");
     let negotiated = client.negotiate(request.clone()).await?;
     assert_eq!(negotiated.version.major, 1);

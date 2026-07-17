@@ -60,7 +60,9 @@ async fn session(
         let input = event::read()?;
         let action = match input {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if matches!(key.code, KeyCode::Esc) { break; }
+                if matches!(key.code, KeyCode::Esc) {
+                    break;
+                }
                 reducer::key_action(&state, key)
             }
             Event::Mouse(mouse) => reducer::mouse_action(&state, mouse),

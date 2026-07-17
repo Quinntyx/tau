@@ -202,11 +202,22 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         }
         Action::ClosePicker => s.picker = Picker::None,
         Action::Query(c) => s.picker_query.push(c),
-        Action::QueryBackspace => { s.picker_query.pop(); s.picker_index = 0; }
+        Action::QueryBackspace => {
+            s.picker_query.pop();
+            s.picker_index = 0;
+        }
         Action::MovePicker(delta) => {
-            let count = if s.picker == Picker::Models { filtered_models(s).len() } else { s.agents.len() };
+            let count = if s.picker == Picker::Models {
+                filtered_models(s).len()
+            } else {
+                s.agents.len()
+            };
             if count > 0 {
-                s.picker_index = if delta < 0 { s.picker_index.saturating_sub(1) } else { (s.picker_index + 1).min(count - 1) };
+                s.picker_index = if delta < 0 {
+                    s.picker_index.saturating_sub(1)
+                } else {
+                    (s.picker_index + 1).min(count - 1)
+                };
             }
         }
         Action::Pick => {
@@ -218,7 +229,11 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                     s.recent_models.truncate(8);
                 }
             } else if s.picker == Picker::Agents {
-                if let Some(a) = s.agents.iter().find(|a| a.to_lowercase().contains(&s.picker_query.to_lowercase())) {
+                if let Some(a) = s
+                    .agents
+                    .iter()
+                    .find(|a| a.to_lowercase().contains(&s.picker_query.to_lowercase()))
+                {
                     s.agent = a.clone();
                 }
             } else if s.picker == Picker::Commands && !s.picker_query.trim().is_empty() {
@@ -315,7 +330,8 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
     None
 }
 pub fn filtered_models(s: &AppState) -> Vec<&Model> {
-    let mut models: Vec<&Model> = s.models
+    let mut models: Vec<&Model> = s
+        .models
         .iter()
         .filter(|m| {
             s.picker_query.is_empty()
@@ -331,8 +347,12 @@ pub fn filtered_models(s: &AppState) -> Vec<&Model> {
 pub fn params(s: &AppState, prompt: String, cwd: Option<String>) -> TurnStartParams {
     let idempotency_key = IdempotencyKey::new(format!("tau-tui-{}", uuid_like(prompt.as_bytes())));
     let action = if prompt.starts_with('/') {
-        RequestAction::Command { command: prompt.clone() }
-    } else { RequestAction::Submit };
+        RequestAction::Command {
+            command: prompt.clone(),
+        }
+    } else {
+        RequestAction::Submit
+    };
     TurnStartParams {
         model: s.model.clone(),
         prompt,

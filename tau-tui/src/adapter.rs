@@ -38,12 +38,14 @@ impl ScriptedClient {
                     status: crate::state::ToolStatus::Complete,
                     expanded: false,
                 }),
-                ClientEvent::Permission { tool, summary } => s.permission = Some(crate::state::Permission {
-                    tool: tool.clone(),
-                    summary: summary.clone(),
-                    choice: crate::state::PermissionChoice::AllowOnce,
-                    stage: crate::state::PermissionStage::Choose,
-                }),
+                ClientEvent::Permission { tool, summary } => {
+                    s.permission = Some(crate::state::Permission {
+                        tool: tool.clone(),
+                        summary: summary.clone(),
+                        choice: crate::state::PermissionChoice::AllowOnce,
+                        stage: crate::state::PermissionStage::Choose,
+                    })
+                }
                 ClientEvent::Disconnected => s.connection = Connection::Disconnected,
                 ClientEvent::Reconnected => s.connection = Connection::Connected,
             }
@@ -120,6 +122,19 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
             status: crate::state::ToolStatus::Complete,
             expanded: false,
         }),
+        TurnEvent::PermissionRequested {
+            tool, description, ..
+        } => {
+            s.permission = Some(crate::state::Permission {
+                tool,
+                summary: description,
+                choice: crate::state::PermissionChoice::AllowOnce,
+                stage: crate::state::PermissionStage::Choose,
+            });
+        }
+        TurnEvent::QuestionAsked { question, .. } => {
+            s.transcript.push(format!("tau question: {question}"));
+        }
         TurnEvent::ArtifactCreated { artifact, .. } => s.transcript.push(format!(
             "artifact {} ({})",
             artifact.artifact_id, artifact.media_type

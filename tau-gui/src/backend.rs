@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
-use tau_proto::prelude::{IdempotencyKey, TurnCancelParams, TurnReplayParams, TurnStartParams};
+use tau_proto::prelude::{
+    IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams, TurnStartParams,
+};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -162,6 +164,9 @@ impl Backend {
                     session_id,
                     cwd: Some(cwd),
                     agent,
+                    task_tier: None,
+                    autonomous: None,
+                    action: Some(RequestAction::Submit),
                     idempotency_key: IdempotencyKey::new(format!(
                         "gui-{}",
                         std::time::SystemTime::now()

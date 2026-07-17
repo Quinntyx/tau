@@ -153,11 +153,11 @@ async fn handle_request(req: Request, state: &AppState, out: &mpsc::Sender<Messa
                 ))
                 .unwrap_or_default();
             };
-            if params.version.major != 1 {
+            if params.version.major != 1 || params.version.minor > 0 {
                 return serde_json::to_string(&Response::<serde_json::Value>::err(
                     id,
                     INVALID_PARAMS,
-                    "unsupported protocol major version",
+                    "unsupported protocol version",
                 ))
                 .unwrap_or_default();
             }
