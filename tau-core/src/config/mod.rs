@@ -61,14 +61,24 @@ impl Config {
             }
         }
         for (name, agent) in &self.agents {
-            if agent.primary
-                && agent
-                    .compaction_agent
-                    .as_deref()
-                    .unwrap_or_default()
-                    .is_empty()
-            {
+            if !agent.primary {
+                continue;
+            }
+            let Some(compaction_name) = agent.compaction_agent.as_deref() else {
                 anyhow::bail!("primary agent {name} must declare compaction_agent");
+            };
+            if compaction_name.is_empty() {
+                anyhow::bail!("primary agent {name} must declare compaction_agent");
+            }
+            let Some(compaction) = self.agents.get(compaction_name) else {
+                anyhow::bail!(
+                    "primary agent {name} references unknown compaction agent {compaction_name}"
+                );
+            };
+            if compaction.primary || compaction_name == name {
+                anyhow::bail!(
+                    "compaction agent {compaction_name} for {name} must be non-primary and distinct"
+                );
             }
         }
         Ok(())

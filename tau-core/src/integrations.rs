@@ -124,11 +124,20 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default = "default_restart_limit")]
+    pub max_restarts: u32,
 }
 fn default_timeout() -> u64 {
     30_000
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_restart_limit() -> u32 {
+    3
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpTool {
     pub name: String,
     #[serde(default)]
@@ -142,86 +151,155 @@ pub struct McpPrompt {
     #[serde(default)]
     pub description: Option<String>,
 }
+
+/// Typed lifecycle records emitted by the daemon-owned MCP manager.  Consumers
+/// feed these through the same persistence/event stream as builtin tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpEvent {
+    ServerStarted {
+        server: String,
+    },
+    ServerRestarted {
+        server: String,
+        attempt: u32,
+    },
+    ToolDiscovered {
+        server: String,
+        tool: McpTool,
+    },
+    ToolCallStarted {
+        server: String,
+        tool: String,
+        arguments: Value,
+    },
+    ToolCallFinished {
+        server: String,
+        tool: String,
+        result: Value,
+    },
+    ToolCallFailed {
+        server: String,
+        tool: String,
+        error: String,
+    },
+}
 pub struct McpClient {
     config: McpServerConfig,
-    rpc: StdioRpc,
+    service: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    restarts: u32,
 }
 impl McpClient {
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
-        let rpc = StdioRpc::spawn_with_timeout(
-            &config.command,
-            &config.args,
+        let service = timeout(
             Duration::from_millis(config.timeout_ms),
+            Self::serve(&config),
         )
-        .await?;
-        let mut this = Self { config, rpc };
-        this.rpc.request("initialize", serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"tau","version":"0.1"}})).await?;
-        this.rpc
-            .notification("notifications/initialized", serde_json::json!({}))
-            .await?;
-        Ok(this)
+        .await
+        .context("MCP server startup timed out")??;
+        Ok(Self {
+            config,
+            service,
+            restarts: 0,
+        })
     }
     pub async fn tools(&mut self) -> Result<Vec<McpTool>> {
-        Ok(self
-            .rpc
-            .request("tools/list", serde_json::json!({}))
-            .await?
-            .get("tools")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default())
+        let tools = tokio::time::timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            self.service.peer().list_all_tools(),
+        )
+        .await
+        .context("MCP tools/list timed out")??;
+        tools
+            .into_iter()
+            .map(|tool| {
+                Ok(McpTool {
+                    name: tool.name.to_string(),
+                    description: tool.description.map(|description| description.into_owned()),
+                    input_schema: serde_json::to_value(tool.input_schema.as_ref())?,
+                })
+            })
+            .collect()
     }
     pub async fn prompts(&mut self) -> Result<Vec<McpPrompt>> {
-        Ok(self
-            .rpc
-            .request("prompts/list", serde_json::json!({}))
-            .await?
-            .get("prompts")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default())
+        let prompts = tokio::time::timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            self.service.peer().list_all_prompts(),
+        )
+        .await
+        .context("MCP prompts/list timed out")??;
+        prompts
+            .into_iter()
+            .map(|prompt| {
+                Ok(McpPrompt {
+                    name: prompt.name.to_string(),
+                    description: prompt.description,
+                })
+            })
+            .collect()
     }
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        self.rpc
-            .request(
-                "tools/call",
-                serde_json::json!({"name":name,"arguments":arguments}),
-            )
-            .await
+        let arguments = arguments.as_object().cloned().unwrap_or_default();
+        let result = tokio::time::timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            self.service.peer().call_tool(
+                rmcp::model::CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
+            ),
+        )
+        .await
+        .context("MCP tools/call timed out")??;
+        Ok(serde_json::to_value(result)?)
     }
     pub async fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        self.rpc
-            .request(
-                "prompts/get",
-                serde_json::json!({"name":name,"arguments":arguments}),
-            )
-            .await
+        let result = tokio::time::timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            self.service.peer().get_prompt(
+                rmcp::model::GetPromptRequestParams::new(name.to_owned())
+                    .with_arguments(arguments.as_object().cloned().unwrap_or_default()),
+            ),
+        )
+        .await
+        .context("MCP prompts/get timed out")??;
+        Ok(serde_json::to_value(result)?)
     }
     pub async fn restart(&mut self) -> Result<()> {
-        self.rpc.shutdown().await?;
-        self.rpc = StdioRpc::spawn_with_timeout(
-            &self.config.command,
-            &self.config.args,
+        if self.restarts >= self.config.max_restarts {
+            bail!("MCP restart limit exhausted")
+        }
+        self.service.close().await?;
+        self.restarts += 1;
+        self.service = timeout(
             Duration::from_millis(self.config.timeout_ms),
+            Self::serve(&self.config),
         )
-        .await?;
-        self.rpc.request("initialize", serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"tau","version":"0.1"}})).await?;
-        self.rpc
-            .notification("notifications/initialized", serde_json::json!({}))
-            .await
+        .await
+        .context("MCP server restart timed out")??;
+        Ok(())
+    }
+    async fn serve(
+        config: &McpServerConfig,
+    ) -> Result<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> {
+        use rmcp::{ServiceExt, transport::TokioChildProcess};
+        let mut command = tokio::process::Command::new(&config.command);
+        command.args(&config.args);
+        if let Some(cwd) = &config.cwd {
+            command.current_dir(cwd);
+        }
+        command.envs(&config.env);
+        Ok(().serve(TokioChildProcess::new(command)?).await?)
     }
 }
 pub struct McpManager {
     servers: std::collections::HashMap<String, McpServerConfig>,
     clients: std::collections::HashMap<String, McpClient>,
+    events: Vec<McpEvent>,
 }
 impl McpManager {
     pub fn new() -> Self {
         Self {
             servers: Default::default(),
             clients: Default::default(),
+            events: Vec::new(),
         }
     }
     pub fn register(&mut self, name: impl Into<String>, config: McpServerConfig) {
@@ -236,8 +314,71 @@ impl McpManager {
                 .context("unknown MCP server")?;
             self.clients
                 .insert(name.to_owned(), McpClient::connect(c).await?);
+            self.events.push(McpEvent::ServerStarted {
+                server: name.to_owned(),
+            });
         }
         self.clients.get_mut(name).context("MCP client disappeared")
+    }
+
+    pub fn take_events(&mut self) -> Vec<McpEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Discover the current server tools and expose them as DynamicTool
+    /// descriptors to the daemon's normal policy/registry layer.
+    pub async fn dynamic_tools(&mut self, name: &str) -> Result<Vec<McpTool>> {
+        let tools = self.client(name).await?.tools().await?;
+        for tool in &tools {
+            self.events.push(McpEvent::ToolDiscovered {
+                server: name.to_owned(),
+                tool: tool.clone(),
+            });
+        }
+        Ok(tools)
+    }
+
+    /// Call an MCP DynamicTool. A dead child gets one bounded daemon-owned
+    /// restart and retry; policy checks happen before this method is called.
+    pub async fn call_tool(&mut self, server: &str, tool: &str, arguments: Value) -> Result<Value> {
+        self.events.push(McpEvent::ToolCallStarted {
+            server: server.to_owned(),
+            tool: tool.to_owned(),
+            arguments: arguments.clone(),
+        });
+        let first = self
+            .client(server)
+            .await?
+            .call_tool(tool, arguments.clone())
+            .await;
+        let result = match first {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let client = self.client(server).await?;
+                client
+                    .restart()
+                    .await
+                    .map_err(|restart| anyhow::anyhow!("{error}; restart failed: {restart}"))?;
+                self.events.push(McpEvent::ServerRestarted {
+                    server: server.to_owned(),
+                    attempt: 1,
+                });
+                self.client(server).await?.call_tool(tool, arguments).await
+            }
+        };
+        match &result {
+            Ok(value) => self.events.push(McpEvent::ToolCallFinished {
+                server: server.to_owned(),
+                tool: tool.to_owned(),
+                result: value.clone(),
+            }),
+            Err(error) => self.events.push(McpEvent::ToolCallFailed {
+                server: server.to_owned(),
+                tool: tool.to_owned(),
+                error: error.to_string(),
+            }),
+        }
+        result
     }
 }
 impl Default for McpManager {

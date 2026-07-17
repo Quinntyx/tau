@@ -49,3 +49,26 @@ fn toml_is_rejected() {
     std::fs::write(&p, "model = 'x'").unwrap();
     assert!(Config::load_from(&p).is_err());
 }
+
+#[test]
+fn primary_compaction_agent_must_be_named_and_non_primary() {
+    let mut config = Config::default();
+    config.agents.insert(
+        "build".into(),
+        AgentConfig {
+            primary: true,
+            compaction_agent: Some("missing".into()),
+            ..AgentConfig::default()
+        },
+    );
+    assert!(config.validate().is_err());
+
+    config.agents.insert(
+        "missing".into(),
+        AgentConfig {
+            primary: true,
+            ..AgentConfig::default()
+        },
+    );
+    assert!(config.validate().is_err());
+}

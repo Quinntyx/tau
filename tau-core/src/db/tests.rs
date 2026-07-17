@@ -76,6 +76,36 @@ fn context_epochs_are_append_only_and_reloaded() {
 }
 
 #[test]
+fn epoch_schema_has_restart_metadata_and_duplicate_append_is_atomic() {
+    let db = test_db();
+    let session = db.create_session("/tmp/project").unwrap();
+    let columns: Vec<String> = {
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(context_epochs)").unwrap();
+        stmt.query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .unwrap()
+    };
+    for name in [
+        "parent_epoch",
+        "estimated_tokens",
+        "terminal_status",
+        "is_baseline",
+        "system_message",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == name),
+            "missing {name}"
+        );
+    }
+    let record = ContextEpochRecord::new(&session.id, 0, "baseline", "manual");
+    db.append_context_epoch(&record).unwrap();
+    assert!(db.append_context_epoch(&record).is_err());
+    assert_eq!(db.context_epochs(&session.id).unwrap().len(), 1);
+}
+
+#[test]
 fn session_create_and_get() {
     let db = test_db();
     let s = db.create_session("/tmp/project").unwrap();

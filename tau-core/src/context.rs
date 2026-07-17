@@ -13,15 +13,21 @@ pub struct ContextEpoch {
     pub number: u32,
     pub messages: Vec<ContextMessage>,
     pub plan_context: Option<String>,
+    /// The complete active state that must survive an epoch boundary.
+    pub active_state: Option<String>,
     pub provider: Option<String>,
     pub compaction_model: Option<String>,
     pub retry_marker: bool,
+    pub estimated_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct ContextAssembler {
     limit: usize,
     epoch: ContextEpoch,
+    /// Epochs are retained in creation order; callers may persist this as an
+    /// append-only log rather than having to reconstruct replaced state.
+    epochs: Vec<ContextEpoch>,
 }
 
 impl ContextAssembler {
@@ -32,10 +38,13 @@ impl ContextAssembler {
                 number: 0,
                 messages: Vec::new(),
                 plan_context: None,
+                active_state: None,
                 provider: None,
                 compaction_model: None,
                 retry_marker: false,
+                estimated_tokens: 0,
             },
+            epochs: Vec::new(),
         }
     }
 
@@ -66,6 +75,14 @@ impl ContextAssembler {
         self.epoch.plan_context = Some(markdown.into());
     }
 
+    pub fn set_active_state(&mut self, state: impl Into<String>) {
+        self.epoch.active_state = Some(state.into());
+    }
+
+    pub fn epochs(&self) -> &[ContextEpoch] {
+        &self.epochs
+    }
+
     pub fn set_provider_metadata(
         &mut self,
         provider: impl Into<String>,
@@ -83,6 +100,12 @@ impl ContextAssembler {
     }
     pub fn should_compact_at(&self, compaction_limit: usize) -> bool {
         self.estimated_tokens() >= Self::automatic_threshold(compaction_limit)
+    }
+
+    /// Whether the compaction agent is operating with a smaller window than
+    /// the primary provider (useful for warning the user before compaction).
+    pub fn has_smaller_window(primary_limit: usize, compaction_limit: usize) -> bool {
+        compaction_limit < primary_limit
     }
     pub fn mark_overflow_retry(&mut self) -> bool {
         if self.epoch.retry_marker {
@@ -104,6 +127,9 @@ impl ContextAssembler {
         {
             return Err("selected hashline range is outside the artifact".into());
         }
+        if ranges.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+            return Err("selected hashline ranges must be ordered and non-overlapping".into());
+        }
         Ok(())
     }
 
@@ -120,24 +146,43 @@ impl ContextAssembler {
 
     pub fn compact(&mut self, summary: impl Into<String>) -> ContextEpoch {
         let next_number = self.epoch.number + 1;
+        let estimated_tokens = self.estimated_tokens();
         let plan_context = self.epoch.plan_context.clone();
+        let active_state = self.epoch.active_state.clone();
         let provider = self.epoch.provider.clone();
         let compaction_model = self.epoch.compaction_model.clone();
-        let previous = std::mem::replace(
+        let mut previous = std::mem::replace(
             &mut self.epoch,
             ContextEpoch {
                 number: next_number,
                 messages: Vec::new(),
                 plan_context,
+                active_state: active_state.clone(),
                 provider,
                 compaction_model,
                 retry_marker: false,
+                estimated_tokens: 0,
             },
         );
+        previous.estimated_tokens = estimated_tokens;
+        self.epochs.push(previous.clone());
         self.epoch.messages.push(ContextMessage {
             role: "system".into(),
             content: format!("Conversation summary:\n{}", summary.into()),
         });
+        self.epoch.estimated_tokens = self.estimated_tokens();
+        if let Some(state) = active_state {
+            self.epoch.messages.push(ContextMessage {
+                role: "system".into(),
+                content: format!("Active state (reinject unchanged):\n{state}"),
+            });
+        }
+        if let Some(plan) = self.epoch.plan_context.clone() {
+            self.epoch.messages.push(ContextMessage {
+                role: "system".into(),
+                content: format!("Active plan (reinject unchanged):\n{plan}"),
+            });
+        }
         previous
     }
 }
@@ -155,5 +200,35 @@ mod tests {
         assert_eq!(old.number, 0);
         assert_eq!(context.epoch().number, 1);
         assert_eq!(context.epoch().plan_context.as_deref(), Some("# Plan"));
+        assert!(
+            context
+                .messages()
+                .iter()
+                .any(|message| message.content.contains("Active plan"))
+        );
+        assert_eq!(context.epochs().len(), 1);
+    }
+
+    #[test]
+    fn compaction_reinjects_active_state_and_retry_is_once_per_epoch() {
+        let mut context = ContextAssembler::new(100);
+        context.set_active_state("open tool call: 42");
+        assert!(context.mark_overflow_retry());
+        assert!(!context.mark_overflow_retry());
+        context.compact("summary");
+        assert!(context.mark_overflow_retry());
+        assert!(
+            context
+                .messages()
+                .iter()
+                .any(|message| message.content.contains("42"))
+        );
+    }
+
+    #[test]
+    fn selected_ranges_must_be_valid_and_non_overlapping() {
+        assert!(ContextAssembler::validate_selected_ranges("a\nb\nc", &[(1, 2), (3, 3)]).is_ok());
+        assert!(ContextAssembler::validate_selected_ranges("a\nb\nc", &[(1, 2), (2, 3)]).is_err());
+        assert!(ContextAssembler::has_smaller_window(100, 80));
     }
 }

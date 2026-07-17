@@ -168,6 +168,11 @@ pub struct ContextEpochRecord {
     pub trigger: String,
     pub retry_marker: bool,
     pub created_at: i64,
+    pub parent_epoch: Option<i64>,
+    pub estimated_tokens: Option<i64>,
+    pub terminal_status: Option<String>,
+    pub is_baseline: bool,
+    pub system_message: Option<String>,
 }
 
 impl ContextEpochRecord {
@@ -189,6 +194,11 @@ impl ContextEpochRecord {
             trigger: trigger.into(),
             retry_marker: false,
             created_at: now_ms(),
+            parent_epoch: (epoch > 0).then_some(epoch - 1),
+            estimated_tokens: None,
+            terminal_status: None,
+            is_baseline: epoch == 0,
+            system_message: None,
         }
     }
 }

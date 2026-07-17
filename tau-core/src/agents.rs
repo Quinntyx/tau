@@ -84,11 +84,9 @@ pub struct AgentRegistry {
 
 impl AgentRegistry {
     pub fn builtins(model: Option<String>) -> Self {
-        let compact = format!(
-            "{}/compaction",
-            model.clone().unwrap_or_else(|| "default".into())
-        );
         let mut profiles = BTreeMap::new();
+        let plan_compaction = "plan/compaction".to_owned();
+        let build_compaction = "build/compaction".to_owned();
         profiles.insert(
             "plan".into(),
             AgentProfile {
@@ -96,7 +94,7 @@ impl AgentRegistry {
                 prompt: AgentKind::Plan.system_instruction().into(),
                 model: model.clone(),
                 primary: true,
-                compaction_agent: Some(compact.clone()),
+                compaction_agent: Some(plan_compaction.clone()),
                 cycle: true,
             },
         );
@@ -105,12 +103,34 @@ impl AgentRegistry {
             AgentProfile {
                 name: "build".into(),
                 prompt: AgentKind::Code.system_instruction().into(),
-                model,
+                model: model.clone(),
                 primary: true,
-                compaction_agent: Some(compact),
+                compaction_agent: Some(build_compaction.clone()),
                 cycle: true,
             },
         );
+        for (name, prompt) in [
+            (
+                plan_compaction,
+                "Compact Plan agent context while preserving decisions and constraints.",
+            ),
+            (
+                build_compaction,
+                "Compact Code agent context while preserving decisions and constraints.",
+            ),
+        ] {
+            profiles.insert(
+                name.clone(),
+                AgentProfile {
+                    name,
+                    prompt: prompt.into(),
+                    model: model.clone(),
+                    primary: false,
+                    compaction_agent: None,
+                    cycle: false,
+                },
+            );
+        }
         Self {
             profiles,
             active: "build".into(),
@@ -139,6 +159,24 @@ impl AgentRegistry {
             };
             if compaction.is_empty() {
                 return Err(format!("empty compaction agent for {}", profile.name));
+            }
+            let Some(compaction_profile) = self.profiles.get(compaction) else {
+                return Err(format!(
+                    "unknown compaction agent {} for {}",
+                    compaction, profile.name
+                ));
+            };
+            if compaction_profile.primary {
+                return Err(format!(
+                    "compaction agent {} for {} must not be primary",
+                    compaction, profile.name
+                ));
+            }
+            if compaction == &profile.name {
+                return Err(format!(
+                    "primary agent {} cannot compact itself",
+                    profile.name
+                ));
             }
         }
         Ok(())
@@ -404,6 +442,57 @@ mod tests {
     fn agents_cycle() {
         assert_eq!(AgentKind::Plan.next(), AgentKind::Code);
         assert_eq!(AgentKind::Code.next(), AgentKind::Plan);
+    }
+
+    #[test]
+    fn builtins_have_model_matched_non_primary_compactors() {
+        let registry = AgentRegistry::builtins(Some("chosen".into()));
+        assert!(registry.validate().is_ok());
+        for primary in registry.profiles().filter(|profile| profile.primary) {
+            let compaction = registry
+                .profiles
+                .get(primary.compaction_agent.as_ref().unwrap())
+                .unwrap();
+            assert!(!compaction.primary);
+            assert_eq!(compaction.model, primary.model);
+        }
+    }
+
+    #[test]
+    fn validation_rejects_invalid_compaction_references() {
+        let primary = |compaction_agent| AgentProfile {
+            name: "primary".into(),
+            prompt: String::new(),
+            model: None,
+            primary: true,
+            compaction_agent,
+            cycle: false,
+        };
+        for (target, other) in [
+            (Some("missing".into()), None),
+            (Some("primary".into()), None),
+            (Some("other".into()), Some(true)),
+        ] {
+            let mut profiles = BTreeMap::from([(String::from("primary"), primary(target))]);
+            if let Some(primary) = other {
+                profiles.insert(
+                    "other".into(),
+                    AgentProfile {
+                        name: "other".into(),
+                        prompt: String::new(),
+                        model: None,
+                        primary,
+                        compaction_agent: None,
+                        cycle: false,
+                    },
+                );
+            }
+            let registry = AgentRegistry {
+                profiles,
+                active: "primary".into(),
+            };
+            assert!(registry.validate().is_err());
+        }
     }
 
     #[test]

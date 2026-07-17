@@ -80,6 +80,9 @@ mod fixtures {
                 command: self.command.clone(),
                 args: self.args.clone(),
                 timeout_ms: 2_000,
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+                max_restarts: 1,
             }
         }
         pub fn lsp_config(&self, root: PathBuf) -> tau_core::integrations::LspServerConfig {
@@ -94,23 +97,36 @@ mod fixtures {
     }
 
     const SCRIPT: &str = r#"import json,sys
+def send(value, line_mode):
+    body=json.dumps(value).encode()
+    if line_mode:
+        sys.stdout.buffer.write(body+b'\n')
+    else:
+        sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n'%len(body)).encode()+body)
+    sys.stdout.buffer.flush()
 while True:
-    headers={}
     line=sys.stdin.buffer.readline()
     if not line: break
-    while line not in (b'\r\n',b'\n',b''):
-        k,v=line.decode().split(':',1); headers[k.lower()]=v.strip()
-        line=sys.stdin.buffer.readline()
-    if not line: break
-    body=sys.stdin.buffer.read(int(headers['content-length']))
+    line_mode=line.lstrip().startswith(b'{')
+    if line_mode:
+        body=line
+    else:
+        headers={}
+        while line not in (b'\r\n',b'\n',b''):
+            k,v=line.decode().split(':',1); headers[k.lower()]=v.strip()
+            line=sys.stdin.buffer.readline()
+        if not line: break
+        body=sys.stdin.buffer.read(int(headers['content-length']))
     req=json.loads(body); method=req.get('method',''); result={}
-    if method == 'tools/list': result={'tools':[{'name':'echo','description':'fixture','input_schema':{}}]}
+    if method == 'initialize': result={'protocolVersion':'2025-06-18','capabilities':{'tools':{},'prompts':{}},'serverInfo':{'name':'tau-fixture','version':'1'}}
+    elif method == 'tools/list': result={'tools':[{'name':'echo','description':'fixture','inputSchema':{'type':'object'}}]}
     elif method == 'prompts/list': result={'prompts':[{'name':'plan','description':'fixture'}]}
     elif method == 'tools/call': result={'content':[{'type':'text','text':'ok'}]}
     elif method.startswith('textDocument/'):
         result=[{'uri':'file:///fixture.rs','range':{'start':{'line':0,'character':0},'end':{'line':0,'character':1}}}]
-    response={'jsonrpc':'2.0','id':req.get('id'),'result':result}
-    encoded=json.dumps(response).encode(); sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n'%len(encoded)).encode()+encoded); sys.stdout.buffer.flush()
+    if 'id' in req:
+        response={'jsonrpc':'2.0','id':req.get('id'),'result':result}
+        send(response, line_mode)
 "#;
 
     pub struct GitFixture {

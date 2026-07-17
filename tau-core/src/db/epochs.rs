@@ -5,19 +5,21 @@ use super::{Db, domain::ContextEpochRecord};
 impl Db {
     /// Append an epoch record. Existing records are never updated or deleted.
     pub fn append_context_epoch(&self, record: &ContextEpochRecord) -> Result<ContextEpochRecord> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO context_epochs (session_id, epoch, summary, plan_context, provider, model, input_tokens, trigger, retry_marker, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            rusqlite::params![record.session_id, record.epoch, record.summary, record.plan_context, record.provider, record.model, record.input_tokens, record.trigger, record.retry_marker as i64, record.created_at],
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO context_epochs (session_id, epoch, summary, plan_context, provider, model, input_tokens, trigger, retry_marker, created_at, parent_epoch, estimated_tokens, terminal_status, is_baseline, system_message) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            rusqlite::params![record.session_id, record.epoch, record.summary, record.plan_context, record.provider, record.model, record.input_tokens, record.trigger, record.retry_marker as i64, record.created_at, record.parent_epoch.or((record.epoch > 0).then_some(record.epoch - 1)), record.estimated_tokens, record.terminal_status, record.is_baseline as i64, record.system_message],
         )?;
         let mut saved = record.clone();
-        saved.id = conn.last_insert_rowid();
+        saved.id = tx.last_insert_rowid();
+        tx.commit()?;
         Ok(saved)
     }
 
     pub fn context_epochs(&self, session_id: &str) -> Result<Vec<ContextEpochRecord>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id,session_id,epoch,summary,plan_context,provider,model,input_tokens,trigger,retry_marker,created_at FROM context_epochs WHERE session_id=?1 ORDER BY epoch")?;
+        let mut stmt = conn.prepare("SELECT id,session_id,epoch,summary,plan_context,provider,model,input_tokens,trigger,retry_marker,created_at,parent_epoch,estimated_tokens,terminal_status,is_baseline,system_message FROM context_epochs WHERE session_id=?1 ORDER BY epoch, id")?;
         let rows = stmt.query_map([session_id], |r| {
             Ok(ContextEpochRecord {
                 id: r.get(0)?,
@@ -31,6 +33,11 @@ impl Db {
                 trigger: r.get(8)?,
                 retry_marker: r.get::<_, i64>(9)? != 0,
                 created_at: r.get(10)?,
+                parent_epoch: r.get(11)?,
+                estimated_tokens: r.get(12)?,
+                terminal_status: r.get(13)?,
+                is_baseline: r.get::<_, i64>(14)? != 0,
+                system_message: r.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
