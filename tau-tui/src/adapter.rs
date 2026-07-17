@@ -222,6 +222,10 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
                 answer: None,
             });
         }
+        TurnEvent::DiffRequested { path, diff, .. } => {
+            s.transcript
+                .push(format!("tau diff review: {path}\n{diff}"));
+        }
         TurnEvent::ArtifactCreated { artifact, .. } => s.transcript.push(format!(
             "artifact {} ({})",
             artifact.artifact_id, artifact.media_type

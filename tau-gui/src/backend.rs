@@ -26,10 +26,15 @@ pub struct Backend {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonAction {
+    /// Dismiss this warning only; retain ownership for this process.
     Okay,
+    /// The caller is closing the GUI; ownership cleanup is performed by Drop.
     Quit,
+    /// Release ownership of the child without changing future preferences.
     Disown,
+    /// Persist disowned startup behavior and release this child, if owned.
     AlwaysDisown,
+    /// Persist hiding this warning, while retaining current ownership policy.
     NeverShowAgain,
 }
 
@@ -64,14 +69,35 @@ impl Drop for Backend {
 }
 
 impl Backend {
-    pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, String, String)> {
+    pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, bool, String, String)> {
         let daemon = ensure_daemon(socket).await?;
+        let auto_started = daemon.is_some();
+        // An existing daemon is never returned by `ensure_daemon`. If the
+        // user chose Always-disown, deliberately leave a newly started child
+        // running but do not transfer it into Backend ownership. Keep the
+        // auto_started bit separate so warning visibility and ownership stay
+        // independent preferences.
+        let daemon = if daemon.is_some()
+            && crate::preferences::path()
+                .ok()
+                .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
+                .is_some_and(|preferences| !preferences.daemon_owned)
+        {
+            None
+        } else {
+            daemon
+        };
         let cwd = std::env::current_dir().context("reading GUI working directory")?;
         let model = tau_core::config::Config::load()
             .ok()
             .and_then(|config| config.model)
             .unwrap_or_else(|| "openai/gpt-4o".into());
-        Ok((daemon, cwd.to_string_lossy().into_owned(), model))
+        Ok((
+            daemon,
+            auto_started,
+            cwd.to_string_lossy().into_owned(),
+            model,
+        ))
     }
 
     pub fn from_parts(
@@ -82,6 +108,17 @@ impl Backend {
         model: String,
     ) -> Self {
         let auto_started = daemon.is_some();
+        Self::from_parts_with_startup(socket, handle, daemon, auto_started, cwd, model)
+    }
+
+    pub fn from_parts_with_startup(
+        socket: PathBuf,
+        handle: tokio::runtime::Handle,
+        daemon: Option<Child>,
+        auto_started: bool,
+        cwd: String,
+        model: String,
+    ) -> Self {
         Self {
             socket,
             cwd,
@@ -104,28 +141,32 @@ impl Backend {
     }
 
     pub fn auto_started(&self) -> bool {
-        self.auto_started && !Self::toast_dismissed()
+        self.auto_started
+            && crate::preferences::path()
+                .ok()
+                .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
+                .map(|preferences| preferences.daemon_warning)
+                .unwrap_or(true)
     }
 
     /// Apply one of the five ownership decisions. Existing daemons are never
     /// present in `_daemon`, so disowning can only affect a child we spawned.
     pub fn daemon_action(&self, action: DaemonAction) {
-        if matches!(action, DaemonAction::NeverShowAgain) {
-            if let Ok(path) = crate::preferences::path() {
-                let _ = std::fs::write(path.with_file_name("gui-daemon-toast.dismissed"), "1");
+        if let Ok(path) = crate::preferences::path() {
+            let mut preferences =
+                crate::preferences::GuiPreferences::load_from(&path).unwrap_or_default();
+            match action {
+                DaemonAction::NeverShowAgain => preferences.daemon_warning = false,
+                DaemonAction::AlwaysDisown => preferences.daemon_owned = false,
+                _ => {}
             }
+            let _ = preferences.save_to(&path);
         }
         if matches!(action, DaemonAction::Disown | DaemonAction::AlwaysDisown) {
             if let Ok(mut daemon) = self._daemon.lock() {
                 daemon.take();
             }
         }
-    }
-
-    fn toast_dismissed() -> bool {
-        crate::preferences::path()
-            .map(|path| path.with_file_name("gui-daemon-toast.dismissed").exists())
-            .unwrap_or(false)
     }
 
     /// Start a turn on the long-lived typed client session. The returned
@@ -144,10 +185,20 @@ impl Backend {
         session_id: Option<String>,
         agent: Option<String>,
     ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
+        self.turn_with_options(prompt, session_id, agent, None)
+    }
+
+    pub fn turn_with_options(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        agent: Option<String>,
+        model: Option<String>,
+    ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let socket = self.socket.clone();
         let cwd = self.cwd.clone();
-        let model = self.model.clone();
+        let model = model.unwrap_or_else(|| self.model.clone());
         let session = self.session.clone();
         let active_turn = self.active_turn.clone();
         self.cancel();
@@ -269,10 +320,11 @@ impl Backend {
 }
 
 async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
-    if tau_client::Client::connect(socket).await.is_ok() {
+    // A stale/unresponsive socket must not prevent startup indefinitely.
+    if daemon_reachable(socket).await {
         return Ok(None);
     }
-    let executable = std::env::current_exe().context("locating tau executable")?;
+    let executable = daemon_executable()?;
     let mut child = Command::new(executable)
         .arg("--socket")
         .arg(socket)
@@ -280,11 +332,62 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
         .spawn()
         .context("starting tau daemon")?;
     for _ in 0..50 {
-        if tau_client::Client::connect(socket).await.is_ok() {
+        if daemon_reachable(socket).await {
             return Ok(Some(child));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     stop_child(&mut child);
     anyhow::bail!("daemon did not become ready at {}", socket.display())
+}
+
+async fn daemon_reachable(socket: &PathBuf) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        tau_client::Client::connect(socket),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+fn daemon_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe().context("locating GUI executable")?;
+    let parent = current
+        .parent()
+        .context("GUI executable has no parent directory")?;
+    let executable = parent.join(format!("tau{}", std::env::consts::EXE_SUFFIX));
+    if executable == current {
+        anyhow::bail!("refusing to launch GUI executable as daemon")
+    }
+    Ok(executable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_child_is_stopped_gracefully_before_force_fallback() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap 'exit 0' TERM; sleep 30")
+            .spawn()
+            .expect("spawn test child");
+        stop_child(&mut child);
+        assert!(child.try_wait().expect("wait status").is_some());
+    }
+
+    #[test]
+    fn backend_drop_is_safe_without_owned_daemon() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let backend = Backend::from_parts(
+            PathBuf::from("/tmp/does-not-exist"),
+            runtime.handle().clone(),
+            None,
+            "/tmp".into(),
+            "test/model".into(),
+        );
+        drop(backend);
+    }
 }

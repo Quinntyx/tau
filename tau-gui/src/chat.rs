@@ -28,10 +28,12 @@ pub enum Card {
         approved: bool,
     },
     Permission {
+        request_id: String,
         tool: String,
         description: String,
     },
     Question {
+        question_id: String,
         question: String,
         answer: Option<String>,
     },
@@ -150,7 +152,14 @@ impl ChatState {
                 Some(Card::Diff {
                     approved: value, ..
                 }) => {
-                    *value = approved;
+                    if approved {
+                        *value = true;
+                    } else {
+                        // Rejection is a terminal review decision. Remove the
+                        // pending card so a rejected mutation cannot be
+                        // accidentally submitted a second time.
+                        self.cards.remove(index);
+                    }
                     true
                 }
                 _ => false,
@@ -202,15 +211,35 @@ impl ChatState {
                 true
             }
             TurnEvent::PermissionRequested {
-                tool, description, ..
+                request_id,
+                tool,
+                description,
+                ..
             } => {
-                self.cards.push(Card::Permission { tool, description });
+                self.cards.push(Card::Permission {
+                    request_id,
+                    tool,
+                    description,
+                });
                 true
             }
-            TurnEvent::QuestionAsked { question, .. } => {
+            TurnEvent::QuestionAsked {
+                question_id,
+                question,
+                ..
+            } => {
                 self.cards.push(Card::Question {
+                    question_id,
                     question,
                     answer: None,
+                });
+                true
+            }
+            TurnEvent::DiffRequested { path, diff, .. } => {
+                self.cards.push(Card::Diff {
+                    path,
+                    patch: diff,
+                    approved: false,
                 });
                 true
             }
@@ -291,6 +320,7 @@ mod tests {
             matches!(&state.cards[0], Card::Tool { expanded: true, input, .. } if input.contains("pwd"))
         );
         state.cards.push(Card::Permission {
+            request_id: "r1".into(),
             tool: "write".into(),
             description: "modify file".into(),
         });
@@ -300,6 +330,57 @@ mod tests {
                 .cards
                 .iter()
                 .any(|card| matches!(card, Card::Permission { .. }))
+        );
+    }
+
+    #[test]
+    fn typed_prompt_events_keep_correlation_ids_and_diff_rejection_is_terminal() {
+        let mut state = ChatState::default();
+        let event = |event| SequencedEvent {
+            event_id: "event".into(),
+            session_id: "session".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: None,
+            event,
+        };
+
+        assert!(state.reduce(ChatAction::SessionEvent(event(
+            TurnEvent::PermissionRequested {
+                turn_id: "turn".into(),
+                request_id: "permission".into(),
+                tool: "write".into(),
+                description: "change file".into(),
+            },
+        ))));
+        assert!(matches!(
+            &state.cards[0],
+            Card::Permission { request_id, .. } if request_id == "permission"
+        ));
+
+        assert!(
+            state.reduce(ChatAction::SessionEvent(event(TurnEvent::QuestionAsked {
+                turn_id: "turn".into(),
+                question_id: "question".into(),
+                question: "Continue?".into(),
+            },)))
+        );
+        assert!(matches!(
+            &state.cards[1],
+            Card::Question { question_id, .. } if question_id == "question"
+        ));
+
+        state.cards.push(Card::Diff {
+            path: "file.rs".into(),
+            patch: "@@".into(),
+            approved: false,
+        });
+        assert!(state.reduce(ChatAction::ApproveDiff(2, false)));
+        assert!(
+            !state
+                .cards
+                .iter()
+                .any(|card| matches!(card, Card::Diff { .. }))
         );
     }
 }

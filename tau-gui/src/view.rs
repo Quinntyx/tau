@@ -134,7 +134,21 @@ impl TauView {
         cx.notify();
     }
 
+    fn answer_question(
+        &mut self,
+        index: usize,
+        answer: &'static str,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat
+            .reduce(ChatAction::AnswerQuestion(index, answer.into()));
+        cx.notify();
+    }
+
     fn hide_toast(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::Okay);
         self.toast_visible = false;
         cx.notify();
     }
@@ -158,6 +172,7 @@ impl TauView {
     }
 
     fn quit_gui(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::Quit);
         cx.quit();
     }
 
@@ -182,10 +197,12 @@ impl TauView {
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
-        let receiver = self.backend.turn_with_agent(
+        let selected_model = self.models.get(self.model_index).cloned();
+        let receiver = self.backend.turn_with_options(
             prompt,
             self.chat.session_id.clone(),
             Some(self.agent.label().into()),
+            selected_model,
         );
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;
@@ -344,13 +361,17 @@ impl Render for TauView {
                             if *approved { "approved" } else { "pending" }
                         ),
                     ),
-                    Card::Permission { tool, description } => (
+                    Card::Permission {
+                        tool, description, ..
+                    } => (
                         0x463b24,
                         "permission",
                         false,
                         format!("{tool}: {description}"),
                     ),
-                    Card::Question { question, answer } => (
+                    Card::Question {
+                        question, answer, ..
+                    } => (
                         0x293b32,
                         "question",
                         false,
@@ -382,7 +403,13 @@ impl Render for TauView {
                         }),
                     );
                 }
-                if matches!(card, Card::Diff { .. }) {
+                if matches!(
+                    card,
+                    Card::Diff {
+                        approved: false,
+                        ..
+                    }
+                ) {
                     card_view = card_view.child(
                         div()
                             .flex()
@@ -424,6 +451,27 @@ impl Render for TauView {
                                 )
                             }),
                         ),
+                    );
+                }
+                if matches!(card, Card::Question { answer: None, .. }) {
+                    card_view = card_view.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(toast_button(
+                                "Yes",
+                                0x39734a,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.answer_question(index, "yes", event, window, cx)
+                                }),
+                            ))
+                            .child(toast_button(
+                                "No",
+                                0x7d3b3b,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.answer_question(index, "no", event, window, cx)
+                                }),
+                            )),
                     );
                 }
                 card_view

@@ -28,12 +28,13 @@ pub fn run(socket: PathBuf) -> Result<()> {
             .handle()
             .clone(),
     };
-    let (daemon, cwd, model) = if let Some(runtime) = owned_runtime.as_ref() {
+    let (daemon, auto_started, cwd, model) = if let Some(runtime) = owned_runtime.as_ref() {
         runtime.block_on(Backend::prepare(&socket))?
     } else {
         tokio::task::block_in_place(|| handle.block_on(Backend::prepare(&socket)))?
     };
-    let backend = Backend::from_parts(socket, handle, daemon, cwd, model);
+    let backend =
+        Backend::from_parts_with_startup(socket, handle, daemon, auto_started, cwd, model);
     Application::new().run(move |cx: &mut App| {
         input::bind_keys(cx);
         view::bind_keys(cx);

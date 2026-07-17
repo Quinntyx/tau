@@ -8,6 +8,8 @@ pub struct GuiPreferences {
     pub recent_models: Vec<String>,
     pub sidebar: bool,
     pub autonomy: bool,
+    pub daemon_warning: bool,
+    pub daemon_owned: bool,
 }
 
 impl Default for GuiPreferences {
@@ -17,6 +19,8 @@ impl Default for GuiPreferences {
             recent_models: Vec::new(),
             sidebar: true,
             autonomy: false,
+            daemon_warning: true,
+            daemon_owned: true,
         }
     }
 }
@@ -65,7 +69,24 @@ impl GuiPreferences {
                         .and_then(|e| e.value().as_bool())
                         .context("autonomy requires bool")?
                 }
-                other => anyhow::bail!("unknown GUI preference node `{other}`"),
+                "daemon_warning" => {
+                    result.daemon_warning = node
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .context("daemon_warning requires bool")?
+                }
+                "daemon_owned" => {
+                    result.daemon_owned = node
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .context("daemon_owned requires bool")?
+                }
+                // Keep loading preferences when a newer GUI has added a key.
+                // Preferences are intentionally forward-compatible: unknown
+                // nodes cannot affect the values understood by this version.
+                _ => {}
             }
         }
         Ok(result)
@@ -88,8 +109,8 @@ impl GuiPreferences {
             ));
         }
         out.push_str(&format!(
-            "sidebar #{}\nautonomy #{}\n",
-            self.sidebar, self.autonomy
+            "sidebar #{}\nautonomy #{}\ndaemon_warning #{}\ndaemon_owned #{}\n",
+            self.sidebar, self.autonomy, self.daemon_warning, self.daemon_owned
         ));
         let temporary = file.with_extension("kdl.tmp");
         std::fs::write(&temporary, out).context("writing temporary gui.kdl")?;
@@ -109,6 +130,8 @@ mod tests {
             recent_models: vec!["b".into()],
             sidebar: true,
             autonomy: false,
+            daemon_warning: true,
+            daemon_owned: true,
         };
         x.save_to(&p).unwrap();
         assert_eq!(GuiPreferences::load_from(&p).unwrap(), x);
@@ -123,8 +146,54 @@ mod tests {
             recent_models: vec![],
             sidebar: true,
             autonomy: true,
+            daemon_warning: false,
+            daemon_owned: false,
         };
         x.save_to(&p).unwrap();
         assert_eq!(GuiPreferences::load_from(&p).unwrap(), x);
+    }
+
+    #[test]
+    fn missing_values_use_defaults_and_unknown_nodes_are_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("gui.kdl");
+        std::fs::write(
+            &p,
+            "future_preference #true\nsidebar #false\nunknown \"value\"\n",
+        )
+        .unwrap();
+
+        let preferences = GuiPreferences::load_from(&p).unwrap();
+        assert!(!preferences.sidebar);
+        assert_eq!(preferences.autonomy, GuiPreferences::default().autonomy);
+        assert_eq!(
+            preferences.daemon_warning,
+            GuiPreferences::default().daemon_warning
+        );
+        assert_eq!(
+            preferences.daemon_owned,
+            GuiPreferences::default().daemon_owned
+        );
+    }
+
+    #[test]
+    fn warning_and_ownership_persist_independently() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("gui.kdl");
+        let mut preferences = GuiPreferences {
+            daemon_warning: false,
+            ..GuiPreferences::default()
+        };
+        preferences.save_to(&p).unwrap();
+        let loaded = GuiPreferences::load_from(&p).unwrap();
+        assert!(!loaded.daemon_warning);
+        assert!(loaded.daemon_owned);
+
+        preferences.daemon_warning = true;
+        preferences.daemon_owned = false;
+        preferences.save_to(&p).unwrap();
+        let loaded = GuiPreferences::load_from(&p).unwrap();
+        assert!(loaded.daemon_warning);
+        assert!(!loaded.daemon_owned);
     }
 }

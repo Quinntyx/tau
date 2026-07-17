@@ -75,8 +75,21 @@ pub struct TurnStartParams {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestAction {
     Submit,
-    Command { command: String },
-    Permission { choice: String },
+    Command {
+        command: String,
+    },
+    PermissionReply {
+        request_id: String,
+        choice: TurnPermissionChoice,
+    },
+    QuestionReply {
+        question_id: String,
+        answer: QuestionAnswer,
+    },
+    DiffReply {
+        path: String,
+        decision: TurnDiffDecision,
+    },
     Cancel,
     Replay,
 }
@@ -107,6 +120,40 @@ pub struct TurnResponseResult {
     pub session_id: String,
     pub turn_id: String,
     pub accepted: bool,
+}
+
+/// Explicit replies emitted by interactive clients.  Keeping these typed on
+/// the wire prevents a GUI from accidentally treating a question or diff as
+/// a permission response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionChoice {
+    AllowOnce,
+    AllowAlways,
+    Reject,
+    Inspect,
+    Cancel,
+}
+
+/// A free-form answer to a rendered question control.  The newtype keeps the
+/// reply distinct from unrelated strings while retaining the wire shape used
+/// by older clients (`"answer": "..."`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QuestionAnswer(pub String);
+
+impl From<String> for QuestionAnswer {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// The explicit decision made by a rendered diff control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnDiffDecision {
+    Approve,
+    Reject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,12 +226,25 @@ pub enum TurnEvent {
     },
     PermissionRequested {
         turn_id: String,
+        #[serde(default)]
+        request_id: String,
         tool: String,
         description: String,
     },
     QuestionAsked {
         turn_id: String,
+        #[serde(default)]
+        question_id: String,
         question: String,
+    },
+    DiffRequested {
+        turn_id: String,
+        /// Correlates the review with the originating turn request. Older
+        /// daemons did not emit this field, so clients default it to empty.
+        #[serde(default)]
+        request_id: String,
+        path: String,
+        diff: String,
     },
     ArtifactCreated {
         turn_id: String,
@@ -217,6 +277,76 @@ pub struct SequencedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_reply_is_typed_on_the_wire() {
+        let action = RequestAction::PermissionReply {
+            request_id: "r1".into(),
+            choice: TurnPermissionChoice::AllowOnce,
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["type"], "permission_reply");
+        assert_eq!(json["choice"], "allow_once");
+        assert_eq!(
+            serde_json::from_value::<RequestAction>(json).unwrap(),
+            action
+        );
+        assert!(
+            serde_json::from_str::<RequestAction>(
+                r#"{"type":"permission_reply","request_id":"r1","choice":"approve"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn question_reply_round_trips_without_becoming_a_generic_action() {
+        let action = RequestAction::QuestionReply {
+            question_id: "q1".into(),
+            answer: QuestionAnswer("yes".into()),
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["type"], "question_reply");
+        assert_eq!(
+            serde_json::from_value::<RequestAction>(json).unwrap(),
+            action
+        );
+    }
+
+    #[test]
+    fn diff_reply_round_trips_with_an_explicit_decision() {
+        let action = RequestAction::DiffReply {
+            path: "src/lib.rs".into(),
+            decision: TurnDiffDecision::Reject,
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["decision"], "reject");
+        assert_eq!(
+            serde_json::from_value::<RequestAction>(json).unwrap(),
+            action
+        );
+    }
+
+    #[test]
+    fn rendered_interaction_events_deserialize_with_control_ids() {
+        let permission = r#"{"type":"permission_requested","turn_id":"t1","request_id":"r1","tool":"shell","description":"run"}"#;
+        assert!(matches!(
+            serde_json::from_str::<TurnEvent>(permission).unwrap(),
+            TurnEvent::PermissionRequested { .. }
+        ));
+        let question =
+            r#"{"type":"question_asked","turn_id":"t1","question_id":"q1","question":"Continue?"}"#;
+        assert!(matches!(
+            serde_json::from_str::<TurnEvent>(question).unwrap(),
+            TurnEvent::QuestionAsked { question_id, .. } if question_id == "q1"
+        ));
+        let diff = r#"{"type":"diff_requested","turn_id":"t1","request_id":"d1","path":"a.txt","diff":"@@"}"#;
+        assert!(matches!(
+            serde_json::from_str::<TurnEvent>(diff).unwrap(),
+            TurnEvent::DiffRequested { request_id, path, .. }
+                if request_id == "d1" && path == "a.txt"
+        ));
+    }
     #[test]
     fn every_public_shape_round_trips() {
         let values = [
