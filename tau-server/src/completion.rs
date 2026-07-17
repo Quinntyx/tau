@@ -7,6 +7,7 @@ use rig_core::OneOrMany;
 use rig_core::completion::{AssistantContent, CompletionRequest, Message as RigMessage, Usage};
 use serde::Serialize;
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tau_core::agent::AgentRunner;
 use tau_core::context::{ContextAssembler, ContextEpoch};
 use tau_core::credentials::CredentialStore;
@@ -33,6 +34,47 @@ pub(crate) async fn handle(
     state: &AppState,
     id: Id,
     raw_params: Option<Value>,
+) {
+    handle_inner(socket, state, id, raw_params, false).await;
+}
+
+pub(crate) async fn handle_turn(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: Id,
+    raw_params: Option<Value>,
+) {
+    let typed = match raw_params
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<TurnStartParams>(v.clone()).ok())
+    {
+        Some(params) => params,
+        None => {
+            send_error(
+                socket,
+                id,
+                INVALID_PARAMS,
+                "session.turn.start requires typed params".into(),
+            )
+            .await;
+            return;
+        }
+    };
+    let params = CompletionStreamParams {
+        model: typed.model,
+        prompt: typed.prompt,
+        session_id: typed.session_id,
+        cwd: typed.cwd,
+    };
+    handle_inner(socket, state, id, serde_json::to_value(params).ok(), true).await;
+}
+
+async fn handle_inner(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: Id,
+    raw_params: Option<Value>,
+    typed: bool,
 ) {
     let params = match raw_params
         .ok_or_else(|| anyhow::anyhow!("completion.stream requires params"))
@@ -135,6 +177,20 @@ pub(crate) async fn handle(
     // denials). Session-specific rules are loaded by higher-level turn APIs;
     // the completion compatibility path starts with the safe allow baseline.
     let mut permissions = PermissionEngine::default().with_default(Decision::Allow);
+    let typed_turn_id = format!("turn-{id:?}");
+    let mut sequence = 0u64;
+    if typed {
+        emit_turn(
+            socket,
+            &session.0.id,
+            &typed_turn_id,
+            &mut sequence,
+            TurnEvent::TurnStarted {
+                turn_id: typed_turn_id.clone(),
+            },
+        )
+        .await;
+    }
     loop {
         let request = CompletionRequest {
             model: None,
@@ -174,6 +230,23 @@ pub(crate) async fn handle(
             match delta {
                 Ok(TauDelta::Text(chunk)) => {
                     turn_text.push_str(&chunk);
+                    if typed {
+                        if !emit_turn(
+                            socket,
+                            &session.0.id,
+                            &typed_turn_id,
+                            &mut sequence,
+                            TurnEvent::TextDelta {
+                                turn_id: typed_turn_id.clone(),
+                                text: chunk,
+                            },
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     let notification = Notification {
                         jsonrpc: JsonRpc::default(),
                         method: METHOD_COMPLETION_DELTA.to_string(),
@@ -191,6 +264,9 @@ pub(crate) async fn handle(
                 Ok(TauDelta::ToolCall(call)) => calls.push(call),
                 Ok(TauDelta::Usage(final_usage)) => {
                     usage = final_usage;
+                    if typed {
+                        continue;
+                    }
                     let notification = Notification {
                         jsonrpc: JsonRpc::default(),
                         method: METHOD_COMPLETION_DELTA.to_string(),
@@ -239,21 +315,41 @@ pub(crate) async fn handle(
                 },
                 Err(error) => format!("tool error: {error}"),
             };
+            if typed
+                && !emit_turn(
+                    socket,
+                    &session.0.id,
+                    &typed_turn_id,
+                    &mut sequence,
+                    TurnEvent::ToolOutput {
+                        turn_id: typed_turn_id.clone(),
+                        output: BoundedOutput {
+                            inline: rendered.clone(),
+                            truncated: false,
+                            artifacts: vec![],
+                        },
+                    },
+                )
+                .await
+            {
+                return;
+            }
             let card = format!("\n[tool {}]\n{}\n", call.function.name, rendered);
-            if !send(
-                socket,
-                &Notification {
-                    jsonrpc: JsonRpc::default(),
-                    method: METHOD_COMPLETION_DELTA.to_string(),
-                    params: Some(CompletionDelta {
-                        request_id: id.clone(),
-                        session_id: session.0.id.clone(),
-                        text: card,
-                        usage: None,
-                    }),
-                },
-            )
-            .await
+            if !typed
+                && !send(
+                    socket,
+                    &Notification {
+                        jsonrpc: JsonRpc::default(),
+                        method: METHOD_COMPLETION_DELTA.to_string(),
+                        params: Some(CompletionDelta {
+                            request_id: id.clone(),
+                            session_id: session.0.id.clone(),
+                            text: card,
+                            usage: None,
+                        }),
+                    },
+                )
+                .await
             {
                 return;
             }
@@ -296,6 +392,34 @@ pub(crate) async fn handle(
         return;
     }
 
+    if typed {
+        if !emit_turn(
+            socket,
+            &session.0.id,
+            &typed_turn_id,
+            &mut sequence,
+            TurnEvent::TurnCompleted {
+                turn_id: typed_turn_id.clone(),
+                message_id: Some(assistant.id),
+            },
+        )
+        .await
+        {
+            return;
+        }
+        send(
+            socket,
+            &Response::ok(
+                id,
+                TurnStartResult {
+                    session_id: session.0.id,
+                    turn_id: typed_turn_id,
+                },
+            ),
+        )
+        .await;
+        return;
+    }
     let result = CompletionStreamResult {
         session_id: session.0.id,
         message_id: assistant.id,
@@ -429,4 +553,33 @@ async fn send<T: Serialize>(socket: &mut WebSocket, value: &T) -> bool {
         return false;
     };
     socket.send(WsMessage::Text(text.into())).await.is_ok()
+}
+
+async fn emit_turn(
+    socket: &mut WebSocket,
+    session_id: &str,
+    turn_id: &str,
+    sequence: &mut u64,
+    event: TurnEvent,
+) -> bool {
+    *sequence += 1;
+    send(
+        socket,
+        &Notification {
+            jsonrpc: JsonRpc::default(),
+            method: METHOD_TURN_EVENT.to_string(),
+            params: Some(SequencedEvent {
+                event_id: format!("{turn_id}-{}", *sequence),
+                session_id: session_id.to_string(),
+                sequence: *sequence,
+                occurred_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default(),
+                request_id: None,
+                event,
+            }),
+        },
+    )
+    .await
 }

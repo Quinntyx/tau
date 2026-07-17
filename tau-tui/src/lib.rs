@@ -29,11 +29,19 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     })?;
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = session(&mut terminal, &mut client).await;
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -59,8 +67,16 @@ async fn session(
             break;
         }
         if let Some(action) = reducer::key_action(&state, key) {
+            let is_cancel = matches!(action, reducer::Action::Cancel);
+            let is_replay = matches!(action, reducer::Action::Replay);
             if let Some(prompt) = reducer::apply(&mut state, action) {
                 adapter::complete(&mut state, client, prompt).await?;
+            }
+            if is_cancel {
+                adapter::cancel(&mut state, client).await?;
+            }
+            if is_replay {
+                adapter::replay(&mut state, client).await?;
             }
         }
     }

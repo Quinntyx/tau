@@ -19,6 +19,8 @@ pub enum PermissionStage {
 pub enum PermissionChoice {
     AllowOnce,
     AllowAlways,
+    AllowSession,
+    DenyOnce,
     Reject,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,6 +64,8 @@ pub struct Model {
 #[derive(Debug, Clone)]
 pub struct Hunk {
     pub header: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
     pub lines: Vec<String>,
     pub accepted: Option<bool>,
 }
@@ -71,14 +75,19 @@ pub struct AppState {
     pub connection: Connection,
     pub input: String,
     pub cursor: usize,
+    pub selection: Option<usize>,
+    pub clipboard: String,
     pub transcript: Vec<String>,
     pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub sequence: u64,
     pub model: String,
     pub agent: String,
     pub picker: Picker,
     pub picker_query: String,
     pub picker_index: usize,
     pub models: Vec<Model>,
+    pub recent_models: Vec<String>,
     pub agents: Vec<String>,
     pub tools: Vec<ToolCard>,
     pub permission: Option<Permission>,
@@ -89,6 +98,34 @@ pub struct AppState {
     pub undo: VecDeque<Vec<Option<bool>>>,
     pub redo: VecDeque<Vec<Option<bool>>>,
     pub cancelling: bool,
+    pub replaying: bool,
+    pub server_index: usize,
+    pub servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferSnapshot {
+    pub input: String,
+    pub cursor: usize,
+    pub selection: Option<usize>,
+}
+
+impl AppState {
+    pub fn buffer_snapshot(&self) -> BufferSnapshot {
+        BufferSnapshot {
+            input: self.input.clone(),
+            cursor: self.cursor,
+            selection: self.selection,
+        }
+    }
+
+    pub fn restore_buffer(&mut self, snapshot: BufferSnapshot) {
+        self.input = snapshot.input;
+        self.cursor = snapshot.cursor.min(self.input.len());
+        self.selection = snapshot
+            .selection
+            .map(|cursor| cursor.min(self.input.len()));
+    }
 }
 impl Default for AppState {
     fn default() -> Self {
@@ -96,8 +133,12 @@ impl Default for AppState {
             connection: Connection::Connected,
             input: String::new(),
             cursor: 0,
+            selection: None,
+            clipboard: String::new(),
             transcript: vec!["Welcome to tau. Select a model and type a prompt.".into()],
             session_id: None,
+            turn_id: None,
+            sequence: 0,
             model: "openai/gpt-4o".into(),
             agent: "default".into(),
             picker: Picker::None,
@@ -115,6 +156,7 @@ impl Default for AppState {
                     favorite: false,
                 },
             ],
+            recent_models: vec![],
             agents: vec!["default".into(), "explore".into(), "general".into()],
             tools: vec![],
             permission: None,
@@ -125,6 +167,9 @@ impl Default for AppState {
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             cancelling: false,
+            replaying: false,
+            server_index: 0,
+            servers: vec!["local".into()],
         }
     }
 }

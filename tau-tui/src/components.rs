@@ -13,7 +13,15 @@ pub fn render(frame: &mut Frame, s: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(5)])
         .split(frame.area());
-    let transcript = s.transcript.join("\n");
+    let mut transcript = s.transcript.join("\n");
+    for tool in &s.tools {
+        transcript.push('\n');
+        transcript.push_str(&format_tool(tool));
+    }
+    if !s.hunks.is_empty() {
+        transcript.push_str("\n\n");
+        transcript.push_str(&format_diff(s));
+    }
     frame.render_widget(
         Paragraph::new(transcript)
             .wrap(Wrap { trim: false })
@@ -84,7 +92,8 @@ fn permission(frame: &mut Frame, p: &Permission) {
         )),
         Line::from(format!(" {}: {}", p.tool, p.summary)),
         Line::from(""),
-        Line::from("[Enter] Allow once   [→] Allow always   [Backspace] Reject"),
+        Line::from("[Enter] once  [→] always  [s] session  [d] deny  [Backspace] reject"),
+        Line::from(format!("stage: {:?}", p.stage)),
     ];
     frame.render_widget(
         Paragraph::new(body)
@@ -92,6 +101,50 @@ fn permission(frame: &mut Frame, p: &Permission) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn format_tool(t: &ToolCard) -> String {
+    let status = match t.status {
+        ToolStatus::Running => "…",
+        ToolStatus::Complete => "✓",
+        ToolStatus::Failed => "!",
+        ToolStatus::Denied => "×",
+    };
+    if t.expanded {
+        format!(
+            "{status} {}\n  input: {}\n  output: {}",
+            t.name, t.input, t.result
+        )
+    } else {
+        format!(
+            "{status} {} — {}",
+            t.name,
+            t.result.lines().next().unwrap_or("")
+        )
+    }
+}
+
+fn format_diff(s: &AppState) -> String {
+    let mut out = format!(
+        "DIFF REVIEW  hunk {}/{}  [Enter] accept [Backspace] reject [u/U] undo/redo [Ctrl-A] file\n",
+        s.hunk_index + 1,
+        s.hunks.len()
+    );
+    if let Some(h) = s.hunks.get(s.hunk_index) {
+        out.push_str(&format!("{}\n", h.header));
+        for line in &h.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("--- split ---\n");
+        for line in &h.before {
+            out.push_str(&format!("< {line}\n"));
+        }
+        for line in &h.after {
+            out.push_str(&format!("> {line}\n"));
+        }
+    }
+    out
 }
 pub fn tool_card(frame: &mut Frame, area: Rect, t: &ToolCard) {
     let status = match t.status {
