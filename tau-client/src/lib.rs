@@ -405,21 +405,32 @@ impl Stream for CompletionStream {
         }
         match std::pin::Pin::new(&mut self.rx).poll_recv(cx) {
             std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(Some(Incoming::Notification(n))) => std::task::Poll::Ready(
-                n.params
-                    .and_then(|p| serde_json::from_value(p).ok())
-                    .map(|d| Ok(CompletionEvent::Delta(d))),
-            ),
+            std::task::Poll::Ready(Some(Incoming::Notification(n))) => {
+                let result = n
+                    .params
+                    .ok_or_else(|| anyhow::anyhow!("completion notification had no params"))
+                    .and_then(|p| serde_json::from_value(p).map_err(Into::into))
+                    .map(CompletionEvent::Delta);
+                std::task::Poll::Ready(Some(result))
+            }
             std::task::Poll::Ready(Some(Incoming::Response(r))) => {
                 self.done = true;
                 std::task::Poll::Ready(Some(
-                    r.result
-                        .ok_or_else(|| anyhow::anyhow!("response had no result"))
-                        .and_then(|v| {
-                            serde_json::from_value(v)
-                                .map(CompletionEvent::Complete)
-                                .map_err(Into::into)
-                        }),
+                    if let Some(error) = r.error {
+                        Err(anyhow::anyhow!(
+                            "rpc error {}: {}",
+                            error.code,
+                            error.message
+                        ))
+                    } else {
+                        r.result
+                            .ok_or_else(|| anyhow::anyhow!("response had no result"))
+                    }
+                    .and_then(|v| {
+                        serde_json::from_value(v)
+                            .map(CompletionEvent::Complete)
+                            .map_err(Into::into)
+                    }),
                 ))
             }
             std::task::Poll::Ready(Some(Incoming::Closed)) => {
@@ -444,21 +455,32 @@ impl Stream for TurnStream {
         }
         match std::pin::Pin::new(&mut self.rx).poll_recv(cx) {
             std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(Some(Incoming::Notification(n))) => std::task::Poll::Ready(
-                n.params
-                    .and_then(|p| serde_json::from_value(p).ok())
-                    .map(|e| Ok(TurnStreamEvent::Event(e))),
-            ),
+            std::task::Poll::Ready(Some(Incoming::Notification(n))) => {
+                let result = n
+                    .params
+                    .ok_or_else(|| anyhow::anyhow!("turn event notification had no params"))
+                    .and_then(|p| serde_json::from_value(p).map_err(Into::into))
+                    .map(TurnStreamEvent::Event);
+                std::task::Poll::Ready(Some(result))
+            }
             std::task::Poll::Ready(Some(Incoming::Response(r))) => {
                 self.done = true;
                 std::task::Poll::Ready(Some(
-                    r.result
-                        .ok_or_else(|| anyhow::anyhow!("response had no result"))
-                        .and_then(|v| {
-                            serde_json::from_value(v)
-                                .map(TurnStreamEvent::Complete)
-                                .map_err(Into::into)
-                        }),
+                    if let Some(error) = r.error {
+                        Err(anyhow::anyhow!(
+                            "rpc error {}: {}",
+                            error.code,
+                            error.message
+                        ))
+                    } else {
+                        r.result
+                            .ok_or_else(|| anyhow::anyhow!("response had no result"))
+                    }
+                    .and_then(|v| {
+                        serde_json::from_value(v)
+                            .map(TurnStreamEvent::Complete)
+                            .map_err(Into::into)
+                    }),
                 ))
             }
             std::task::Poll::Ready(Some(Incoming::Closed)) => {

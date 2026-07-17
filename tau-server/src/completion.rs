@@ -63,18 +63,23 @@ async fn execute_inner(state: &AppState, job: &TurnJob) -> Result<Option<i64>> {
     })
     .await?;
     let (provider_id, model_id) = split_model(&job.params.model)?;
-    let provider_config = state.config().providers.get(provider_id);
-    let credentials = CredentialStore::new()?;
-    let key = credentials.get(
-        provider_id,
-        provider_config.and_then(|c| c.api_key_env.as_deref()),
-    );
-    let provider = Provider::new(
-        provider_id,
-        model_id,
-        key.as_deref(),
-        provider_config.and_then(|c| c.api_base.as_deref()),
-    )?;
+    let provider = match state.provider_override().cloned() {
+        Some(provider) => provider,
+        None => {
+            let provider_config = state.config().providers.get(provider_id);
+            let credentials = CredentialStore::new()?;
+            let key = credentials.get(
+                provider_id,
+                provider_config.and_then(|c| c.api_key_env.as_deref()),
+            );
+            Provider::new(
+                provider_id,
+                model_id,
+                key.as_deref(),
+                provider_config.and_then(|c| c.api_base.as_deref()),
+            )?
+        }
+    };
 
     let mut context = ContextAssembler::new(context_limit());
     context.set_provider_metadata(provider_id, model_id);

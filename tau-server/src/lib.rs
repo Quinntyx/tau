@@ -24,7 +24,6 @@ use tokio::{
 };
 
 mod completion;
-
 pub mod runtime;
 
 /// Per-process server state shared with every connection.
@@ -64,6 +63,7 @@ impl PolicyBroker {
         for (_, waiter) in waiters.drain() {
             let _ = waiter.send(Err("prompt interrupted by daemon restart".to_owned()));
         }
+    provider_override: Option<tau_core::provider::Provider>,
 }
 }
 
@@ -77,6 +77,7 @@ impl AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             events: tokio::sync::broadcast::channel(4096).0,
             policy: Arc::new(PolicyBroker::new()),
+            provider_override: None,
         }
     }
 
@@ -182,6 +183,18 @@ impl AppState {
             Ok(Err(error)) => anyhow::bail!(error),
             Err(_) => anyhow::bail!("policy prompt broker closed"),
         }
+    }
+
+    /// Test-only-in-practice provider seam: the transport and completion
+    /// implementation remain production code while the external model is
+    /// scripted at the provider boundary.
+    pub fn with_provider(mut self, provider: tau_core::provider::Provider) -> Self {
+        self.provider_override = Some(provider);
+        self
+    }
+
+    pub(crate) fn provider_override(&self) -> Option<&tau_core::provider::Provider> {
+        self.provider_override.as_ref()
     }
 }
 

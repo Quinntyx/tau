@@ -37,10 +37,14 @@ mod fixtures {
 
     impl ServerFixture {
         pub async fn start() -> Result<Self> {
+            Self::start_with_state(tau_server::AppState::default()).await
+        }
+
+        pub async fn start_with_state(state: tau_server::AppState) -> Result<Self> {
             let dir = tempdir()?;
             let socket = dir.path().join("tau.sock");
             let listener = UnixListener::bind(&socket)?;
-            let app = tau_server::router(tau_server::AppState::default());
+            let app = tau_server::router(state);
             let task = tokio::spawn(async move {
                 let _ = axum::serve(listener, app.into_make_service()).await;
             });
@@ -193,8 +197,51 @@ while True:
     }
 }
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use futures::StreamExt;
 use tau_proto::prelude::*;
+
+async fn run_typed_turn(client: &tau_client::Client, params: TurnStartParams) -> Result<String> {
+    let mut events = client.events();
+    let mut admission = client.turn_start(params).await?;
+    let started = loop {
+        match admission
+            .next()
+            .await
+            .context("turn admission stream closed")??
+        {
+            tau_client::TurnStreamEvent::Complete(result) => break result,
+            tau_client::TurnStreamEvent::Event(_) => {}
+        }
+    };
+    let turn_id = started.turn_id;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+        let mut text = String::new();
+        loop {
+            let event = events.next().await.context("turn event stream closed")??;
+            match event.event {
+                TurnEvent::TextDelta {
+                    turn_id: event_turn,
+                    text: delta,
+                } if event_turn == turn_id => text.push_str(&delta),
+                TurnEvent::TurnCompleted {
+                    turn_id: event_turn,
+                    ..
+                } if event_turn == turn_id => return Ok::<String, anyhow::Error>(text),
+                TurnEvent::TurnFailed {
+                    turn_id: event_turn,
+                    message,
+                } if event_turn == turn_id => anyhow::bail!(message),
+                TurnEvent::TurnCancelled {
+                    turn_id: event_turn,
+                } if event_turn == turn_id => anyhow::bail!("turn cancelled"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("typed turn timed out")?
+}
 
 #[tokio::test]
 async fn websocket_protocol_negotiation_and_scripted_provider_round_trip() -> Result<()> {
@@ -429,4 +476,227 @@ fn gui_and_tui_state_fixtures_cover_permission_diff_tiers_and_cancel() {
     let mut gui = tau_gui::chat::ChatState::default();
     assert!(gui.reduce(tau_gui::chat::ChatAction::Submit("hello".into())));
     assert_eq!(gui.cards.len(), 2);
+}
+
+/// Mandatory M13 closure chain. The only double here is Rig's scripted model
+/// at the provider boundary; negotiation, persistence, completion and replay
+/// are driven through the real server/client APIs. Plan/permission/file/git
+/// stages use their real tau-core APIs because no corresponding JSON-RPC
+/// methods exist yet; this test intentionally does not claim those absent
+/// server surfaces are covered.
+#[tokio::test]
+async fn mandatory_production_agent_workflow_closure() -> Result<()> {
+    use rig_core::test_utils::{MockCompletionModel, MockStreamEvent};
+
+    let scripted = MockCompletionModel::from_stream_turns([
+        [
+            MockStreamEvent::text("first model result"),
+            MockStreamEvent::final_response_with_total_tokens(3),
+        ],
+        [
+            MockStreamEvent::text("second model result"),
+            MockStreamEvent::final_response_with_total_tokens(4),
+        ],
+    ]);
+    let state = tau_server::AppState::default()
+        .with_provider(tau_core::provider::Provider::scripted(scripted));
+    let session = state.db().create_session("/tmp/m13-production")?;
+    let qa = state
+        .db()
+        .record_qa(&session.id, "May the actor edit?", "Yes, only tracked.txt")?;
+    let qa = state
+        .db()
+        .get_qa_records(&session.id)?
+        .into_iter()
+        .find(|record| record.id == qa.id)
+        .expect("recorded Q&A must be reloadable before plan citation");
+    let mut plan = tau_core::plan::Plan::new("closure", "do the requested mutation");
+    let step = plan.add_step("authorized mutation");
+    assert!(plan.attach_qa(step, qa.id.clone(), tau_core::plan::PlanAuthority::Human));
+    assert!(
+        plan.render_markdown_with_qa(std::slice::from_ref(&qa))
+            .contains("only tracked.txt")
+    );
+    assert!(tau_core::plan::allows_tool(&plan, false, "write").is_err());
+    assert!(plan.airtight_step(step));
+    assert!(tau_core::plan::allows_tool(&plan, false, "write").is_ok());
+
+    let broker = tau_core::permissions::PermissionBroker::default();
+    let request = broker
+        .request("m13", "write", serde_json::json!({"path":"tracked.txt"}))
+        .await;
+    assert!(
+        broker
+            .reply(&request.id, tau_core::permissions::PermissionReply::Allow)
+            .await
+    );
+    assert_eq!(
+        broker.wait(&request.id).await,
+        Some(tau_core::permissions::PermissionReply::Allow)
+    );
+
+    let git = fixtures::GitFixture::new()?;
+    let worktree = git.workspace.managed_worktree("closure/model", &git.root)?;
+    let root = worktree.path.clone();
+    let file = root.join("tracked.txt");
+    std::fs::write(&file, "before\n")?;
+    let mut transaction =
+        tau_core::tools::SnapshotTransaction::begin(&root, std::slice::from_ref(&file))?;
+    std::fs::write(&file, "after\n")?;
+    let diff = transaction.diff()?;
+    assert_eq!(diff[0].hunks.len(), 1);
+    assert_eq!(
+        transaction.apply(
+            &[(file.clone(), tau_core::tools::FileDecision::Accept)],
+            false
+        )?,
+        1
+    );
+    let commit = git.workspace.commit(
+        &root,
+        "accept authorized mutation",
+        &[std::path::PathBuf::from("tracked.txt")],
+    )?;
+    let preview = git
+        .workspace
+        .preview_integration(&git.root, &worktree.branch, "master")?;
+    assert!(preview.commits.iter().any(|candidate| candidate == &commit));
+    assert!(
+        !preview.conflicts,
+        "integration preview must be conflict-free"
+    );
+
+    let fixture = fixtures::ServerFixture::start_with_state(state.clone()).await?;
+    let client = fixtures::client(&fixture).await?;
+    let negotiated = client.negotiate(fixtures::protocol_fixture().0).await?;
+    assert_eq!(negotiated.version.major, 1);
+
+    let first_text = run_typed_turn(
+        &client,
+        TurnStartParams {
+            model: "scripted/model".into(),
+            prompt: "run the authorized mutation".into(),
+            session_id: Some(session.id.clone()),
+            cwd: Some(root.to_string_lossy().into_owned()),
+            idempotency_key: IdempotencyKey::new("m13-first-model-result"),
+            agent: Some("code".into()),
+            task_tier: Some(1),
+            autonomous: Some(false),
+            action: Some(RequestAction::Submit),
+        }
+    )
+    .await?;
+    assert_eq!(first_text, "first model result");
+    let messages = state.db().get_messages(&session.id)?;
+    assert!(
+        messages.iter().any(|message| {
+            message.role == "user"
+            && message.blocks.iter().any(|block| matches!(
+                block,
+                tau_core::db::ContentBlock::Text { text } if text == "run the authorized mutation"
+            ))
+        }),
+        "server completion must persist the user prompt"
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message.role == "assistant"
+                && message.blocks.iter().any(|block| {
+                    matches!(
+                        block,
+                        tau_core::db::ContentBlock::Text { text } if text == "first model result"
+                    )
+                })
+        }),
+        "server completion must persist the model result"
+    );
+
+    let second_text = run_typed_turn(
+        &client,
+        TurnStartParams {
+            model: "scripted/model".into(),
+            prompt: "continue after review".into(),
+            session_id: Some(session.id.clone()),
+            cwd: Some(root.to_string_lossy().into_owned()),
+            idempotency_key: IdempotencyKey::new("m13-second-model-result"),
+            agent: Some("code".into()),
+            task_tier: Some(1),
+            autonomous: Some(false),
+            action: Some(RequestAction::Submit),
+        }
+    )
+    .await?;
+    assert_eq!(second_text, "second model result");
+
+    // Replay must be produced by the typed server API, not by appending a
+    // fixture event directly to the database.
+    let _turn = client
+        .turn_start(tau_proto::turn::TurnStartParams {
+            model: "scripted/model".into(),
+            prompt: "replay the authorized mutation".into(),
+            session_id: Some(session.id.clone()),
+            cwd: Some(root.to_string_lossy().into_owned()),
+            idempotency_key: tau_proto::turn::IdempotencyKey::new("m13-replay"),
+            agent: Some("code".into()),
+            task_tier: Some(1),
+            autonomous: Some(false),
+            action: Some(tau_proto::turn::RequestAction::Replay),
+        })
+        .await?;
+    drop(client); // explicit disconnect before replay
+    let replay_client = fixtures::client(&fixture).await?;
+    let replay = replay_client
+        .turn_replay(tau_proto::turn::TurnReplayParams {
+            session_id: session.id.clone(),
+            after_sequence: 0,
+            limit: None,
+        })
+        .await?;
+    assert!(
+        replay
+            .events
+            .iter()
+            .any(|event| { matches!(event.event, tau_proto::turn::TurnEvent::TurnStarted { .. }) }),
+        "replay must contain the server-created turn event"
+    );
+
+    let plan_markdown = plan.render_markdown_with_qa(std::slice::from_ref(&qa));
+    let mut context = tau_core::context::ContextAssembler::new(1);
+    context.set_plan_context(&plan_markdown);
+    context.set_provider_metadata("scripted", "model");
+    context.push("user", "compact this");
+    let compacted = context.compact("summary with plan reinjection");
+    assert!(
+        context
+            .epoch()
+            .plan_context
+            .as_deref()
+            .unwrap_or_default()
+            .contains("closure")
+    );
+    assert!(context.epoch().messages[0].content.contains("summary"));
+    let mut epoch = tau_core::db::ContextEpochRecord::new(
+        &session.id,
+        context.epoch().number as i64,
+        context.epoch().messages[0].content.clone(),
+        "manual_acceptance",
+    );
+    epoch.plan_context = compacted.plan_context;
+    epoch.provider = compacted.provider;
+    epoch.model = compacted.compaction_model;
+    epoch.retry_marker = compacted.retry_marker;
+    state.db().append_context_epoch(&epoch)?;
+    let persisted = state
+        .db()
+        .latest_context_epoch(&session.id)?
+        .expect("compaction epoch must be durable");
+    assert!(
+        persisted
+            .plan_context
+            .as_deref()
+            .unwrap_or_default()
+            .contains("closure")
+    );
+    fixture.task.abort();
+    Ok(())
 }
