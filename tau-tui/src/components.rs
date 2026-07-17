@@ -57,6 +57,9 @@ pub fn render(frame: &mut Frame, s: &AppState) {
     if let Some(p) = &s.permission {
         permission(frame, p);
     }
+    if let Some(question) = &s.question {
+        question_modal(frame, question);
+    }
 }
 fn picker(frame: &mut Frame, s: &AppState) {
     let area = center(frame.area(), 60, 14);
@@ -114,6 +117,28 @@ fn permission(frame: &mut Frame, p: &Permission) {
     frame.render_widget(
         Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL).title(" Permission "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn question_modal(frame: &mut Frame, question: &Question) {
+    let area = center(frame.area(), 64, 9);
+    frame.render_widget(Clear, area);
+    let body = vec![
+        Line::from(Span::styled(
+            " Question ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(question.prompt.as_str()),
+        Line::from(""),
+        Line::from("Type an answer in the prompt and press Enter; Esc rejects."),
+    ];
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(Block::default().borders(Borders::ALL).title(" Question "))
             .wrap(Wrap { trim: false }),
         area,
     );

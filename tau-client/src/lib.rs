@@ -35,6 +35,7 @@ struct Inner {
     pending: Mutex<HashMap<Id, mpsc::UnboundedSender<Incoming>>>,
     events: broadcast::Sender<SequencedEvent>,
     policy_events: broadcast::Sender<PolicyEvent>,
+    disconnected: broadcast::Sender<()>,
 }
 
 /// A connected tau daemon client. All reads are performed by one background
@@ -64,7 +65,7 @@ pub struct TurnStream {
     done: bool,
 }
 pub struct EventStream {
-    rx: mpsc::UnboundedReceiver<SequencedEvent>,
+    rx: mpsc::UnboundedReceiver<Result<SequencedEvent>>,
 }
 
 pub struct PolicyEventStream {
@@ -88,11 +89,13 @@ impl Client {
         let (sink, mut reader) = ws.split();
         let (events, _) = broadcast::channel(4096);
         let (policy_events, _) = broadcast::channel(4096);
+        let (disconnected, _) = broadcast::channel(1);
         let inner = Arc::new(Inner {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
             events,
             policy_events,
+            disconnected,
         });
         let routed = Arc::clone(&inner);
         tokio::spawn(async move {
@@ -161,6 +164,7 @@ impl Client {
                 }
             };
             let _ = error;
+            let _ = routed.disconnected.send(());
             let pending = routed.pending.lock().await;
             for tx in pending.values() {
                 let _ = tx.send(Incoming::Closed);
@@ -186,9 +190,9 @@ impl Client {
     ) -> Result<(Id, mpsc::UnboundedReceiver<Incoming>)> {
         let id = self.next_id();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.pending.lock().await.insert(id.clone(), tx);
         let request = Request::new(id.clone(), method, params);
         let text = serde_json::to_string(&request)?;
+        self.inner.pending.lock().await.insert(id.clone(), tx);
         if let Err(e) = self
             .inner
             .sink
@@ -210,13 +214,17 @@ impl Client {
     ) -> Result<serde_json::Value> {
         let (id, mut rx) = self.send(method, params).await?;
         let response = loop {
-            match rx.recv().await.context("connection closed")? {
-                Incoming::Response(r) if r.id == id => break r,
-                Incoming::Closed => {
+            match rx.recv().await {
+                Some(Incoming::Response(r)) if r.id == id => break r,
+                Some(Incoming::Closed) => {
                     self.inner.pending.lock().await.remove(&id);
                     anyhow::bail!("connection closed (request interrupted)");
                 }
-                _ => {}
+                Some(_) => {}
+                None => {
+                    self.inner.pending.lock().await.remove(&id);
+                    anyhow::bail!("connection closed");
+                }
             }
         };
         self.inner.pending.lock().await.remove(&id);
@@ -281,6 +289,10 @@ impl Client {
         serde_json::from_value(self.call(METHOD_TURN_CANCEL, Some(params)).await?)
             .context("decoding cancellation")
     }
+    pub async fn turn_response(&self, params: TurnResponseParams) -> Result<TurnResponseResult> {
+        serde_json::from_value(self.call(METHOD_TURN_RESPONSE, Some(params)).await?)
+            .context("decoding turn response")
+    }
     pub async fn turn_replay(&self, params: TurnReplayParams) -> Result<TurnReplayResult> {
         serde_json::from_value(self.call(METHOD_TURN_REPLAY, Some(params)).await?)
             .context("decoding replay")
@@ -310,10 +322,19 @@ impl Client {
     pub fn events(&self) -> EventStream {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut source = self.inner.events.subscribe();
+        let mut disconnected = self.inner.disconnected.subscribe();
         tokio::spawn(async move {
-            while let Ok(event) = source.recv().await {
-                if tx.send(event).is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    event = source.recv() => match event {
+                        Ok(event) => if tx.send(Ok(event)).is_err() { break },
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    },
+                    closed = disconnected.recv() => {
+                        if closed.is_ok() { let _ = tx.send(Err(anyhow::anyhow!("connection closed"))); }
+                        break;
+                    }
                 }
             }
         });
@@ -336,20 +357,20 @@ impl Client {
 
 impl Drop for CompletionStream {
     fn drop(&mut self) {
-        self.inner
-            .pending
-            .try_lock()
-            .ok()
-            .map(|mut p| p.remove(&self.id));
+        let pending = Arc::clone(&self.inner);
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            pending.pending.lock().await.remove(&id);
+        });
     }
 }
 impl Drop for TurnStream {
     fn drop(&mut self) {
-        self.inner
-            .pending
-            .try_lock()
-            .ok()
-            .map(|mut p| p.remove(&self.id));
+        let pending = Arc::clone(&self.inner);
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            pending.pending.lock().await.remove(&id);
+        });
     }
 }
 
@@ -359,9 +380,7 @@ impl Stream for EventStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::new(&mut self.rx)
-            .poll_recv(cx)
-            .map(|r| r.map(Ok))
+        std::pin::Pin::new(&mut self.rx).poll_recv(cx).map(|r| r)
     }
 }
 

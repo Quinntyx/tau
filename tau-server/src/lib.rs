@@ -338,6 +338,7 @@ async fn handle_request(
         }
         METHOD_TURN_START => start_turn(id, req.params, state, out).await,
         METHOD_TURN_CANCEL => cancel_turn(id, req.params, state).await,
+        METHOD_TURN_RESPONSE => respond_turn(id, req.params, state).await,
         METHOD_TURN_REPLAY => replay_turn(id, req.params, state).await,
         METHOD_PERMISSION_REPLY => {
             resolve_prompt(id, req.params, state, client_id, "permission", true).await
@@ -740,6 +741,33 @@ async fn cancel_turn(id: Id, value: Option<serde_json::Value>, state: &AppState)
             session_id: params.session_id,
             turn_id: params.turn_id,
             cancelled,
+        },
+    ))
+    .unwrap_or_default()
+}
+
+async fn respond_turn(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+    let Some(params) = value.and_then(|v| serde_json::from_value::<TurnResponseParams>(v).ok())
+    else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "invalid turn.response params",
+        ))
+        .unwrap_or_default();
+    };
+
+    // The runtime's interactive brokers own the eventual answer.  This
+    // transport acknowledgement is intentionally immediate: the TUI must not
+    // wait for the model turn (or a SQLite write) before returning to input.
+    // Until a broker is attached, accepting a well-formed response is the
+    // compatible no-op used by the M12 transport boundary.
+    serde_json::to_string(&Response::ok(
+        id,
+        TurnResponseResult {
+            session_id: params.session_id,
+            turn_id: params.turn_id,
+            accepted: true,
         },
     ))
     .unwrap_or_default()

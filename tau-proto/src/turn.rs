@@ -8,6 +8,8 @@ pub const METHOD_TURN_START: &str = "session.turn.start";
 pub const METHOD_TURN_CANCEL: &str = "session.turn.cancel";
 pub const METHOD_TURN_REPLAY: &str = "session.turn.replay";
 pub const METHOD_TURN_EVENT: &str = "session.turn.event";
+/// Submit an answer to an interactive turn event.
+pub const METHOD_TURN_RESPONSE: &str = "session.turn.response";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -77,6 +79,34 @@ pub enum RequestAction {
     Permission { choice: String },
     Cancel,
     Replay,
+}
+
+/// A typed answer to an interactive turn event.
+///
+/// This is deliberately separate from [`RequestAction`]: actions describe how
+/// a turn is started, while these values are replies to a permission prompt,
+/// question, or diff review request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientResponse {
+    Permission { choice: String },
+    Question { answer: String },
+    DiffHunk { index: u32, approved: bool },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnResponseParams {
+    pub session_id: String,
+    pub turn_id: String,
+    pub idempotency_key: IdempotencyKey,
+    pub response: ClientResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnResponseResult {
+    pub session_id: String,
+    pub turn_id: String,
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,5 +265,40 @@ mod tests {
                 serde_json::from_value::<serde_json::Value>(value.clone()).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn client_responses_round_trip_with_stable_wire_tags() {
+        let responses = [
+            ClientResponse::Permission {
+                choice: "allow".into(),
+            },
+            ClientResponse::Question {
+                answer: "yes".into(),
+            },
+            ClientResponse::DiffHunk {
+                index: 2,
+                approved: false,
+            },
+        ];
+        for response in responses {
+            let value = serde_json::to_value(&response).unwrap();
+            let decoded: ClientResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(decoded, response);
+            assert!(value.get("type").is_some());
+        }
+
+        let params = TurnResponseParams {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            idempotency_key: IdempotencyKey::new("k"),
+            response: ClientResponse::DiffHunk {
+                index: 0,
+                approved: true,
+            },
+        };
+        let decoded: TurnResponseParams =
+            serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
+        assert_eq!(decoded, params);
     }
 }

@@ -5,7 +5,9 @@ use crate::{
 use anyhow::Result;
 use futures_util::StreamExt;
 use tau_client::{Client, TurnStreamEvent};
-use tau_proto::prelude::{BoundedOutput, SequencedEvent, TurnEvent};
+use tau_proto::prelude::{
+    BoundedOutput, ClientResponse, IdempotencyKey, SequencedEvent, TurnEvent, TurnResponseParams,
+};
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
     Turn(SequencedEvent),
@@ -14,6 +16,7 @@ pub enum ClientEvent {
     Permission { tool: String, summary: String },
     Disconnected,
     Reconnected,
+    Error(String),
 }
 #[derive(Debug, Default)]
 pub struct ScriptedClient {
@@ -48,32 +51,81 @@ impl ScriptedClient {
                 }
                 ClientEvent::Disconnected => s.connection = Connection::Disconnected,
                 ClientEvent::Reconnected => s.connection = Connection::Connected,
+                ClientEvent::Error(message) => s.transcript.push(format!("tau error: {message}")),
             }
         }
     }
 }
-pub async fn complete(s: &mut AppState, client: &mut Client, prompt: String) -> Result<()> {
-    s.transcript.push("tau: ".into());
-    let mut stream = client
-        .turn_start(reducer::params(
-            s,
-            prompt,
-            Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-        ))
-        .await?;
-    while let Some(e) = stream.next().await {
-        match e? {
-            TurnStreamEvent::Event(event) => reduce_event(s, event),
-            TurnStreamEvent::Complete(r) => {
-                s.session_id = Some(r.session_id);
-                s.turn_id = Some(r.turn_id);
+/// Run a turn away from the terminal task.  The sender is deliberately
+/// unbounded: rendering must never apply backpressure to cancellation or
+/// terminal input while a daemon is producing output.
+pub async fn turn_task(
+    client: Client,
+    params: tau_proto::prelude::TurnStartParams,
+    tx: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
+) {
+    let result = async {
+        let mut stream = client.turn_start(params).await?;
+        while let Some(e) = stream.next().await {
+            match e? {
+                TurnStreamEvent::Event(event) => {
+                    let _ = tx.send(ClientEvent::Turn(event));
+                }
+                TurnStreamEvent::Complete(r) => {
+                    let _ = tx.send(ClientEvent::Complete {
+                        session_id: r.session_id,
+                        turn_id: r.turn_id,
+                    });
+                    break;
+                }
             }
         }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    if let Err(error) = result {
+        let _ = tx.send(ClientEvent::Error(error.to_string()));
+    }
+}
+
+pub async fn complete(
+    s: &mut AppState,
+    client: &Client,
+    prompt: String,
+    tx: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
+) -> Result<()> {
+    s.transcript.push("tau: ".into());
+    let params = reducer::params(
+        s,
+        prompt,
+        Some(std::env::current_dir()?.to_string_lossy().into_owned()),
+    );
+    tokio::spawn(turn_task(client.clone(), params, tx));
     Ok(())
 }
 
-pub async fn cancel(s: &mut AppState, client: &mut Client) -> Result<()> {
+pub async fn persistent_events(
+    client: Client,
+    tx: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
+) {
+    let mut stream = client.events();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(event) => {
+                if tx.send(ClientEvent::Turn(event)).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(ClientEvent::Error(error.to_string()));
+                break;
+            }
+        }
+    }
+    let _ = tx.send(ClientEvent::Disconnected);
+}
+
+pub async fn cancel(s: &mut AppState, client: &Client) -> Result<()> {
     if let (Some(session_id), Some(turn_id)) = (s.session_id.clone(), s.turn_id.clone()) {
         let result = client
             .turn_cancel(tau_proto::prelude::TurnCancelParams {
@@ -87,24 +139,56 @@ pub async fn cancel(s: &mut AppState, client: &mut Client) -> Result<()> {
     Ok(())
 }
 
-pub async fn replay(s: &mut AppState, client: &mut Client) -> Result<()> {
-    if let Some(session_id) = s.session_id.clone() {
-        let result = client
-            .turn_replay(tau_proto::prelude::TurnReplayParams {
-                session_id,
-                after_sequence: s.sequence,
-                limit: Some(256),
-            })
-            .await?;
-        for event in result.events {
-            reduce_event(s, event);
-        }
-        s.replaying = false;
-    }
+/// Send an interactive answer on the control plane.  This is intentionally a
+/// separate request from the active turn stream so a permission/question/diff
+/// decision is never queued behind generation.
+pub async fn respond(s: &AppState, client: &Client, response: ClientResponse) -> Result<()> {
+    let (Some(session_id), Some(turn_id)) = (s.session_id.clone(), s.turn_id.clone()) else {
+        anyhow::bail!("cannot answer a turn before the daemon provides its session and turn ids");
+    };
+    client
+        .turn_response(TurnResponseParams {
+            session_id,
+            turn_id,
+            idempotency_key: IdempotencyKey::new(format!("tau-tui-response-{}", s.sequence)),
+            response,
+        })
+        .await?;
     Ok(())
 }
 
+pub async fn replay_task(
+    client: Client,
+    session_id: String,
+    after_sequence: u64,
+    tx: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
+) {
+    match client
+        .turn_replay(tau_proto::prelude::TurnReplayParams {
+            session_id,
+            after_sequence,
+            limit: Some(256),
+        })
+        .await
+    {
+        Ok(result) => {
+            for event in result.events {
+                if tx.send(ClientEvent::Turn(event)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(ClientEvent::Reconnected);
+        }
+        Err(error) => {
+            let _ = tx.send(ClientEvent::Error(error.to_string()));
+        }
+    }
+}
+
 pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
+    if event.sequence <= s.sequence {
+        return;
+    }
     s.sequence = s.sequence.max(event.sequence);
     match event.event {
         TurnEvent::TurnStarted { turn_id } => s.turn_id = Some(turn_id),
@@ -133,7 +217,10 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
             });
         }
         TurnEvent::QuestionAsked { question, .. } => {
-            s.transcript.push(format!("tau question: {question}"));
+            s.question = Some(crate::state::Question {
+                prompt: question,
+                answer: None,
+            });
         }
         TurnEvent::ArtifactCreated { artifact, .. } => s.transcript.push(format!(
             "artifact {} ({})",

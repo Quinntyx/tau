@@ -8,12 +8,24 @@ pub enum Action {
     Paste(String),
     Backspace,
     Delete,
-    MoveLeft { select: bool },
-    MoveRight { select: bool },
-    MoveHome { select: bool },
-    MoveEnd { select: bool },
-    MoveUp { select: bool },
-    MoveDown { select: bool },
+    MoveLeft {
+        select: bool,
+    },
+    MoveRight {
+        select: bool,
+    },
+    MoveHome {
+        select: bool,
+    },
+    MoveEnd {
+        select: bool,
+    },
+    MoveUp {
+        select: bool,
+    },
+    MoveDown {
+        select: bool,
+    },
     Newline,
     Submit,
     Open(Picker),
@@ -24,6 +36,11 @@ pub enum Action {
     Pick,
     ToggleFavorite,
     Permission(PermissionChoice),
+    /// Reply to a pending permission request; unlike the legacy action this is
+    /// explicit about the protocol reply and is safe to dispatch from replay.
+    PermissionReply(PermissionChoice),
+    QuestionReply(String),
+    DiffReply(bool),
     ExpandTool(usize),
     NextHunk,
     PrevHunk,
@@ -37,6 +54,7 @@ pub enum Action {
     Replay,
     SwitchServer,
     Reconnect,
+    Connected,
 }
 
 pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
@@ -54,6 +72,14 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
             KeyCode::Backspace => Some(Action::Permission(PermissionChoice::Reject)),
             _ => None,
         };
+    }
+    if s.question.is_some() {
+        if matches!(k.code, KeyCode::Enter) {
+            return Some(Action::QuestionReply(s.input.clone()));
+        }
+        if matches!(k.code, KeyCode::Esc) {
+            return Some(Action::QuestionReply(String::new()));
+        }
     }
     if !s.hunks.is_empty() && s.input.is_empty() {
         if k.code == KeyCode::Enter {
@@ -189,8 +215,13 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                 if let Some(agent) = p.strip_prefix("/agent ") {
                     s.agent = agent.trim().to_string();
                     s.picker = Picker::None;
+                } else if let Some(model) = p.strip_prefix("/model ") {
+                    s.model = model.trim().to_string();
+                    s.picker = Picker::None;
                 } else if p.trim() == "/agents" || p.trim() == "/agent" {
                     s.picker = Picker::Agents;
+                } else if p.trim() == "/models" || p.trim() == "/model" {
+                    s.picker = Picker::Models;
                 }
                 return Some(p);
             }
@@ -264,6 +295,39 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                 }
             }
         }
+        Action::PermissionReply(c) => {
+            if let Some(p) = s.permission.as_mut() {
+                p.choice = c;
+                if c == PermissionChoice::AllowAlways || c == PermissionChoice::AllowSession {
+                    p.stage = PermissionStage::AlwaysConfirm;
+                } else {
+                    s.permission = None;
+                }
+                return Some(format!("permission:{c:?}"));
+            }
+        }
+        Action::QuestionReply(answer) => {
+            if let Some(q) = s.question.as_mut() {
+                q.answer = Some(answer.clone());
+                s.question = None;
+                s.input.clear();
+                s.cursor = 0;
+                return Some(answer);
+            }
+        }
+        Action::DiffReply(accepted) => {
+            if let Some(reply) = s.diff_reply.as_mut() {
+                reply.accepted = Some(accepted);
+                return Some(if accepted {
+                    "diff:accept".into()
+                } else {
+                    "diff:reject".into()
+                });
+            }
+            if s.hunk_index < s.hunks.len() {
+                s.hunks[s.hunk_index].accepted = Some(accepted);
+            }
+        }
         Action::ExpandTool(i) => {
             if let Some(t) = s.tools.get_mut(i) {
                 t.expanded = !t.expanded;
@@ -318,14 +382,25 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         }
         Action::ToggleAutonomy => s.autonomous = !s.autonomous,
         Action::Tier(d) => s.task_tier = (s.task_tier as i8 + d).clamp(1, 3) as u8,
-        Action::Cancel => s.cancelling = true,
-        Action::Replay => s.replaying = true,
+        Action::Cancel => {
+            s.cancelling = true;
+            s.replaying = false;
+        }
+        Action::Replay => {
+            s.replaying = true;
+            s.cancelling = false;
+            s.connection = Connection::Reconnecting;
+        }
         Action::SwitchServer => {
             if !s.servers.is_empty() {
                 s.server_index = (s.server_index + 1) % s.servers.len();
             }
         }
         Action::Reconnect => s.connection = Connection::Reconnecting,
+        Action::Connected => {
+            s.connection = Connection::Connected;
+            s.replaying = false;
+        }
     }
     None
 }
@@ -482,5 +557,45 @@ mod tests {
         apply(&mut state, Action::MoveEnd { select: true });
         apply(&mut state, Action::Paste("H".into()));
         assert_eq!(state.input, "H");
+    }
+
+    #[test]
+    fn explicit_replies_are_reducer_state_transitions() {
+        let mut state = AppState {
+            permission: Some(Permission {
+                tool: "shell".into(),
+                summary: "run".into(),
+                choice: PermissionChoice::AllowOnce,
+                stage: PermissionStage::Choose,
+            }),
+            question: Some(Question {
+                prompt: "?".into(),
+                answer: None,
+            }),
+            ..AppState::default()
+        };
+        apply(
+            &mut state,
+            Action::PermissionReply(PermissionChoice::DenyOnce),
+        );
+        assert!(state.permission.is_none());
+        assert_eq!(
+            apply(&mut state, Action::QuestionReply("yes".into())),
+            Some("yes".into())
+        );
+        assert!(state.question.is_none());
+    }
+
+    #[test]
+    fn replay_cancel_and_connection_transitions_are_exclusive() {
+        let mut state = AppState::default();
+        apply(&mut state, Action::Replay);
+        assert!(state.replaying);
+        assert_eq!(state.connection, Connection::Reconnecting);
+        apply(&mut state, Action::Cancel);
+        assert!(state.cancelling);
+        assert!(!state.replaying);
+        apply(&mut state, Action::Connected);
+        assert_eq!(state.connection, Connection::Connected);
     }
 }

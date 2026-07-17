@@ -47,6 +47,17 @@ pub struct Permission {
     pub choice: PermissionChoice,
     pub stage: PermissionStage,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub prompt: String,
+    pub answer: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffReply {
+    pub accepted: Option<bool>,
+}
 #[derive(Debug, Clone)]
 pub struct ToolCard {
     pub name: String,
@@ -91,6 +102,8 @@ pub struct AppState {
     pub agents: Vec<String>,
     pub tools: Vec<ToolCard>,
     pub permission: Option<Permission>,
+    pub question: Option<Question>,
+    pub diff_reply: Option<DiffReply>,
     pub task_tier: u8,
     pub autonomous: bool,
     pub hunks: Vec<Hunk>,
@@ -160,6 +173,8 @@ impl Default for AppState {
             agents: vec!["default".into(), "explore".into(), "general".into()],
             tools: vec![],
             permission: None,
+            question: None,
+            diff_reply: None,
             task_tier: 1,
             autonomous: false,
             hunks: vec![],

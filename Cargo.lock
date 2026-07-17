@@ -6373,12 +6373,14 @@ name = "tau-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "crossterm",
  "futures-util",
  "ratatui",
  "serde_json",
  "tau-client",
  "tau-proto",
+ "tau-server",
  "tokio",
 ]
 

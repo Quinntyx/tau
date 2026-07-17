@@ -14,6 +14,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, path::PathBuf, time::Duration};
 use tau_client::Client;
+use tau_proto::prelude::ClientResponse;
 
 pub use adapter::{ClientEvent, ScriptedClient};
 pub use reducer::{Action, apply as reduce};
@@ -21,9 +22,9 @@ pub use state::AppState;
 
 /// Start the client without ever starting a daemon for the user.
 pub async fn run(socket: PathBuf) -> Result<()> {
-    let mut client = Client::connect(&socket).await.with_context(|| {
+    let client = Client::connect(&socket).await.with_context(|| {
         format!(
-            "daemon unavailable at {}\nhelp: run `tau serve` first",
+            "daemon unavailable at {}\nhelp: to fix this, run `tau serve` before running the tui",
             socket.display()
         )
     })?;
@@ -35,7 +36,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         crossterm::event::EnableMouseCapture
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = session(&mut terminal, &mut client).await;
+    let result = session(&mut terminal, client, socket).await;
     terminal::disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -48,42 +49,149 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 
 async fn session(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    client: &mut Client,
+    mut client: Client,
+    socket: PathBuf,
 ) -> Result<()> {
     let mut state = AppState::default();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut event_task = tokio::spawn(adapter::persistent_events(
+        client.clone(),
+        events_tx.clone(),
+    ));
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let input_task = tokio::spawn(async move {
+        loop {
+            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+                match event::read() {
+                    Ok(input) => {
+                        if input_tx.send(input).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
     loop {
         terminal.draw(|frame| components::render(frame, &state))?;
-        if !event::poll(Duration::from_millis(50))? {
-            tokio::task::yield_now().await;
-            continue;
-        }
-        let input = event::read()?;
-        let action = match input {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if matches!(key.code, KeyCode::Esc) {
-                    break;
+        tokio::select! {
+            Some(input) = input_rx.recv() => {
+                let action = match input {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if matches!(key.code, KeyCode::Esc) { break; }
+                        reducer::key_action(&state, key)
+                    }
+                    Event::Mouse(mouse) => reducer::mouse_action(&state, mouse),
+                    Event::Resize(_, _) => Some(reducer::Action::Reconnect),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    let is_cancel = matches!(action, reducer::Action::Cancel);
+                    let is_submit = matches!(action, reducer::Action::Submit);
+                    let reconnect_requested = matches!(action, reducer::Action::Reconnect);
+                    let replay_requested = matches!(action, reducer::Action::Replay);
+                    let reconnect = reconnect_requested
+                        || (replay_requested && state.connection == state::Connection::Disconnected);
+                    let response = match &action {
+                        reducer::Action::Permission(choice)
+                        | reducer::Action::PermissionReply(choice) => {
+                            Some(ClientResponse::Permission { choice: permission_choice(*choice).into() })
+                        }
+                        reducer::Action::QuestionReply(answer) => {
+                            Some(ClientResponse::Question { answer: answer.clone() })
+                        }
+                        reducer::Action::DiffReply(approved) => Some(ClientResponse::DiffHunk {
+                            index: state.hunk_index as u32,
+                            approved: *approved,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(prompt) = reducer::apply(&mut state, action) {
+                        if is_submit {
+                            adapter::complete(&mut state, &client, prompt, events_tx.clone()).await?;
+                        }
+                    }
+                    if let Some(response) = response {
+                        let snapshot = state.clone();
+                        let c = client.clone();
+                        let tx = events_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = adapter::respond(&snapshot, &c, response).await {
+                                let _ = tx.send(adapter::ClientEvent::Error(e.to_string()));
+                            }
+                        });
+                    }
+                    // These requests are independent of the active turn stream.
+                    // In particular, Ctrl-C is not queued behind generation.
+                    if is_cancel {
+                        let c = client.clone();
+                        let mut snapshot = state.clone();
+                        let tx = events_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = adapter::cancel(&mut snapshot, &c).await { let _ = tx.send(adapter::ClientEvent::Error(e.to_string())); }
+                        });
+                    }
+                    if reconnect {
+                        event_task.abort();
+                        match Client::connect(&socket).await {
+                            Ok(new_client) => {
+                                client = new_client;
+                                event_task = tokio::spawn(adapter::persistent_events(
+                                    client.clone(),
+                                    events_tx.clone(),
+                                ));
+                                state.connection = state::Connection::Reconnecting;
+                            }
+                            Err(error) => {
+                                state.connection = state::Connection::Disconnected;
+                                let _ = events_tx.send(adapter::ClientEvent::Error(
+                                    format!("reconnect failed: {error}"),
+                                ));
+                            }
+                        }
+                    }
+                    if replay_requested || reconnect {
+                        if let Some(session_id) = state.session_id.clone() {
+                            tokio::spawn(adapter::replay_task(
+                                client.clone(),
+                                session_id,
+                                state.sequence,
+                                events_tx.clone(),
+                            ));
+                        }
+                    }
                 }
-                reducer::key_action(&state, key)
             }
-            Event::Mouse(mouse) => reducer::mouse_action(&state, mouse),
-            Event::Resize(_, _) => Some(reducer::Action::Reconnect),
-            _ => None,
-        };
-        if let Some(action) = action {
-            let is_cancel = matches!(action, reducer::Action::Cancel);
-            let is_replay = matches!(action, reducer::Action::Replay);
-            if let Some(prompt) = reducer::apply(&mut state, action) {
-                adapter::complete(&mut state, client, prompt).await?;
+            Some(message) = events_rx.recv() => {
+                match message {
+                    adapter::ClientEvent::Complete { session_id, turn_id } => {
+                        state.session_id = Some(session_id);
+                        state.turn_id = Some(turn_id);
+                    }
+                    adapter::ClientEvent::Turn(event) => adapter::reduce_event(&mut state, event),
+                    adapter::ClientEvent::Disconnected => state.connection = state::Connection::Disconnected,
+                    other => adapter::ScriptedClient { events: vec![other] }.drive(&mut state),
+                }
             }
-            if is_cancel {
-                adapter::cancel(&mut state, client).await?;
-            }
-            if is_replay {
-                adapter::replay(&mut state, client).await?;
-            }
+            else => break,
         }
     }
+    input_task.abort();
+    event_task.abort();
     Ok(())
+}
+
+fn permission_choice(choice: state::PermissionChoice) -> &'static str {
+    match choice {
+        state::PermissionChoice::AllowOnce => "allow_once",
+        state::PermissionChoice::AllowAlways => "allow_always",
+        state::PermissionChoice::AllowSession => "allow_session",
+        state::PermissionChoice::DenyOnce => "deny_once",
+        state::PermissionChoice::Reject => "reject",
+    }
 }
 
 #[cfg(test)]
