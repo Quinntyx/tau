@@ -138,11 +138,13 @@ impl SnapshotTransaction {
                 return Err(TransactionError::Conflict(path.clone()));
             }
             let target = match decision {
-                FileDecision::Accept | FileDecision::Restore | FileDecision::Force => {
-                    c.before.clone()
-                }
+                // Accept materializes the proposed state. Restore is the
+                // explicit operation for putting the snapshot back.
+                FileDecision::Accept => c.after.clone(),
+                FileDecision::Force => c.before.clone(),
+                FileDecision::Restore => c.before.clone(),
                 FileDecision::Delete => None,
-                FileDecision::Reject => c.after.clone(),
+                FileDecision::Reject => c.before.clone(),
             };
             write(path, target)?;
             n += 1;
@@ -217,5 +219,22 @@ mod tests {
         tx.diff().unwrap();
         tx.undo().unwrap();
         tx.redo().unwrap();
+    }
+
+    #[test]
+    fn accept_applies_proposal_and_reject_restores_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "before").unwrap();
+        let mut tx = SnapshotTransaction::begin(dir.path(), std::slice::from_ref(&file)).unwrap();
+        std::fs::write(&file, "proposal").unwrap();
+        tx.diff().unwrap();
+        tx.apply(&[(file.clone(), FileDecision::Accept)], false)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "proposal");
+        std::fs::write(&file, "proposal").unwrap();
+        tx.apply(&[(file.clone(), FileDecision::Reject)], false)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
     }
 }

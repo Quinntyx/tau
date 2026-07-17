@@ -77,8 +77,19 @@ impl GitWorkspace {
         })
     }
     pub fn managed_worktree(&self, model: &str, repository: &Path) -> Result<ManagedWorktree> {
-        let branch = managed_name(model);
-        let folder = self.manifest.root.join(&branch);
+        ensure_clean(repository, "creating managed worktree")?;
+        let mut branch = managed_name(model);
+        let mut folder = self.manifest.root.join(&branch);
+        // Keep the human-readable model name, but disambiguate an existing
+        // folder that was created for a different full model identifier.
+        let marker = self.manifest.tau_metadata.join("model-map").join(&branch);
+        if folder.exists()
+            && marker.is_file()
+            && std::fs::read_to_string(&marker).ok().as_deref() != Some(model)
+        {
+            branch = format!("{branch}-{}", short_model_hash(model));
+            folder = self.manifest.root.join(&branch);
+        }
         if !branch_exists(repository, &branch) {
             git(repository, &["branch", &branch])?;
         }
@@ -92,6 +103,9 @@ impl GitWorkspace {
                     &branch,
                 ],
             )?;
+            std::fs::create_dir_all(marker.parent().expect("model marker parent"))?;
+            std::fs::write(&marker, model)
+                .with_context(|| format!("writing model marker in {}", folder.display()))?;
         }
         Ok(ManagedWorktree {
             branch,
@@ -157,12 +171,23 @@ impl GitWorkspace {
         target: &str,
         force: bool,
     ) -> Result<()> {
+        ensure_clean(repository, "integrating managed worktree")?;
         let preview = self.preview_integration(repository, source, target)?;
         if preview.conflicts && !force {
             bail!("integration has conflicts; resolve or force explicitly")
         }
-        git(repository, &["checkout", target])?;
-        git(repository, &["merge", "--no-ff", source])?;
+        let current =
+            String::from_utf8_lossy(&git_output(repository, &["branch", "--show-current"])?.stdout)
+                .trim()
+                .to_owned();
+        if current != target {
+            git(repository, &["checkout", target])?;
+        }
+        let merged = git(repository, &["merge", "--no-ff", source]);
+        if current != target {
+            let _ = git(repository, &["checkout", &current]);
+        }
+        merged?;
         Ok(())
     }
 }
@@ -188,6 +213,17 @@ pub fn managed_name(model: &str) -> String {
         s.truncate(64);
     }
     format!("tau/{s}")
+}
+fn short_model_hash(model: &str) -> String {
+    use sha1::{Digest, Sha1};
+    format!("{:x}", Sha1::digest(model.as_bytes()))[..10].to_owned()
+}
+fn ensure_clean(repository: &Path, operation: &str) -> Result<()> {
+    let status = git_output(repository, &["status", "--porcelain"])?;
+    if !status.stdout.is_empty() {
+        bail!("refusing {operation}: repository has uncommitted changes")
+    }
+    Ok(())
 }
 fn is_repo(path: &Path) -> bool {
     path.join(".git").exists() || path.join("HEAD").exists()

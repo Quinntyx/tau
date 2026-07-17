@@ -67,6 +67,7 @@ fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("sql/v1.sql")),
         M::up(include_str!("sql/v2.sql")),
+        M::up(include_str!("sql/v3.sql")),
     ])
 }
 

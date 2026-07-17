@@ -19,6 +19,7 @@ pub struct StdioRpc {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     timeout: Duration,
+    notifications: Vec<Value>,
 }
 impl StdioRpc {
     pub async fn spawn(command: &str, args: &[String]) -> Result<Self> {
@@ -44,6 +45,7 @@ impl StdioRpc {
             stdout: BufReader::new(stdout),
             next_id: 1,
             timeout,
+            notifications: Vec::new(),
         })
     }
     pub async fn request<P: Serialize>(&mut self, method: &str, params: P) -> Result<Value> {
@@ -56,6 +58,9 @@ impl StdioRpc {
                 .await
                 .context("stdio request timed out")??;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
+                if value.get("method").is_some() {
+                    self.notifications.push(value);
+                }
                 continue;
             }
             if let Some(error) = value.get("error") {
@@ -63,6 +68,9 @@ impl StdioRpc {
             }
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
+    }
+    pub fn take_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.notifications)
     }
     pub async fn notification<P: Serialize>(&mut self, method: &str, params: P) -> Result<()> {
         self.send(serde_json::json!({"jsonrpc":"2.0","method":method,"params":params}))
@@ -281,6 +289,7 @@ pub struct LspClient {
     config: LspServerConfig,
     rpc: StdioRpc,
     diagnostics: std::collections::HashMap<String, Vec<LspDiagnostic>>,
+    open_documents: std::collections::HashMap<String, (String, String, i32)>,
 }
 impl LspClient {
     pub async fn connect(config: LspServerConfig) -> Result<Self> {
@@ -294,6 +303,7 @@ impl LspClient {
             config,
             rpc,
             diagnostics: Default::default(),
+            open_documents: Default::default(),
         };
         c.initialize().await?;
         Ok(c)
@@ -312,6 +322,30 @@ impl LspClient {
     }
     pub async fn diagnostics(&self, uri: &str) -> &[LspDiagnostic] {
         self.diagnostics.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    }
+    /// Drain server notifications received while servicing a request.
+    /// Diagnostics are published asynchronously by LSP servers, so callers
+    /// must dispatch them rather than silently dropping them.
+    pub fn dispatch_notifications(&mut self) {
+        for notification in self.rpc.take_notifications() {
+            if notification.get("method").and_then(Value::as_str)
+                != Some("textDocument/publishDiagnostics")
+            {
+                continue;
+            }
+            let Some(params) = notification.get("params") else {
+                continue;
+            };
+            let (Some(uri), Some(items)) = (
+                params.get("uri").and_then(Value::as_str),
+                params.get("diagnostics"),
+            ) else {
+                continue;
+            };
+            if let Ok(items) = serde_json::from_value(items.clone()) {
+                self.diagnostics.insert(uri.to_owned(), items);
+            }
+        }
     }
     pub async fn request_locations(
         &mut self,
@@ -414,12 +448,21 @@ impl LspClient {
         language_id: &str,
         version: i32,
     ) -> Result<()> {
+        self.open_documents.insert(
+            uri.to_owned(),
+            (text.to_owned(), language_id.to_owned(), version),
+        );
         self.rpc.notification("textDocument/didOpen", serde_json::json!({"textDocument":{"uri":uri,"languageId":language_id,"version":version,"text":text}})).await
     }
     pub async fn change(&mut self, uri: &str, text: &str, version: i32) -> Result<()> {
+        if let Some(document) = self.open_documents.get_mut(uri) {
+            document.0 = text.to_owned();
+            document.2 = version;
+        }
         self.rpc.notification("textDocument/didChange", serde_json::json!({"textDocument":{"uri":uri,"version":version},"contentChanges":[{"text":text}]})).await
     }
     pub async fn close(&mut self, uri: &str) -> Result<()> {
+        self.open_documents.remove(uri);
         self.rpc
             .notification(
                 "textDocument/didClose",
@@ -446,7 +489,11 @@ impl LspClient {
             Duration::from_millis(self.config.timeout_ms),
         )
         .await?;
-        self.initialize().await
+        self.initialize().await?;
+        for (uri, (text, language_id, version)) in self.open_documents.clone() {
+            self.rpc.notification("textDocument/didOpen", serde_json::json!({"textDocument":{"uri":uri,"languageId":language_id,"version":version,"text":text}})).await?;
+        }
+        Ok(())
     }
 }
 pub struct LspManager {

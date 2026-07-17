@@ -40,6 +40,10 @@ pub struct Skill {
     pub instructions: String,
     pub description: Option<String>,
     pub allowed_tools: Vec<String>,
+    /// Files shipped next to the skill and made available as read-only
+    /// context.  Keep paths relative to the skill directory.
+    pub resources: Vec<PathBuf>,
+    pub scripts: Vec<PathBuf>,
     pub source: SkillSource,
     pub trusted: bool,
 }
@@ -164,8 +168,10 @@ pub fn discover_skills(roots: &[PathBuf]) -> std::io::Result<Vec<Skill>> {
                 description: metadata.get("description").cloned(),
                 allowed_tools: metadata
                     .get("allowed-tools")
-                    .map(|v| v.split_whitespace().map(str::to_owned).collect())
+                    .map(|value| parse_list(value))
                     .unwrap_or_default(),
+                resources: collect_adjacent(&path, "resources"),
+                scripts: collect_adjacent(&path, "scripts"),
                 instructions,
                 path,
                 source,
@@ -231,7 +237,11 @@ fn walk_skill_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 fn parse_skill(text: &str) -> (BTreeMap<String, String>, String) {
-    let Some(rest) = text.strip_prefix("---\n") else {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let Some(rest) = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    else {
         return (BTreeMap::new(), text.to_owned());
     };
     let Some((front, body)) = rest.split_once("\n---\n") else {
@@ -239,10 +249,47 @@ fn parse_skill(text: &str) -> (BTreeMap<String, String>, String) {
     };
     let metadata = front
         .lines()
-        .filter_map(|line| line.split_once(':'))
-        .map(|(k, v)| (k.trim().to_owned(), v.trim().trim_matches('"').to_owned()))
+        .filter_map(|line| {
+            let line = line.split_once('#').map_or(line, |(line, _)| line).trim();
+            line.split_once(':').map(|(k, v)| {
+                (
+                    k.trim().to_owned(),
+                    v.trim().trim_matches(['"', '\'']).to_owned(),
+                )
+            })
+        })
         .collect();
     (metadata, body.to_owned())
+}
+
+fn parse_list(value: &str) -> Vec<String> {
+    value
+        .trim_matches(['[', ']'])
+        .split([',', ' ', '\t'])
+        .map(|item| item.trim_matches(['"', '\'']))
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn collect_adjacent(skill: &Path, directory: &str) -> Vec<PathBuf> {
+    let Some(parent) = skill.parent() else {
+        return Vec::new();
+    };
+    let dir = parent.join(directory);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(parent).ok().map(Path::to_path_buf))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +360,7 @@ pub fn expand_dynamic_context(
 pub fn skill_context(skills: &[Skill]) -> String {
     skills
         .iter()
+        .filter(|skill| skill.trusted)
         .map(|skill| format!("## Skill: {}\n{}", skill.name, skill.instructions))
         .collect::<Vec<_>>()
         .join("\n\n")

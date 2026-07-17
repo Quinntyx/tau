@@ -53,8 +53,11 @@ impl SnapshotStore {
         let manifest_seed =
             serde_json::to_vec(&entries).map_err(|e| ToolError::Snapshot(e.to_string()))?;
         let id = digest(&manifest_seed);
+        std::fs::create_dir_all(&self.root).map_err(|e| ToolError::Snapshot(e.to_string()))?;
         let snapshot_dir = self.root.join(&id);
-        let blobs = snapshot_dir.join("blobs");
+        let temp_dir = self.root.join(format!(".{id}.tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let blobs = temp_dir.join("blobs");
         std::fs::create_dir_all(&blobs).map_err(|e| ToolError::Snapshot(e.to_string()))?;
         let manifest = SnapshotManifest {
             id: id.clone(),
@@ -71,10 +74,17 @@ impl SnapshotStore {
                 std::fs::write(blob, bytes).map_err(|e| ToolError::Snapshot(e.to_string()))?;
             }
         }
-        let manifest_path = snapshot_dir.join("manifest.json");
+        let manifest_path = temp_dir.join("manifest.json");
         let encoded =
             serde_json::to_vec_pretty(&manifest).map_err(|e| ToolError::Snapshot(e.to_string()))?;
         std::fs::write(&manifest_path, encoded).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+        if snapshot_dir.exists() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        } else {
+            std::fs::rename(&temp_dir, &snapshot_dir)
+                .map_err(|e| ToolError::Snapshot(e.to_string()))?;
+        }
+        let manifest_path = snapshot_dir.join("manifest.json");
         Ok(SnapshotCapture {
             id,
             manifest: manifest_path,
@@ -112,7 +122,7 @@ impl SnapshotStore {
     }
 
     pub fn restore(&self, id: &str) -> Result<usize, ToolError> {
-        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if id.len() != 40 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ToolError::Snapshot("invalid snapshot id".into()));
         }
         let snapshot_dir = self.root.join(id);
@@ -121,6 +131,20 @@ impl SnapshotStore {
             std::fs::read(&manifest_path).map_err(|e| ToolError::Snapshot(e.to_string()))?;
         let manifest: SnapshotManifest =
             serde_json::from_slice(&bytes).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+        if manifest.id != id {
+            return Err(ToolError::Snapshot("snapshot id mismatch".into()));
+        }
+        for entry in &manifest.entries {
+            validate_relative(&entry.path)?;
+            if let Some(digest) = &entry.digest {
+                if digest.len() != 40 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(ToolError::Snapshot("invalid blob digest".into()));
+                }
+                if !snapshot_dir.join("blobs").join(digest).is_file() {
+                    return Err(ToolError::Snapshot("missing snapshot blob".into()));
+                }
+            }
+        }
         let mut restored = 0;
         for entry in manifest.entries {
             let target = self.base.join(&entry.path);
@@ -151,7 +175,7 @@ impl SnapshotStore {
     fn collect(&self, path: &Path, entries: &mut Vec<SnapshotEntry>) -> Result<(), ToolError> {
         let relative = path
             .strip_prefix(&self.base)
-            .unwrap_or(path)
+            .map_err(|_| ToolError::Snapshot("path is outside snapshot root".into()))?
             .to_string_lossy()
             .replace('\\', "/");
         let metadata = match std::fs::symlink_metadata(path) {
@@ -222,6 +246,19 @@ impl SnapshotStore {
     }
 }
 
+fn validate_relative(path: &str) -> Result<(), ToolError> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        || path == "."
+    {
+        return Err(ToolError::Snapshot("invalid snapshot path".into()));
+    }
+    Ok(())
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha1::digest(bytes))
 }
@@ -241,5 +278,19 @@ mod tests {
         assert_eq!(store.restore(&capture.id).unwrap(), 1);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn restore_rejects_traversal_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::for_cwd(root.path());
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let dir = root.path().join(".tau/snapshots").join(id);
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({"id": id, "entries": [{"path":"../escape","kind":"file","existed":true,"bytes":0,"digest":null,"skipped":true}]}).to_string(),
+        ).unwrap();
+        assert!(store.restore(id).is_err());
     }
 }
