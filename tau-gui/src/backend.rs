@@ -209,22 +209,7 @@ impl Backend {
                     *guard = Some(tau_client::Client::connect(&socket).await?);
                 }
                 let client = guard.as_mut().expect("session initialized");
-                let params = TurnStartParams {
-                    model,
-                    prompt,
-                    session_id,
-                    cwd: Some(cwd),
-                    agent,
-                    task_tier: None,
-                    autonomous: None,
-                    action: Some(RequestAction::Submit),
-                    idempotency_key: IdempotencyKey::new(format!(
-                        "gui-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_nanos())
-                    )),
-                };
+                let params = turn_start_request(model, prompt, session_id, cwd, agent);
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
@@ -241,7 +226,7 @@ impl Backend {
                             }
                         }
                     }
-                    let complete = matches!(event, TurnStreamEvent::Complete(_));
+                    let complete = is_terminal_event(&event);
                     sender
                         .send(Ok(event))
                         .map_err(|_| anyhow::anyhow!("GUI closed"))?;
@@ -273,16 +258,7 @@ impl Backend {
             let active = active_turn.lock().ok().and_then(|mut value| value.take());
             if let Some((client, session_id, turn_id)) = active {
                 let _ = client
-                    .turn_cancel(TurnCancelParams {
-                        session_id,
-                        turn_id,
-                        idempotency_key: IdempotencyKey::new(format!(
-                            "gui-cancel-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |d| d.as_nanos())
-                        )),
-                    })
+                    .turn_cancel(cancel_request(session_id, turn_id))
                     .await;
             }
         });
@@ -304,11 +280,7 @@ impl Backend {
             let result = async {
                 let client = tau_client::Client::connect(socket).await?;
                 client
-                    .turn_replay(TurnReplayParams {
-                        session_id,
-                        after_sequence,
-                        limit: Some(500),
-                    })
+                    .turn_replay(replay_request(session_id, after_sequence))
                     .await
             }
             .await
@@ -317,6 +289,54 @@ impl Backend {
         });
         rx
     }
+}
+
+/// Typed protocol construction is kept separate from task orchestration so the
+/// GUI can be acceptance-tested without asserting on JSON or reducer state.
+fn turn_start_request(
+    model: String,
+    prompt: String,
+    session_id: Option<String>,
+    cwd: String,
+    agent: Option<String>,
+) -> TurnStartParams {
+    TurnStartParams {
+        model,
+        prompt,
+        session_id,
+        cwd: Some(cwd),
+        agent,
+        task_tier: None,
+        autonomous: None,
+        action: Some(RequestAction::Submit),
+        idempotency_key: IdempotencyKey::new(format!(
+            "gui-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        )),
+    }
+}
+
+fn cancel_request(session_id: String, turn_id: String) -> TurnCancelParams {
+    TurnCancelParams {
+        session_id,
+        turn_id,
+        idempotency_key: IdempotencyKey::new(format!(
+            "gui-cancel-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        )),
+    }
+}
+
+fn replay_request(session_id: String, after_sequence: u64) -> TurnReplayParams {
+    TurnReplayParams { session_id, after_sequence, limit: Some(500) }
+}
+
+fn is_terminal_event(event: &TurnStreamEvent) -> bool {
+    matches!(event, TurnStreamEvent::Complete(_))
 }
 
 async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
@@ -389,5 +409,41 @@ mod tests {
             "test/model".into(),
         );
         drop(backend);
+    }
+
+    #[test]
+    fn turn_request_uses_submit_and_preserves_typed_fields() {
+        let request = turn_start_request(
+            "m".into(), "hello".into(), Some("s".into()), "/tmp".into(), Some("a".into()),
+        );
+        assert_eq!(request.model, "m");
+        assert_eq!(request.prompt, "hello");
+        assert_eq!(request.session_id.as_deref(), Some("s"));
+        assert_eq!(request.cwd.as_deref(), Some("/tmp"));
+        assert!(matches!(request.action, Some(RequestAction::Submit)));
+    }
+
+    #[test]
+    fn cancel_and_replay_are_typed_protocol_requests() {
+        let cancel = cancel_request("session".into(), "turn".into());
+        assert_eq!(cancel.session_id, "session");
+        assert_eq!(cancel.turn_id, "turn");
+        let replay = replay_request("session".into(), 41);
+        assert_eq!(replay.session_id, "session");
+        assert_eq!(replay.after_sequence, 41);
+        assert_eq!(replay.limit, Some(500));
+    }
+
+    #[test]
+    fn terminal_stream_is_only_completion_not_interactive_events() {
+        let event = TurnStreamEvent::Event(tau_proto::prelude::SequencedEvent {
+            event_id: "e".into(), session_id: "s".into(), sequence: 1,
+            occurred_at: 0, request_id: None,
+            event: tau_proto::prelude::TurnEvent::PermissionRequested {
+                turn_id: "t".into(), request_id: "p".into(), tool: "shell".into(),
+                description: "run".into(),
+            },
+        });
+        assert!(!is_terminal_event(&event));
     }
 }
