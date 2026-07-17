@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
-use tau_proto::prelude::{IdempotencyKey, TurnStartParams};
+use tau_proto::prelude::{IdempotencyKey, TurnCancelParams, TurnReplayParams, TurnStartParams};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -17,6 +17,7 @@ pub struct Backend {
     runtime: tokio::runtime::Handle,
     session: Arc<tokio::sync::Mutex<Option<tau_client::Client>>>,
     active: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    active_turn: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
     _daemon: Arc<Mutex<Option<Child>>>,
     auto_started: bool,
 }
@@ -86,6 +87,7 @@ impl Backend {
             runtime: handle,
             session: Arc::new(tokio::sync::Mutex::new(None)),
             active: Arc::new(Mutex::new(None)),
+            active_turn: Arc::new(Mutex::new(None)),
             _daemon: Arc::new(Mutex::new(daemon)),
             auto_started,
         }
@@ -100,17 +102,28 @@ impl Backend {
     }
 
     pub fn auto_started(&self) -> bool {
-        self.auto_started
+        self.auto_started && !Self::toast_dismissed()
     }
 
     /// Apply one of the five ownership decisions. Existing daemons are never
     /// present in `_daemon`, so disowning can only affect a child we spawned.
     pub fn daemon_action(&self, action: DaemonAction) {
+        if matches!(action, DaemonAction::NeverShowAgain) {
+            if let Ok(path) = crate::preferences::path() {
+                let _ = std::fs::write(path.with_file_name("gui-daemon-toast.dismissed"), "1");
+            }
+        }
         if matches!(action, DaemonAction::Disown | DaemonAction::AlwaysDisown) {
             if let Ok(mut daemon) = self._daemon.lock() {
                 daemon.take();
             }
         }
+    }
+
+    fn toast_dismissed() -> bool {
+        crate::preferences::path()
+            .map(|path| path.with_file_name("gui-daemon-toast.dismissed").exists())
+            .unwrap_or(false)
     }
 
     /// Start a turn on the long-lived typed client session. The returned
@@ -120,11 +133,21 @@ impl Backend {
         prompt: String,
         session_id: Option<String>,
     ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
+        self.turn_with_agent(prompt, session_id, None)
+    }
+
+    pub fn turn_with_agent(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        agent: Option<String>,
+    ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let socket = self.socket.clone();
         let cwd = self.cwd.clone();
         let model = self.model.clone();
         let session = self.session.clone();
+        let active_turn = self.active_turn.clone();
         self.cancel();
         let task = self.runtime.spawn(async move {
             let result = async {
@@ -138,6 +161,7 @@ impl Backend {
                     prompt,
                     session_id,
                     cwd: Some(cwd),
+                    agent,
                     idempotency_key: IdempotencyKey::new(format!(
                         "gui-{}",
                         std::time::SystemTime::now()
@@ -148,11 +172,27 @@ impl Backend {
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
+                    if let TurnStreamEvent::Event(ref sequenced) = event {
+                        if let tau_proto::prelude::TurnEvent::TurnStarted { turn_id } =
+                            &sequenced.event
+                        {
+                            if let Ok(mut active) = active_turn.lock() {
+                                *active = Some((
+                                    client.clone(),
+                                    sequenced.session_id.clone(),
+                                    turn_id.clone(),
+                                ));
+                            }
+                        }
+                    }
                     let complete = matches!(event, TurnStreamEvent::Complete(_));
                     sender
                         .send(Ok(event))
                         .map_err(|_| anyhow::anyhow!("GUI closed"))?;
                     if complete {
+                        if let Ok(mut active) = active_turn.lock() {
+                            active.take();
+                        }
                         break;
                     }
                 }
@@ -172,11 +212,54 @@ impl Backend {
     /// Stop delivery for the active turn. The daemon owns cancellation; the
     /// next replay/turn remains available on the persistent session.
     pub fn cancel(&self) {
+        let active_turn = self.active_turn.clone();
+        self.runtime.spawn(async move {
+            let active = active_turn.lock().ok().and_then(|mut value| value.take());
+            if let Some((client, session_id, turn_id)) = active {
+                let _ = client
+                    .turn_cancel(TurnCancelParams {
+                        session_id,
+                        turn_id,
+                        idempotency_key: IdempotencyKey::new(format!(
+                            "gui-cancel-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_nanos())
+                        )),
+                    })
+                    .await;
+            }
+        });
         if let Ok(mut active) = self.active.lock() {
             if let Some(task) = active.take() {
                 task.abort();
             }
         }
+    }
+
+    pub fn replay(
+        &self,
+        session_id: String,
+        after_sequence: u64,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnReplayResult, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let client = tau_client::Client::connect(socket).await?;
+                client
+                    .turn_replay(TurnReplayParams {
+                        session_id,
+                        after_sequence,
+                        limit: Some(500),
+                    })
+                    .await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
     }
 }
 

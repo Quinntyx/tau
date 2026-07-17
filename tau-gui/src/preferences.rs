@@ -2,12 +2,23 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuiPreferences {
     pub favorites: Vec<String>,
     pub recent_models: Vec<String>,
     pub sidebar: bool,
     pub autonomy: bool,
+}
+
+impl Default for GuiPreferences {
+    fn default() -> Self {
+        Self {
+            favorites: Vec::new(),
+            recent_models: Vec::new(),
+            sidebar: true,
+            autonomy: false,
+        }
+    }
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -65,10 +76,16 @@ impl GuiPreferences {
         }
         let mut out = String::new();
         for value in &self.favorites {
-            out.push_str(&format!("favorite \"{value}\"\n"));
+            out.push_str(&format!(
+                "favorite {}\n",
+                kdl::KdlValue::String(value.clone())
+            ));
         }
         for value in &self.recent_models {
-            out.push_str(&format!("recent \"{value}\"\n"));
+            out.push_str(&format!(
+                "recent {}\n",
+                kdl::KdlValue::String(value.clone())
+            ));
         }
         out.push_str(&format!(
             "sidebar #{}\nautonomy #{}\n",
@@ -92,6 +109,20 @@ mod tests {
             recent_models: vec!["b".into()],
             sidebar: true,
             autonomy: false,
+        };
+        x.save_to(&p).unwrap();
+        assert_eq!(GuiPreferences::load_from(&p).unwrap(), x);
+    }
+
+    #[test]
+    fn round_trip_escapes_kdl_strings() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("nested").join("gui.kdl");
+        let x = GuiPreferences {
+            favorites: vec!["a\"\\\nb".into()],
+            recent_models: vec![],
+            sidebar: true,
+            autonomy: true,
         };
         x.save_to(&p).unwrap();
         assert_eq!(GuiPreferences::load_from(&p).unwrap(), x);

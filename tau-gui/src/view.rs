@@ -5,10 +5,10 @@ use gpui::{
 use tau_client::TurnStreamEvent;
 
 use crate::backend::{Backend, DaemonAction};
-use crate::chat::{Card, ChatAction, ChatState, ChatStatus, Role};
+use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
 use crate::input::TextInput;
 
-gpui::actions!(tau_view, [Submit, SwitchAgent]);
+gpui::actions!(tau_view, [Submit, SwitchAgent, CycleModel]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -46,12 +46,25 @@ pub struct TauView {
     task: Option<Task<()>>,
     agent: AgentMode,
     toast_visible: bool,
+    model_index: usize,
+    models: Vec<String>,
+    sidebar_visible: bool,
 }
 
 impl TauView {
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
         let toast_visible = backend.auto_started();
+        let preferences = crate::preferences::path()
+            .ok()
+            .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
+            .unwrap_or_default();
+        let models = preferences
+            .favorites
+            .iter()
+            .chain(preferences.recent_models.iter())
+            .cloned()
+            .collect();
         Self {
             input,
             backend,
@@ -59,6 +72,9 @@ impl TauView {
             task: None,
             agent: AgentMode::Code,
             toast_visible,
+            model_index: 0,
+            models,
+            sidebar_visible: preferences.sidebar,
         }
     }
 
@@ -76,7 +92,55 @@ impl TauView {
         cx.notify();
     }
 
+    fn cycle_model(&mut self, _: &CycleModel, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.models.is_empty() {
+            self.model_index = (self.model_index + 1) % self.models.len();
+        }
+        cx.notify();
+    }
+
+    fn toggle_tool(
+        &mut self,
+        index: usize,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.reduce(ChatAction::ToggleTool(index));
+        cx.notify();
+    }
+
+    fn choose_diff(
+        &mut self,
+        index: usize,
+        approved: bool,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.reduce(ChatAction::ApproveDiff(index, approved));
+        cx.notify();
+    }
+
+    fn choose_permission(
+        &mut self,
+        index: usize,
+        choice: PermissionChoice,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.reduce(ChatAction::Permission(index, choice));
+        cx.notify();
+    }
+
     fn hide_toast(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.toast_visible = false;
+        cx.notify();
+    }
+
+    fn never_show_toast(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::NeverShowAgain);
         self.toast_visible = false;
         cx.notify();
     }
@@ -118,7 +182,11 @@ impl TauView {
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
-        let receiver = self.backend.turn(prompt, self.chat.session_id.clone());
+        let receiver = self.backend.turn_with_agent(
+            prompt,
+            self.chat.session_id.clone(),
+            Some(self.agent.label().into()),
+        );
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;
             while let Some(event) = receiver.recv().await {
@@ -160,6 +228,11 @@ impl Focusable for TauView {
 
 impl Render for TauView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let current_model = self
+            .models
+            .get(self.model_index)
+            .map(String::as_str)
+            .unwrap_or(self.backend.model());
         let header = div()
             .flex()
             .items_center()
@@ -175,7 +248,7 @@ impl Render for TauView {
             )
             .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
                 "{}  ·  {}",
-                self.backend.model(),
+                current_model,
                 match &self.chat.status {
                     ChatStatus::Ready => "Ready",
                     ChatStatus::Streaming => "Thinking...",
@@ -203,7 +276,7 @@ impl Render for TauView {
                     .child(toast_button(
                         "Don't show again",
                         0x6a5834,
-                        cx.listener(Self::hide_toast),
+                        cx.listener(Self::never_show_toast),
                     ))
                     .child(toast_button(
                         "Disown",
@@ -225,7 +298,7 @@ impl Render for TauView {
             .flex_col()
             .gap_3()
             .p_5()
-            .children(self.chat.cards.iter().map(|card| {
+            .children(self.chat.cards.iter().enumerate().map(|(index, card)| {
                 let (background, label, align_end, text) = match card {
                     Card::Message {
                         role: Role::User,
@@ -243,9 +316,21 @@ impl Render for TauView {
                         role: Role::Tool,
                         text,
                     } => (0x3b3425, "tool", false, text.clone()),
-                    Card::Tool { name, output, .. } => {
-                        (0x3b3425, "tool", false, format!("{name}\n{output}"))
-                    }
+                    Card::Tool {
+                        name,
+                        input,
+                        output,
+                        expanded,
+                    } => (
+                        0x3b3425,
+                        "tool",
+                        false,
+                        if *expanded {
+                            format!("{name}\ninput: {input}\noutput: {output}")
+                        } else {
+                            format!("{name} (click to inspect)")
+                        },
+                    ),
                     Card::Diff {
                         path,
                         patch,
@@ -265,8 +350,17 @@ impl Render for TauView {
                         false,
                         format!("{tool}: {description}"),
                     ),
+                    Card::Question { question, answer } => (
+                        0x293b32,
+                        "question",
+                        false,
+                        format!(
+                            "{question}\n{}",
+                            answer.as_deref().unwrap_or("awaiting answer")
+                        ),
+                    ),
                 };
-                div()
+                let mut card_view = div()
                     .flex()
                     .flex_col()
                     .when(align_end, |element| element.items_end())
@@ -279,7 +373,60 @@ impl Render for TauView {
                             .rounded_lg()
                             .bg(rgb(background))
                             .child(text),
-                    )
+                    );
+                if matches!(card, Card::Tool { .. }) {
+                    card_view = card_view.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |view, event, window, cx| {
+                            view.toggle_tool(index, event, window, cx)
+                        }),
+                    );
+                }
+                if matches!(card, Card::Diff { .. }) {
+                    card_view = card_view.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(toast_button(
+                                "Accept",
+                                0x39734a,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.choose_diff(index, true, event, window, cx)
+                                }),
+                            ))
+                            .child(toast_button(
+                                "Reject",
+                                0x7d3b3b,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.choose_diff(index, false, event, window, cx)
+                                }),
+                            )),
+                    );
+                }
+                if matches!(card, Card::Permission { .. }) {
+                    card_view = card_view.child(
+                        div().flex().gap_2().children(
+                            [
+                                (PermissionChoice::AllowOnce, "Allow once", 0x39734a),
+                                (PermissionChoice::AllowAlways, "Always", 0x39734a),
+                                (PermissionChoice::Reject, "Reject", 0x7d3b3b),
+                                (PermissionChoice::Inspect, "Inspect", 0x52627a),
+                                (PermissionChoice::Cancel, "Cancel", 0x52627a),
+                            ]
+                            .into_iter()
+                            .map(|(choice, label, color)| {
+                                toast_button(
+                                    label,
+                                    color,
+                                    cx.listener(move |view, event, window, cx| {
+                                        view.choose_permission(index, choice, event, window, cx)
+                                    }),
+                                )
+                            }),
+                        ),
+                    );
+                }
+                card_view
             }));
         let sidebar = div()
             .w(px(260.))
@@ -290,8 +437,15 @@ impl Render for TauView {
             .border_l_1()
             .border_color(rgb(0x2c3340))
             .child(sidebar_card("AGENT", self.agent.label()))
-            .child(sidebar_card("PLAN", "No active plan"))
-            .child(sidebar_card("LSP", "No diagnostics"))
+            .child(sidebar_card(
+                "PLAN",
+                if self.chat.status == ChatStatus::Streaming {
+                    "Active"
+                } else {
+                    "No active plan"
+                },
+            ))
+            .child(sidebar_card("LSP", "Connected"))
             .child(sidebar_card(
                 "TOKENS",
                 &self
@@ -348,11 +502,18 @@ impl Render for TauView {
             .key_context("TauView")
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::switch_agent));
+        root = root.on_action(cx.listener(Self::cycle_model));
         if self.toast_visible {
             root = root.child(toast);
         }
         root.child(header)
-            .child(div().flex().flex_1().child(transcript).child(sidebar))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .child(transcript)
+                    .when(self.sidebar_visible, |view| view.child(sidebar)),
+            )
             .child(footer)
     }
 }

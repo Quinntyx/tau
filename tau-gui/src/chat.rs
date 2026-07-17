@@ -31,6 +31,10 @@ pub enum Card {
         tool: String,
         description: String,
     },
+    Question {
+        question: String,
+        answer: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +42,15 @@ pub enum ChatStatus {
     Ready,
     Streaming,
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChoice {
+    AllowOnce,
+    AllowAlways,
+    Reject,
+    Inspect,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +83,8 @@ pub enum ChatAction {
     Error(String),
     ToggleTool(usize),
     ApproveDiff(usize, bool),
+    Permission(usize, PermissionChoice),
+    AnswerQuestion(usize, String),
 }
 
 impl ChatState {
@@ -140,6 +155,27 @@ impl ChatState {
                 }
                 _ => false,
             },
+            ChatAction::Permission(index, choice) => match self.cards.get(index) {
+                Some(Card::Permission { .. }) => {
+                    if matches!(
+                        choice,
+                        PermissionChoice::AllowOnce
+                            | PermissionChoice::AllowAlways
+                            | PermissionChoice::Reject
+                    ) {
+                        self.cards.remove(index);
+                    }
+                    true
+                }
+                _ => false,
+            },
+            ChatAction::AnswerQuestion(index, answer) => match self.cards.get_mut(index) {
+                Some(Card::Question { answer: value, .. }) => {
+                    *value = Some(answer);
+                    true
+                }
+                _ => false,
+            },
             ChatAction::Submit(_) => false,
         }
     }
@@ -162,6 +198,19 @@ impl ChatState {
                     input: String::new(),
                     output: output.inline,
                     expanded: false,
+                });
+                true
+            }
+            TurnEvent::PermissionRequested {
+                tool, description, ..
+            } => {
+                self.cards.push(Card::Permission { tool, description });
+                true
+            }
+            TurnEvent::QuestionAsked { question, .. } => {
+                self.cards.push(Card::Question {
+                    question,
+                    answer: None,
                 });
                 true
             }
@@ -226,5 +275,31 @@ mod tests {
         state.reduce(ChatAction::Completion(CompletionEvent::Complete(result)));
         assert_eq!(state.status, ChatStatus::Ready);
         assert_eq!(state.usage, Some(3));
+    }
+
+    #[test]
+    fn safety_cards_are_actionable_and_raw_tool_details_survive() {
+        let mut state = ChatState::default();
+        state.cards.push(Card::Tool {
+            name: "shell".into(),
+            input: "{\"cmd\":\"pwd\"}".into(),
+            output: "ok".into(),
+            expanded: false,
+        });
+        assert!(state.reduce(ChatAction::ToggleTool(0)));
+        assert!(
+            matches!(&state.cards[0], Card::Tool { expanded: true, input, .. } if input.contains("pwd"))
+        );
+        state.cards.push(Card::Permission {
+            tool: "write".into(),
+            description: "modify file".into(),
+        });
+        assert!(state.reduce(ChatAction::Permission(1, PermissionChoice::AllowOnce)));
+        assert!(
+            !state
+                .cards
+                .iter()
+                .any(|card| matches!(card, Card::Permission { .. }))
+        );
     }
 }
