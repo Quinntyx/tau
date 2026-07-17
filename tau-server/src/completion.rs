@@ -4,13 +4,14 @@ use anyhow::{Result, bail};
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::StreamExt;
 use rig_core::OneOrMany;
-use rig_core::completion::{CompletionRequest, Message as RigMessage, Usage};
+use rig_core::completion::{AssistantContent, CompletionRequest, Message as RigMessage, Usage};
 use serde::Serialize;
 use serde_json::Value;
 use tau_core::agent::AgentRunner;
 use tau_core::credentials::CredentialStore;
 use tau_core::db::{ContentBlock, Message as DbMessage, Session};
 use tau_core::provider::{Provider, TauDelta};
+use tau_core::tools::ToolContext;
 use tau_proto::prelude::*;
 
 use crate::AppState;
@@ -73,17 +74,15 @@ pub(crate) async fn handle(
         }
     };
 
-    let request = CompletionRequest {
-        model: None,
-        preamble: None,
-        chat_history: chat_history(&session.1, &params.prompt),
-        documents: vec![],
-        tools: vec![],
-        temperature: None,
-        max_tokens: None,
-        tool_choice: None,
-        additional_params: None,
-        output_schema: None,
+    let mut history = chat_history(&session.1, &params.prompt);
+    let runner = AgentRunner::new(provider);
+    let tool_definitions = runner.tool_definitions();
+    let tool_context = match ToolContext::new(&session.0.cwd) {
+        Ok(context) => context,
+        Err(error) => {
+            send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
+            return;
+        }
     };
     if let Err(error) = state.db().append_message(
         &session.0.id,
@@ -94,54 +93,113 @@ pub(crate) async fn handle(
         return;
     }
 
-    let mut stream = match AgentRunner::new(provider).stream(request).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-            return;
-        }
-    };
     let mut text = String::new();
     let mut usage = Usage::default();
-    while let Some(delta) = stream.next().await {
-        match delta {
-            Ok(TauDelta::Text(chunk)) => {
-                text.push_str(&chunk);
-                let notification = Notification {
-                    jsonrpc: JsonRpc::default(),
-                    method: METHOD_COMPLETION_DELTA.to_string(),
-                    params: Some(CompletionDelta {
-                        request_id: id.clone(),
-                        session_id: session.0.id.clone(),
-                        text: chunk,
-                        usage: None,
-                    }),
-                };
-                if !send(socket, &notification).await {
-                    return;
-                }
-            }
-            Ok(TauDelta::Usage(final_usage)) => {
-                usage = final_usage;
-                let notification = Notification {
-                    jsonrpc: JsonRpc::default(),
-                    method: METHOD_COMPLETION_DELTA.to_string(),
-                    params: Some(CompletionDelta {
-                        request_id: id.clone(),
-                        session_id: session.0.id.clone(),
-                        text: String::new(),
-                        usage: Some(usage_summary(usage)),
-                    }),
-                };
-                if !send(socket, &notification).await {
-                    return;
-                }
-            }
+    loop {
+        let request = CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: history.clone(),
+            documents: vec![],
+            tools: tool_definitions.clone(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+        let mut stream = match runner.stream(request).await {
+            Ok(stream) => stream,
             Err(error) => {
                 send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
                 return;
             }
+        };
+        let mut turn_text = String::new();
+        let mut calls = Vec::new();
+        while let Some(delta) = stream.next().await {
+            match delta {
+                Ok(TauDelta::Text(chunk)) => {
+                    turn_text.push_str(&chunk);
+                    let notification = Notification {
+                        jsonrpc: JsonRpc::default(),
+                        method: METHOD_COMPLETION_DELTA.to_string(),
+                        params: Some(CompletionDelta {
+                            request_id: id.clone(),
+                            session_id: session.0.id.clone(),
+                            text: chunk,
+                            usage: None,
+                        }),
+                    };
+                    if !send(socket, &notification).await {
+                        return;
+                    }
+                }
+                Ok(TauDelta::ToolCall(call)) => calls.push(call),
+                Ok(TauDelta::Usage(final_usage)) => {
+                    usage = final_usage;
+                    let notification = Notification {
+                        jsonrpc: JsonRpc::default(),
+                        method: METHOD_COMPLETION_DELTA.to_string(),
+                        params: Some(CompletionDelta {
+                            request_id: id.clone(),
+                            session_id: session.0.id.clone(),
+                            text: String::new(),
+                            usage: Some(usage_summary(usage)),
+                        }),
+                    };
+                    if !send(socket, &notification).await {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
+                    return;
+                }
+            }
         }
+        text.push_str(&turn_text);
+        if calls.is_empty() {
+            break;
+        }
+        let mut next_history = history.into_iter().collect::<Vec<_>>();
+        if !turn_text.is_empty() {
+            next_history.push(RigMessage::assistant(turn_text));
+        }
+        for call in calls {
+            next_history.push(RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::ToolCall(call.clone())),
+            });
+            let rendered = match runner.tools().execute(
+                &call.function.name,
+                call.function.arguments.clone(),
+                &tool_context,
+            ) {
+                Ok(result) => result.rendered,
+                Err(error) => format!("tool error: {error}"),
+            };
+            let card = format!("\n[tool {}]\n{}\n", call.function.name, rendered);
+            if !send(
+                socket,
+                &Notification {
+                    jsonrpc: JsonRpc::default(),
+                    method: METHOD_COMPLETION_DELTA.to_string(),
+                    params: Some(CompletionDelta {
+                        request_id: id.clone(),
+                        session_id: session.0.id.clone(),
+                        text: card,
+                        usage: None,
+                    }),
+                },
+            )
+            .await
+            {
+                return;
+            }
+            next_history.push(RigMessage::tool_result(call.id, rendered));
+        }
+        history = OneOrMany::many(next_history).expect("history contains the prompt");
     }
 
     let assistant =

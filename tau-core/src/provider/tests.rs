@@ -25,6 +25,7 @@ async fn mock_stream_yields_text_then_usage() {
         match delta.unwrap() {
             TauDelta::Text(chunk) => text.push_str(&chunk),
             TauDelta::Usage(u) => usage_tokens = Some(u.total_tokens),
+            TauDelta::ToolCall(_) => {}
         }
     }
     assert_eq!(text, "hello world");

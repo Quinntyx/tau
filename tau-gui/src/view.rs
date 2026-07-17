@@ -8,16 +8,41 @@ use tau_proto::prelude::CompletionStreamResult;
 use crate::backend::Backend;
 use crate::input::TextInput;
 
-gpui::actions!(tau_view, [Submit]);
+gpui::actions!(tau_view, [Submit, SwitchAgent]);
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("enter", Submit, None)]);
+    cx.bind_keys([
+        KeyBinding::new("enter", Submit, None),
+        KeyBinding::new("tab", SwitchAgent, None),
+    ]);
 }
 
 #[derive(Clone, Copy)]
 enum Role {
     User,
     Assistant,
+}
+
+#[derive(Clone, Copy)]
+enum AgentMode {
+    Plan,
+    Code,
+}
+
+impl AgentMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan",
+            Self::Code => "Code",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Plan => Self::Code,
+            Self::Code => Self::Plan,
+        }
+    }
 }
 
 struct Message {
@@ -34,6 +59,7 @@ pub struct TauView {
     usage: Option<String>,
     status: String,
     task: Option<Task<()>>,
+    agent: AgentMode,
 }
 
 impl TauView {
@@ -48,6 +74,7 @@ impl TauView {
             usage: None,
             status: "Ready".into(),
             task: None,
+            agent: AgentMode::Code,
         }
     }
 
@@ -57,6 +84,12 @@ impl TauView {
 
     fn click_send(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.send(window, cx);
+    }
+
+    fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent = self.agent.next();
+        self.status = format!("{} agent", self.agent.label());
+        cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -181,6 +214,26 @@ impl Render for TauView {
                             .child(message.text.clone()),
                     )
             }));
+        let sidebar = div()
+            .w(px(260.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .border_l_1()
+            .border_color(rgb(0x2c3340))
+            .child(sidebar_card("AGENT", self.agent.label()))
+            .child(sidebar_card("PLAN", "No active plan"))
+            .child(sidebar_card("LSP", "No diagnostics"))
+            .child(sidebar_card(
+                "TOKENS",
+                self.usage.as_deref().unwrap_or("No usage yet"),
+            ))
+            .child(sidebar_card(
+                "SESSION",
+                self.session_id.as_deref().unwrap_or("Not started"),
+            ))
+            .child(sidebar_card("DIRECTORY", self.backend.cwd()));
         let footer = div().p_4().border_t_1().border_color(rgb(0x2c3340)).child(
             div()
                 .flex()
@@ -207,8 +260,26 @@ impl Render for TauView {
             .flex_col()
             .key_context("TauView")
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::switch_agent))
             .child(header)
-            .child(transcript)
+            .child(div().flex().flex_1().child(transcript).child(sidebar))
             .child(footer)
     }
+}
+
+fn sidebar_card(title: &str, value: &str) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .rounded_md()
+        .bg(rgb(0x1b1f27))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x7e8a9d))
+                .child(title.to_string()),
+        )
+        .child(div().text_sm().child(value.to_string()))
 }

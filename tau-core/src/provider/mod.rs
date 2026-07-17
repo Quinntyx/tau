@@ -14,13 +14,15 @@ pub use ops::{completion_request, stream_with_model};
 use std::pin::Pin;
 
 use futures::Stream;
-use rig_core::completion::{CompletionError, Usage};
+use rig_core::completion::{CompletionError, Usage, message::ToolCall};
 
 /// Normalised streaming delta — text chunks and final usage.
 #[derive(Debug, Clone)]
 pub enum TauDelta {
     /// Text chunk from the assistant.
     Text(String),
+    /// A complete function call requested by the model.
+    ToolCall(ToolCall),
     /// Token usage from the final response.
     Usage(Usage),
 }

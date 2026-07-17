@@ -8,6 +8,8 @@ pub mod agent;
 pub mod config;
 pub mod credentials;
 pub mod db;
+pub mod permissions;
+pub mod plan;
 pub mod provider;
 pub mod tools;
 

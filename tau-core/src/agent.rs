@@ -4,7 +4,7 @@
 //! execution and hook-driven multi-turn loops can be added behind this stable
 //! boundary without changing clients.
 
-use rig_core::completion::{CompletionError, CompletionRequest};
+use rig_core::completion::{CompletionError, CompletionRequest, ToolDefinition};
 
 use crate::provider::{Provider, TauStream};
 use crate::tools::ToolRegistry;
@@ -30,6 +30,18 @@ impl AgentRunner {
 
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
+    }
+
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| ToolDefinition {
+                name: descriptor.name,
+                description: descriptor.description,
+                parameters: serde_json::json!({"type": "object"}),
+            })
+            .collect()
     }
 
     pub async fn stream(&self, request: CompletionRequest) -> Result<TauStream, CompletionError> {

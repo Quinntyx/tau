@@ -40,6 +40,10 @@ impl Backend {
         &self.model
     }
 
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
     pub fn completion(
         &self,
         prompt: String,
