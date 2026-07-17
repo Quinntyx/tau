@@ -52,6 +52,9 @@ pub trait Tool: Send + Sync + 'static {
     type Output: Serialize;
 
     fn descriptor(&self) -> ToolDescriptor;
+    fn schema(&self) -> serde_json::Value {
+        schema_for(&self.descriptor().name)
+    }
     fn execute(&self, input: Self::Input, context: &ToolContext)
     -> Result<Self::Output, ToolError>;
     fn render(&self, output: &Self::Output) -> String;
@@ -59,6 +62,7 @@ pub trait Tool: Send + Sync + 'static {
 
 trait ErasedTool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
+    fn schema(&self) -> serde_json::Value;
     fn execute(
         &self,
         input: serde_json::Value,
@@ -72,6 +76,10 @@ where
 {
     fn descriptor(&self) -> ToolDescriptor {
         Tool::descriptor(self)
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        Tool::schema(self)
     }
 
     fn execute(
@@ -121,12 +129,9 @@ impl ToolRegistry {
     }
 
     pub fn schemas(&self) -> Vec<(ToolDescriptor, serde_json::Value)> {
-        self.descriptors()
-            .into_iter()
-            .map(|d| {
-                let schema = schema_for(&d.name);
-                (d, schema)
-            })
+        self.tools
+            .values()
+            .map(|tool| (tool.descriptor(), tool.schema()))
             .collect()
     }
 

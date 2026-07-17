@@ -11,6 +11,17 @@ pub struct Plan {
     pub current_step: Option<usize>,
     #[serde(default)]
     pub airtight_revoked: bool,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub authority: PlanAuthority,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum PlanAuthority {
+    #[default]
+    Human,
+    SteeringAgent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +46,8 @@ impl Plan {
             steps: Vec::new(),
             current_step: None,
             airtight_revoked: false,
+            revision: 1,
+            authority: PlanAuthority::Human,
         }
     }
 
@@ -99,6 +112,7 @@ impl Plan {
         for step in &mut self.steps {
             step.airtight = false;
         }
+        self.revision = self.revision.saturating_add(1);
     }
 
     pub fn current_is_airtight(&self) -> bool {
@@ -149,6 +163,36 @@ impl Plan {
             }
         }
         output
+    }
+}
+
+impl Plan {
+    /// Only the human or an explicitly authorized steering agent may create a
+    /// new airtight authority. The ordinary autonomous model is never an
+    /// authority and therefore cannot bypass this gate.
+    pub fn authorize_revision(&mut self, actor: PlanAuthority, expected_revision: u64) -> bool {
+        if self.revision != expected_revision {
+            return false;
+        }
+        self.authority = actor;
+        self.revision = self.revision.saturating_add(1);
+        true
+    }
+    pub fn attach_qa(
+        &mut self,
+        step: usize,
+        qa_id: impl Into<String>,
+        actor: PlanAuthority,
+    ) -> bool {
+        if self.authority != actor || self.airtight_revoked {
+            return false;
+        }
+        let Some(step) = self.steps.get_mut(step) else {
+            return false;
+        };
+        step.qa_ids.push(qa_id.into());
+        self.revision = self.revision.saturating_add(1);
+        true
     }
 }
 

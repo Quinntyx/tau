@@ -1,9 +1,49 @@
 use super::Db;
 use super::domain::*;
+use crate::permissions::{Decision, PermissionEngine, Rule};
 use anyhow::{Result, bail};
 use uuid::Uuid;
 
 impl Db {
+    /// Persist the canonical ordered session rules. Replacing the full set in
+    /// one transaction prevents a partially updated policy from authorizing a
+    /// call after a client reconnects.
+    pub fn save_session_permissions(
+        &self,
+        session_id: &str,
+        engine: &PermissionEngine,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM session_permissions WHERE session_id=?1",
+            [session_id],
+        )?;
+        for (ordinal, rule) in engine.rules().iter().enumerate() {
+            tx.execute("INSERT INTO session_permissions(session_id,ordinal,pattern,decision) VALUES(?1,?2,?3,?4)", rusqlite::params![session_id, ordinal as i64, rule.pattern, serde_json::to_string(&rule.decision)?])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_session_permissions(&self, session_id: &str) -> Result<PermissionEngine> {
+        let conn = self.conn.lock().unwrap();
+        let mut engine = PermissionEngine::default();
+        let mut stmt = conn.prepare(
+            "SELECT pattern,decision FROM session_permissions WHERE session_id=?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (pattern, decision) = row?;
+            engine.add_rule(Rule::new(
+                pattern,
+                serde_json::from_str::<Decision>(&decision)?,
+            )?);
+        }
+        Ok(engine)
+    }
     pub fn create_plan_revision(
         &self,
         session_id: &str,

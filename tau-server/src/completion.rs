@@ -10,6 +10,7 @@ use serde_json::Value;
 use tau_core::agent::AgentRunner;
 use tau_core::credentials::CredentialStore;
 use tau_core::db::{ContentBlock, Message as DbMessage, Session};
+use tau_core::permissions::{Decision, PermissionEngine, authorize};
 use tau_core::provider::{Provider, TauDelta};
 use tau_core::tools::ToolContext;
 use tau_proto::prelude::*;
@@ -113,6 +114,11 @@ pub(crate) async fn handle(
 
     let mut text = String::new();
     let mut usage = Usage::default();
+    // Keep authorization at the last possible boundary: no model call can
+    // reach a tool body without passing the canonical engine (including hard
+    // denials). Session-specific rules are loaded by higher-level turn APIs;
+    // the completion compatibility path starts with the safe allow baseline.
+    let mut permissions = PermissionEngine::default().with_default(Decision::Allow);
     loop {
         let request = CompletionRequest {
             model: None,
@@ -189,12 +195,19 @@ pub(crate) async fn handle(
                 id: None,
                 content: OneOrMany::one(AssistantContent::ToolCall(call.clone())),
             });
-            let rendered = match runner.tools().execute(
+            let rendered = match authorize(
+                &mut permissions,
                 &call.function.name,
-                call.function.arguments.clone(),
-                &tool_context,
+                &call.function.arguments,
             ) {
-                Ok(result) => result.rendered,
+                Ok(()) => match runner.tools().execute(
+                    &call.function.name,
+                    call.function.arguments.clone(),
+                    &tool_context,
+                ) {
+                    Ok(result) => result.rendered,
+                    Err(error) => format!("tool error: {error}"),
+                },
                 Err(error) => format!("tool error: {error}"),
             };
             let card = format!("\n[tool {}]\n{}\n", call.function.name, rendered);

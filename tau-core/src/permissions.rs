@@ -2,6 +2,9 @@
 
 use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::{Mutex, Notify};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +56,12 @@ pub struct PermissionEngine {
     default: Decision,
     #[serde(default)]
     hard_denials: Vec<String>,
+    #[serde(default = "default_network_decision")]
+    network_default: Decision,
+}
+
+fn default_network_decision() -> Decision {
+    Decision::Allow
 }
 
 impl Default for PermissionEngine {
@@ -67,6 +76,7 @@ impl Default for PermissionEngine {
                 "chmod:*".into(),
                 "git:push*".into(),
             ],
+            network_default: Decision::Allow,
         }
     }
 }
@@ -83,7 +93,12 @@ impl PermissionEngine {
 
     /// The risk-based default is overridden for network operations.
     pub fn with_network_default(mut self) -> Self {
-        self.default = Decision::Allow;
+        self.network_default = Decision::Allow;
+        self
+    }
+
+    pub fn with_network_decision(mut self, decision: Decision) -> Self {
+        self.network_default = decision;
         self
     }
 
@@ -100,7 +115,7 @@ impl PermissionEngine {
 
     pub fn evaluate(&mut self, tool: &str, args: &serde_json::Value) -> Decision {
         if tool == "network" || tool.starts_with("network:") {
-            return Decision::Allow;
+            return self.network_default;
         }
         let subject = format!("{tool}:{args}");
         if self.hard_denials.iter().any(|pattern| {
@@ -114,6 +129,87 @@ impl PermissionEngine {
             .iter_mut()
             .find_map(|rule| rule.matches(&subject).then_some(rule.decision))
             .unwrap_or(self.default)
+    }
+}
+
+/// A durable-shaped approval request. The broker intentionally waits until a
+/// reply arrives; dropping a client must not turn an approval into execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PermissionRequest {
+    pub id: String,
+    pub run_id: String,
+    pub tool: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PermissionReply {
+    Allow,
+    Reject,
+}
+
+type PendingPermission = (PermissionRequest, Option<PermissionReply>);
+
+#[derive(Clone, Default)]
+pub struct PermissionBroker {
+    pending: Arc<Mutex<std::collections::BTreeMap<String, PendingPermission>>>,
+    changed: Arc<Notify>,
+}
+
+impl PermissionBroker {
+    pub async fn request(
+        &self,
+        run_id: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> PermissionRequest {
+        let request = PermissionRequest {
+            id: Uuid::new_v4().to_string(),
+            run_id: run_id.into(),
+            tool: tool.into(),
+            arguments,
+        };
+        self.pending
+            .lock()
+            .await
+            .insert(request.id.clone(), (request.clone(), None));
+        request
+    }
+
+    pub async fn wait(&self, id: &str) -> Option<PermissionReply> {
+        loop {
+            let mut pending = self.pending.lock().await;
+            if let Some((_, Some(reply))) = pending.get(id) {
+                let reply = *reply;
+                pending.remove(id);
+                return Some(reply);
+            }
+            if !pending.contains_key(id) {
+                return None;
+            }
+            drop(pending);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    pub async fn reply(&self, id: &str, reply: PermissionReply) -> bool {
+        let mut pending = self.pending.lock().await;
+        let Some((_, slot)) = pending.get_mut(id) else {
+            return false;
+        };
+        *slot = Some(reply);
+        self.changed.notify_one();
+        true
+    }
+
+    pub async fn pending(&self) -> Vec<PermissionRequest> {
+        self.pending
+            .lock()
+            .await
+            .values()
+            .map(|(request, _)| request.clone())
+            .filter(|r| !r.run_id.is_empty())
+            .collect()
     }
 }
 
