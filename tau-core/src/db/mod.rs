@@ -1,8 +1,8 @@
 //! `Db` type, connection management, and schema migration.
 
 pub mod domain;
-mod journal;
 mod epochs;
+mod journal;
 mod messages;
 mod policy;
 mod qa_records;

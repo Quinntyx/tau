@@ -144,7 +144,8 @@ impl Config {
                             "prompt" => agent.prompt = Some(string_arg(child, "prompt")?),
                             "model" => agent.model = Some(string_arg(child, "model")?),
                             "compaction_agent" => {
-                                agent.compaction_agent = Some(string_arg(child, "compaction_agent")?)
+                                agent.compaction_agent =
+                                    Some(string_arg(child, "compaction_agent")?)
                             }
                             other => anyhow::bail!("unknown agent field `{other}`"),
                         }
