@@ -2191,6 +2191,7 @@ dependencies = [
  "dirs",
  "tau-client",
  "tau-core",
+ "tau-gui",
  "tau-server",
  "tokio",
  "tracing",
@@ -2235,6 +2236,21 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "tau-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tau-client",
+ "tau-core",
+ "tau-proto",
+ "tokio",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@ members = [
     "tau-server",
     "tau-client",
     "tau-cli",
+    "tau-gui",
 ]
 
 [workspace.package]
@@ -61,3 +62,4 @@ tau-proto = { path = "tau-proto", version = "0.1.0" }
 tau-core = { path = "tau-core", version = "0.1.0" }
 tau-client = { path = "tau-client", version = "0.1.0" }
 tau-server = { path = "tau-server", version = "0.1.0" }
+tau-gui = { path = "tau-gui", version = "0.1.0" }

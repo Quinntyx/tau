@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Tui => bail!("`tau tui` is not implemented yet"),
-        Command::Gui => bail!("`tau gui` is not implemented yet"),
+        Command::Gui => tau_gui::run(socket).await,
         Command::Config => bail!("`tau config` is not implemented yet"),
         Command::Resume => bail!("`tau resume` is not implemented yet"),
     }
