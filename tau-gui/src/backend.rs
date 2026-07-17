@@ -38,6 +38,78 @@ pub enum DaemonAction {
     NeverShowAgain,
 }
 
+/// A point-in-time, UI-facing description of the backend.  Optional values are
+/// intentional: the daemon does not expose every piece of sidebar state yet,
+/// and callers must not display an invented "connected" or "active" value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackendSnapshot {
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub session: SessionSnapshot,
+    pub cwd: Option<String>,
+    pub plan: PlanSnapshot,
+    pub lsp: ServiceSnapshot,
+    pub usage: UsageSnapshot,
+    pub mcp: ServiceSnapshot,
+    pub task: TaskSnapshot,
+    pub startup: StartupSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionSnapshot {
+    pub id: Option<String>,
+    pub state: SessionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionState {
+    #[default]
+    Unavailable,
+    Connected,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanSnapshot {
+    pub name: Option<String>,
+    pub current_step: Option<String>,
+    pub airtight: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceSnapshot {
+    pub available: Option<bool>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageSnapshot {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskSnapshot {
+    pub tier: Option<u8>,
+    pub autonomous: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupSnapshot {
+    Loading,
+    Ready,
+    Unavailable,
+    Error(String),
+}
+
+impl Default for StartupSnapshot {
+    fn default() -> Self {
+        Self::Loading
+    }
+}
+
 /// Ownership is explicit: a daemon found before connection is never stopped;
 /// only a child returned by `ensure_daemon` is owned by the GUI.
 fn stop_child(child: &mut Child) {
@@ -147,6 +219,45 @@ impl Backend {
                 .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
                 .map(|preferences| preferences.daemon_warning)
                 .unwrap_or(true)
+    }
+
+    /// Return the facts currently known by the GUI backend without probing or
+    /// fabricating server state.  This is cheap and safe to call while
+    /// rendering; a contended session lock is represented as unavailable.
+    pub fn operational_snapshot(&self) -> BackendSnapshot {
+        let active = self
+            .active_turn
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|(_, session_id, _)| session_id.clone()));
+        let session = self.session.try_lock().ok();
+        let connected = session.as_ref().is_some_and(|guard| guard.is_some());
+        BackendSnapshot {
+            model: Some(self.model.clone()),
+            agent: None,
+            session: SessionSnapshot {
+                id: active.clone(),
+                state: if active.is_some() {
+                    SessionState::Active
+                } else if connected {
+                    SessionState::Connected
+                } else {
+                    SessionState::Unavailable
+                },
+            },
+            cwd: Some(self.cwd.clone()),
+            startup: if connected {
+                StartupSnapshot::Ready
+            } else {
+                StartupSnapshot::Unavailable
+            },
+            ..BackendSnapshot::default()
+        }
+    }
+
+    /// Short alias for consumers that treat the backend as a session source.
+    pub fn snapshot(&self) -> BackendSnapshot {
+        self.operational_snapshot()
     }
 
     /// Apply one of the five ownership decisions. Existing daemons are never
@@ -365,6 +476,32 @@ fn daemon_executable() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_defaults_are_explicitly_unavailable() {
+        let snapshot = BackendSnapshot::default();
+        assert_eq!(snapshot.session.state, SessionState::Unavailable);
+        assert_eq!(snapshot.lsp.available, None);
+        assert_eq!(snapshot.mcp.available, None);
+        assert_eq!(snapshot.usage.total_tokens, None);
+        assert_eq!(snapshot.task.tier, None);
+        assert!(matches!(snapshot.startup, StartupSnapshot::Loading));
+    }
+
+    #[test]
+    fn snapshot_preserves_unavailable_server_facts() {
+        let snapshot = BackendSnapshot {
+            model: None,
+            cwd: None,
+            startup: StartupSnapshot::Unavailable,
+            ..BackendSnapshot::default()
+        };
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.cwd, None);
+        assert_eq!(snapshot.session.id, None);
+        assert_eq!(snapshot.plan.airtight, None);
+        assert_eq!(snapshot.lsp.detail, None);
+    }
 
     #[cfg(unix)]
     #[test]

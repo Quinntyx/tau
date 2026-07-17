@@ -1,6 +1,125 @@
 //! Pure, typed chat model used by the GPUI view and scripted fixtures.
 use tau_client::CompletionEvent;
-use tau_proto::prelude::{CompletionStreamResult, SequencedEvent, TurnEvent};
+use tau_proto::prelude::{CompletionStreamResult, SequencedEvent, ToolStatusValue, TurnEvent};
+
+/// Correlation and lifecycle information retained alongside the presentation cards.
+/// This deliberately is not rendered as text: consumers can reconstruct an exact
+/// transcript (including events which have no visual card) from this log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedEvent {
+    pub event_id: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub occurred_at: i64,
+    pub request_id: Option<String>,
+    pub turn_id: String,
+    pub kind: EventKind,
+    /// Lossless protocol payload; projections never parse display strings.
+    pub raw: TurnEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventKind {
+    Started,
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolOutput {
+        inline: String,
+        truncated: bool,
+        artifacts: Vec<String>,
+    },
+    ToolStarted {
+        call_id: String,
+        tool: String,
+        input: Option<String>,
+    },
+    ToolStatus {
+        call_id: String,
+        status: ToolStatusValue,
+        metadata: Option<String>,
+    },
+    ToolCompleted {
+        call_id: String,
+        output: Option<String>,
+    },
+    ToolError {
+        call_id: String,
+        error: String,
+    },
+    PermissionRequested {
+        permission_id: String,
+        tool: String,
+        description: String,
+    },
+    QuestionAsked {
+        question_id: String,
+        question: String,
+    },
+    DiffRequested {
+        request_id: String,
+        path: String,
+        diff: String,
+    },
+    ArtifactCreated {
+        artifact_id: String,
+        media_type: String,
+        size_bytes: u64,
+        content_hash: String,
+        storage_ref: String,
+    },
+    Completed {
+        message_id: Option<i64>,
+    },
+    Cancelled,
+    Failed {
+        message: String,
+    },
+    CompactionStarted,
+    CompactionCompleted {
+        summary: Option<String>,
+    },
+    SystemMessage {
+        message: String,
+    },
+    IntegrationEvent {
+        integration: String,
+        event: String,
+        data: Option<String>,
+    },
+    PlanUpdated {
+        plan: String,
+    },
+    StatusChanged {
+        status: String,
+        message: Option<String>,
+    },
+    Telemetry {
+        usage: Option<String>,
+        context: Option<String>,
+    },
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidebarState {
+    pub plan: Option<String>,
+    pub current_step: Option<String>,
+    pub airtight: Option<bool>,
+    pub lsp: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub context_tokens: Option<u64>,
+    pub context_percent: Option<u8>,
+    pub mcp: Option<String>,
+    pub task_tier: Option<u8>,
+    pub autonomous: Option<bool>,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -55,13 +174,23 @@ pub enum PermissionChoice {
     Cancel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatState {
     pub cards: Vec<Card>,
     pub session_id: Option<String>,
     pub usage: Option<u64>,
     pub status: ChatStatus,
     pub active_assistant: Option<usize>,
+    /// All protocol events, including lifecycle and artifact events without cards.
+    pub events: Vec<TypedEvent>,
+    /// Most recent raw user input and assistant output, retained independently of
+    /// the legacy display cards.
+    pub raw_input: Option<String>,
+    pub raw_output: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub artifacts: Vec<(String, String, u64, String, String)>,
+    pub sidebar: SidebarState,
 }
 
 impl Default for ChatState {
@@ -72,6 +201,13 @@ impl Default for ChatState {
             usage: None,
             status: ChatStatus::Ready,
             active_assistant: None,
+            events: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            loading: false,
+            error: None,
+            artifacts: Vec::new(),
+            sidebar: SidebarState::default(),
         }
     }
 }
@@ -96,6 +232,7 @@ impl ChatState {
             ChatAction::Submit(text)
                 if !text.trim().is_empty() && self.active_assistant.is_none() =>
             {
+                self.raw_input = Some(text.clone());
                 self.cards.push(Card::Message {
                     role: Role::User,
                     text,
@@ -107,6 +244,8 @@ impl ChatState {
                 });
                 self.active_assistant = Some(index);
                 self.status = ChatStatus::Streaming;
+                self.loading = true;
+                self.error = None;
                 true
             }
             ChatAction::Completion(CompletionEvent::Delta(delta)) => {
@@ -138,7 +277,9 @@ impl ChatState {
                 if let Card::Message { text, .. } = &mut self.cards[index] {
                     *text = format!("Error: {error}");
                 }
-                self.status = ChatStatus::Failed(error);
+                self.status = ChatStatus::Failed(error.clone());
+                self.loading = false;
+                self.error = Some(error);
                 true
             }
             ChatAction::ToggleTool(index) => match self.cards.get_mut(index) {
@@ -190,16 +331,56 @@ impl ChatState {
     }
 
     fn apply_session_event(&mut self, event: SequencedEvent) -> bool {
+        let typed = typed_event(&event);
+        self.raw_output = match &typed.kind {
+            EventKind::TextDelta { text } => Some(format!(
+                "{}{}",
+                self.raw_output.as_deref().unwrap_or(""),
+                text
+            )),
+            _ => self.raw_output.clone(),
+        };
+        self.session_id = Some(event.session_id.clone());
+        self.events.push(typed);
         match event.event {
+            TurnEvent::TurnStarted { .. } => {
+                self.status = ChatStatus::Streaming;
+                self.loading = true;
+                self.error = None;
+                if self.active_assistant.is_none() {
+                    self.cards.push(Card::Message {
+                        role: Role::Assistant,
+                        text: String::new(),
+                    });
+                    self.active_assistant = Some(self.cards.len() - 1);
+                }
+                true
+            }
             TurnEvent::TextDelta { text, .. } => {
-                let Some(index) = self.active_assistant else {
-                    return false;
+                let index = if let Some(index) = self.active_assistant {
+                    index
+                } else {
+                    self.cards.push(Card::Message {
+                        role: Role::Assistant,
+                        text: String::new(),
+                    });
+                    self.active_assistant = Some(self.cards.len() - 1);
+                    self.cards.len() - 1
                 };
+                self.status = ChatStatus::Streaming;
+                self.loading = true;
                 if let Card::Message { text: output, .. } = &mut self.cards[index] {
                     output.push_str(&text);
                     return true;
                 }
                 false
+            }
+            TurnEvent::ReasoningDelta { text, .. } => {
+                self.cards.push(Card::Message {
+                    role: Role::Assistant,
+                    text: format!("Reasoning: {text}"),
+                });
+                true
             }
             TurnEvent::ToolOutput { output, .. } => {
                 self.cards.push(Card::Tool {
@@ -207,6 +388,34 @@ impl ChatState {
                     input: String::new(),
                     output: output.inline,
                     expanded: false,
+                });
+                true
+            }
+            TurnEvent::ToolStarted { tool, input, .. } => {
+                self.cards.push(Card::Tool {
+                    name: tool,
+                    input: input.map(|value| value.to_string()).unwrap_or_default(),
+                    output: String::new(),
+                    expanded: false,
+                });
+                true
+            }
+            TurnEvent::ToolStatus { .. } => true,
+            TurnEvent::ToolCompleted { output, .. } => {
+                if let Some(output) = output {
+                    self.cards.push(Card::Tool {
+                        name: "tool".into(),
+                        input: String::new(),
+                        output: output.inline,
+                        expanded: false,
+                    });
+                }
+                true
+            }
+            TurnEvent::ToolError { error, .. } => {
+                self.cards.push(Card::Message {
+                    role: Role::Tool,
+                    text: format!("Tool error: {error}"),
                 });
                 true
             }
@@ -246,19 +455,100 @@ impl ChatState {
             TurnEvent::TurnCompleted { .. } => {
                 self.active_assistant = None;
                 self.status = ChatStatus::Ready;
+                self.loading = false;
                 true
             }
             TurnEvent::TurnCancelled { .. } => {
                 self.active_assistant = None;
                 self.status = ChatStatus::Ready;
+                self.loading = false;
                 true
             }
             TurnEvent::TurnFailed { message, .. } => {
                 self.active_assistant = None;
+                self.error = Some(message.clone());
                 self.status = ChatStatus::Failed(message);
+                self.loading = false;
                 true
             }
-            TurnEvent::TurnStarted { .. } | TurnEvent::ArtifactCreated { .. } => false,
+            TurnEvent::ArtifactCreated { artifact, .. } => {
+                self.artifacts.push((
+                    artifact.artifact_id,
+                    artifact.media_type,
+                    artifact.size_bytes,
+                    artifact.content_hash,
+                    artifact.storage_ref,
+                ));
+                true
+            }
+            TurnEvent::CompactionStarted { .. } => {
+                self.cards.push(Card::Message {
+                    role: Role::System,
+                    text: "Compaction started".into(),
+                });
+                true
+            }
+            TurnEvent::CompactionCompleted { summary, .. } => {
+                self.cards.push(Card::Message {
+                    role: Role::System,
+                    text: summary.unwrap_or_else(|| "Compaction completed".into()),
+                });
+                true
+            }
+            TurnEvent::SystemMessage { message, .. } => {
+                self.cards.push(Card::Message {
+                    role: Role::System,
+                    text: message,
+                });
+                true
+            }
+            TurnEvent::IntegrationEvent {
+                integration,
+                event,
+                data,
+                ..
+            } => {
+                if integration.eq_ignore_ascii_case("lsp") {
+                    self.sidebar.lsp = Some(event.clone());
+                } else if integration.eq_ignore_ascii_case("mcp") {
+                    self.sidebar.mcp = Some(event.clone());
+                }
+                self.cards.push(Card::Message {
+                    role: Role::System,
+                    text: format!(
+                        "{integration}: {event}{}",
+                        data.map(|value| format!("\n{value}")).unwrap_or_default()
+                    ),
+                });
+                true
+            }
+            TurnEvent::PlanUpdated { plan, .. } => {
+                self.sidebar.plan = plan
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                self.sidebar.current_step = plan
+                    .get("current_step")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                self.sidebar.airtight = plan.get("airtight").and_then(serde_json::Value::as_bool);
+                true
+            }
+            TurnEvent::StatusChanged {
+                status, message, ..
+            } => {
+                if matches!(status.as_str(), "failed" | "error") {
+                    let error = message.unwrap_or_else(|| status.clone());
+                    self.error = Some(error.clone());
+                    self.status = ChatStatus::Failed(error);
+                }
+                true
+            }
+            TurnEvent::Telemetry { usage, context, .. } => {
+                update_usage(&mut self.sidebar, usage.as_ref());
+                update_context(&mut self.sidebar, context.as_ref());
+                true
+            }
         }
     }
 
@@ -267,13 +557,252 @@ impl ChatState {
             return false;
         };
         if let Card::Message { text, .. } = &mut self.cards[index] {
+            self.raw_output = Some(result.text.clone());
             *text = result.text;
         }
         self.session_id = Some(result.session_id);
         self.usage = Some(result.usage.total_tokens);
         self.status = ChatStatus::Ready;
+        self.loading = false;
+        self.error = None;
         true
     }
+}
+
+fn typed_event(event: &SequencedEvent) -> TypedEvent {
+    let (turn_id, kind) = match &event.event {
+        TurnEvent::TurnStarted { turn_id } => (turn_id.clone(), EventKind::Started),
+        TurnEvent::TextDelta { turn_id, text } => {
+            (turn_id.clone(), EventKind::TextDelta { text: text.clone() })
+        }
+        TurnEvent::ReasoningDelta { turn_id, text } => (
+            turn_id.clone(),
+            EventKind::ReasoningDelta { text: text.clone() },
+        ),
+        TurnEvent::ToolOutput { turn_id, output } => (
+            turn_id.clone(),
+            EventKind::ToolOutput {
+                inline: output.inline.clone(),
+                truncated: output.truncated,
+                artifacts: output
+                    .artifacts
+                    .iter()
+                    .map(|a| a.artifact_id.clone())
+                    .collect(),
+            },
+        ),
+        TurnEvent::ToolStarted {
+            turn_id,
+            tool_call_id,
+            tool,
+            input,
+        } => (
+            turn_id.clone(),
+            EventKind::ToolStarted {
+                call_id: tool_call_id.clone(),
+                tool: tool.clone(),
+                input: input.as_ref().map(ToString::to_string),
+            },
+        ),
+        TurnEvent::ToolStatus {
+            turn_id,
+            tool_call_id,
+            status,
+            metadata,
+        } => (
+            turn_id.clone(),
+            EventKind::ToolStatus {
+                call_id: tool_call_id.clone(),
+                status: status.clone(),
+                metadata: metadata.as_ref().map(ToString::to_string),
+            },
+        ),
+        TurnEvent::ToolCompleted {
+            turn_id,
+            tool_call_id,
+            output,
+        } => (
+            turn_id.clone(),
+            EventKind::ToolCompleted {
+                call_id: tool_call_id.clone(),
+                output: output.as_ref().map(|value| value.inline.clone()),
+            },
+        ),
+        TurnEvent::ToolError {
+            turn_id,
+            tool_call_id,
+            error,
+        } => (
+            turn_id.clone(),
+            EventKind::ToolError {
+                call_id: tool_call_id.clone(),
+                error: error.clone(),
+            },
+        ),
+        TurnEvent::PermissionRequested {
+            turn_id,
+            request_id,
+            tool,
+            description,
+        } => (
+            turn_id.clone(),
+            EventKind::PermissionRequested {
+                permission_id: request_id.clone(),
+                tool: tool.clone(),
+                description: description.clone(),
+            },
+        ),
+        TurnEvent::QuestionAsked {
+            turn_id,
+            question_id,
+            question,
+        } => (
+            turn_id.clone(),
+            EventKind::QuestionAsked {
+                question_id: question_id.clone(),
+                question: question.clone(),
+            },
+        ),
+        TurnEvent::DiffRequested {
+            turn_id,
+            request_id,
+            path,
+            diff,
+        } => (
+            turn_id.clone(),
+            EventKind::DiffRequested {
+                request_id: request_id.clone(),
+                path: path.clone(),
+                diff: diff.clone(),
+            },
+        ),
+        TurnEvent::ArtifactCreated { turn_id, artifact } => (
+            turn_id.clone(),
+            EventKind::ArtifactCreated {
+                artifact_id: artifact.artifact_id.clone(),
+                media_type: artifact.media_type.clone(),
+                size_bytes: artifact.size_bytes,
+                content_hash: artifact.content_hash.clone(),
+                storage_ref: artifact.storage_ref.clone(),
+            },
+        ),
+        TurnEvent::TurnCompleted {
+            turn_id,
+            message_id,
+        } => (
+            turn_id.clone(),
+            EventKind::Completed {
+                message_id: *message_id,
+            },
+        ),
+        TurnEvent::TurnCancelled { turn_id } => (turn_id.clone(), EventKind::Cancelled),
+        TurnEvent::TurnFailed { turn_id, message } => (
+            turn_id.clone(),
+            EventKind::Failed {
+                message: message.clone(),
+            },
+        ),
+        TurnEvent::CompactionStarted { turn_id } => (turn_id.clone(), EventKind::CompactionStarted),
+        TurnEvent::CompactionCompleted { turn_id, summary } => (
+            turn_id.clone(),
+            EventKind::CompactionCompleted {
+                summary: summary.clone(),
+            },
+        ),
+        TurnEvent::SystemMessage { turn_id, message } => (
+            turn_id.clone(),
+            EventKind::SystemMessage {
+                message: message.clone(),
+            },
+        ),
+        TurnEvent::IntegrationEvent {
+            turn_id,
+            integration,
+            event,
+            data,
+        } => (
+            turn_id.clone(),
+            EventKind::IntegrationEvent {
+                integration: integration.clone(),
+                event: event.clone(),
+                data: data.as_ref().map(ToString::to_string),
+            },
+        ),
+        TurnEvent::PlanUpdated { turn_id, plan } => (
+            turn_id.clone(),
+            EventKind::PlanUpdated {
+                plan: plan.to_string(),
+            },
+        ),
+        TurnEvent::StatusChanged {
+            turn_id,
+            status,
+            message,
+        } => (
+            turn_id.clone(),
+            EventKind::StatusChanged {
+                status: status.clone(),
+                message: message.clone(),
+            },
+        ),
+        TurnEvent::Telemetry {
+            turn_id,
+            usage,
+            context,
+        } => (
+            turn_id.clone(),
+            EventKind::Telemetry {
+                usage: usage.as_ref().map(ToString::to_string),
+                context: context.as_ref().map(ToString::to_string),
+            },
+        ),
+    };
+    let request_id = event.request_id.as_ref().map(|id| match id {
+        tau_proto::envelope::Id::Num(value) => value.to_string(),
+        tau_proto::envelope::Id::Str(value) => value.clone(),
+    });
+    TypedEvent {
+        event_id: event.event_id.clone(),
+        session_id: event.session_id.clone(),
+        sequence: event.sequence,
+        occurred_at: event.occurred_at,
+        request_id,
+        turn_id,
+        kind,
+        raw: event.event.clone(),
+    }
+}
+
+fn update_usage(sidebar: &mut SidebarState, usage: Option<&serde_json::Value>) {
+    let Some(usage) = usage.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    sidebar.input_tokens = usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    sidebar.output_tokens = usage
+        .get("output_tokens")
+        .and_then(serde_json::Value::as_u64);
+    if let Some(total) = usage
+        .get("total_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
+        sidebar.context_tokens = Some(total);
+    }
+}
+
+fn update_context(sidebar: &mut SidebarState, context: Option<&serde_json::Value>) {
+    let Some(context) = context.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    sidebar.context_tokens = context
+        .get("tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or(sidebar.context_tokens);
+    sidebar.context_percent = context
+        .get("percent")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok());
 }
 
 #[cfg(test)]
@@ -382,5 +911,73 @@ mod tests {
                 .iter()
                 .any(|card| matches!(card, Card::Diff { .. }))
         );
+    }
+
+    #[test]
+    fn typed_lifecycle_and_operational_events_project_to_render_state() {
+        let mut state = ChatState::default();
+        let mut sequence = 1;
+        let mut apply = |event| {
+            let accepted = state.reduce(ChatAction::SessionEvent(SequencedEvent {
+                event_id: format!("event-{sequence}"),
+                session_id: "session".into(),
+                sequence,
+                occurred_at: 0,
+                request_id: None,
+                event,
+            }));
+            sequence += 1;
+            assert!(accepted);
+        };
+        apply(TurnEvent::TurnStarted {
+            turn_id: "turn".into(),
+        });
+        apply(TurnEvent::ReasoningDelta {
+            turn_id: "turn".into(),
+            text: "inspect".into(),
+        });
+        apply(TurnEvent::ToolStarted {
+            turn_id: "turn".into(),
+            tool_call_id: "call".into(),
+            tool: "read".into(),
+            input: Some(serde_json::json!({"path":"README"})),
+        });
+        apply(TurnEvent::ToolStatus {
+            turn_id: "turn".into(),
+            tool_call_id: "call".into(),
+            status: ToolStatusValue::Running,
+            metadata: None,
+        });
+        apply(TurnEvent::IntegrationEvent {
+            turn_id: "turn".into(),
+            integration: "lsp".into(),
+            event: "ready".into(),
+            data: None,
+        });
+        apply(TurnEvent::PlanUpdated {
+            turn_id: "turn".into(),
+            plan: serde_json::json!({"title":"M13", "current_step":"render", "airtight":true}),
+        });
+        apply(TurnEvent::Telemetry {
+            turn_id: "turn".into(),
+            usage: Some(serde_json::json!({"input_tokens": 3, "output_tokens": 2})),
+            context: Some(serde_json::json!({"tokens": 5, "percent": 10})),
+        });
+        apply(TurnEvent::CompactionCompleted {
+            turn_id: "turn".into(),
+            summary: Some("kept decisions".into()),
+        });
+        assert_eq!(state.events.len(), 8);
+        assert_eq!(state.sidebar.lsp.as_deref(), Some("ready"));
+        assert_eq!(state.sidebar.plan.as_deref(), Some("M13"));
+        assert_eq!(state.sidebar.current_step.as_deref(), Some("render"));
+        assert_eq!(state.sidebar.context_percent, Some(10));
+        assert!(state.cards.iter().any(|card| matches!(
+            card,
+            Card::Message {
+                role: Role::System,
+                ..
+            }
+        )));
     }
 }

@@ -1,14 +1,317 @@
 use gpui::{
-    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, Task, Window,
-    div, prelude::*, px, rgb,
+    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, ScrollHandle,
+    Task, Window, div, prelude::*, px, rgb,
 };
 use tau_client::TurnStreamEvent;
 
-use crate::backend::{Backend, DaemonAction};
-use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
+use crate::backend::{Backend, DaemonAction, StartupSnapshot};
+use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
 use crate::input::TextInput;
 
-gpui::actions!(tau_view, [Submit, SwitchAgent, CycleModel]);
+gpui::actions!(
+    tau_view,
+    [Submit, SwitchAgent, CycleModel, ToggleSidebar, ToggleFollow]
+);
+
+/// Stable, testable description of the information presented by the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TauViewDescription {
+    pub transcript: Vec<(String, String)>,
+    pub status: String,
+    pub loading: bool,
+    pub sidebar: Vec<(String, String)>,
+}
+
+pub fn next_sidebar_visibility(visible: bool) -> bool {
+    !visible
+}
+
+pub fn next_follow_state(following: bool) -> bool {
+    !following
+}
+
+/// Build presentation data without requiring a GPUI window.  Typed protocol
+/// events are included even when they do not have a legacy card.
+pub fn describe_chat(chat: &ChatState, agent: &str, model: &str, cwd: &str) -> TauViewDescription {
+    let mut transcript = chat.cards.iter().map(card_description).collect::<Vec<_>>();
+    for event in &chat.events {
+        let item = match &event.kind {
+            EventKind::Started => Some(("lifecycle".into(), "Turn started".into())),
+            EventKind::TextDelta { .. } => None,
+            EventKind::ReasoningDelta { text } => Some(("reasoning".into(), text.clone())),
+            EventKind::ToolOutput {
+                inline,
+                truncated,
+                artifacts,
+            } => Some((
+                "tool output".into(),
+                format!(
+                    "{}{}{}",
+                    inline,
+                    if *truncated { " (truncated)" } else { "" },
+                    if artifacts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{} artifacts]", artifacts.len())
+                    }
+                ),
+            )),
+            EventKind::PermissionRequested {
+                tool, description, ..
+            } => Some(("permission".into(), format!("{tool}: {description}"))),
+            EventKind::QuestionAsked { question, .. } => {
+                Some(("question".into(), question.clone()))
+            }
+            EventKind::DiffRequested { path, diff, .. } => {
+                Some(("diff".into(), format!("{path}\n{diff}")))
+            }
+            EventKind::ArtifactCreated {
+                artifact_id,
+                media_type,
+                size_bytes,
+                storage_ref,
+                ..
+            } => Some((
+                "artifact".into(),
+                format!("{artifact_id} ({media_type}, {size_bytes} bytes)\n{storage_ref}"),
+            )),
+            EventKind::Completed { message_id } => Some((
+                "lifecycle".into(),
+                format!(
+                    "Turn completed{}",
+                    message_id
+                        .map(|id| format!(" (message {id})"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::Cancelled => Some(("lifecycle".into(), "Turn cancelled".into())),
+            EventKind::Failed { message } => Some(("error".into(), message.clone())),
+            EventKind::ToolStarted {
+                call_id,
+                tool,
+                input,
+            } => Some((
+                "tool started".into(),
+                format!(
+                    "{tool} [{call_id}]{}",
+                    input
+                        .as_deref()
+                        .map(|value| format!("\ninput: {value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::ToolStatus {
+                call_id,
+                status,
+                metadata,
+            } => Some((
+                "tool status".into(),
+                format!(
+                    "{call_id}: {status:?}{}",
+                    metadata
+                        .as_deref()
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::ToolCompleted { call_id, output } => Some((
+                "tool completed".into(),
+                format!(
+                    "{call_id}{}",
+                    output
+                        .as_deref()
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::ToolError { call_id, error } => {
+                Some(("tool error".into(), format!("{call_id}: {error}")))
+            }
+            EventKind::CompactionStarted => {
+                Some(("compaction".into(), "Compaction started".into()))
+            }
+            EventKind::CompactionCompleted { summary } => Some((
+                "compaction".into(),
+                summary
+                    .clone()
+                    .unwrap_or_else(|| "Compaction completed".into()),
+            )),
+            EventKind::SystemMessage { message } => Some(("system".into(), message.clone())),
+            EventKind::IntegrationEvent {
+                integration,
+                event,
+                data,
+            } => Some((
+                "integration".into(),
+                format!(
+                    "{integration}: {event}{}",
+                    data.as_deref()
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::PlanUpdated { plan } => Some(("plan".into(), plan.clone())),
+            EventKind::StatusChanged { status, message } => Some((
+                "status".into(),
+                format!(
+                    "{status}{}",
+                    message
+                        .as_deref()
+                        .map(|value| format!(": {value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::Telemetry { usage, context } => Some((
+                "telemetry".into(),
+                format!(
+                    "usage={} context={}",
+                    usage.as_deref().unwrap_or("unavailable"),
+                    context.as_deref().unwrap_or("unavailable")
+                ),
+            )),
+            EventKind::Other => Some(("event".into(), "Unknown typed event".into())),
+        };
+        if let Some(item) = item {
+            transcript.push(item);
+        }
+    }
+    let status = match &chat.status {
+        ChatStatus::Ready => "Ready".into(),
+        ChatStatus::Streaming => "Thinking...".into(),
+        ChatStatus::Failed(error) => format!("Error: {error}"),
+    };
+    let sidebar = &chat.sidebar;
+    let plan = match (&sidebar.plan, &sidebar.current_step, sidebar.airtight) {
+        (Some(plan), Some(step), Some(airtight)) => format!(
+            "{plan} · {step} ({})",
+            if airtight { "airtight" } else { "not airtight" }
+        ),
+        (Some(plan), _, _) => plan.clone(),
+        _ => "Unavailable".into(),
+    };
+    let tokens = match (
+        sidebar.input_tokens,
+        sidebar.output_tokens,
+        sidebar.context_tokens,
+    ) {
+        (Some(input), Some(output), Some(context)) => format!(
+            "in {input} · out {output} · ctx {context}{}",
+            sidebar
+                .context_percent
+                .map(|percent| format!(" ({percent}%)"))
+                .unwrap_or_default()
+        ),
+        _ => chat
+            .usage
+            .map(|value| format!("{value} total"))
+            .unwrap_or_else(|| "Unavailable".into()),
+    };
+    TauViewDescription {
+        transcript,
+        status,
+        loading: chat.loading || chat.active_assistant.is_some(),
+        sidebar: vec![
+            (
+                "AGENT".into(),
+                sidebar.agent.as_deref().unwrap_or(agent).into(),
+            ),
+            (
+                "MODEL".into(),
+                sidebar.model.as_deref().unwrap_or(model).into(),
+            ),
+            ("PLAN".into(), plan),
+            (
+                "LSP".into(),
+                sidebar.lsp.as_deref().unwrap_or("Unavailable").into(),
+            ),
+            ("TOKENS".into(), tokens),
+            (
+                "MCP".into(),
+                sidebar.mcp.as_deref().unwrap_or("Unavailable").into(),
+            ),
+            (
+                "TASK".into(),
+                sidebar
+                    .task_tier
+                    .map(|tier| format!("Tier {tier}"))
+                    .unwrap_or_else(|| "Unavailable".into()),
+            ),
+            (
+                "AUTONOMY".into(),
+                sidebar
+                    .autonomous
+                    .map(|enabled| if enabled { "Enabled" } else { "Disabled" })
+                    .unwrap_or("Unavailable")
+                    .into(),
+            ),
+            (
+                "SESSION".into(),
+                chat.session_id
+                    .clone()
+                    .unwrap_or_else(|| "Unavailable".into()),
+            ),
+            (
+                "DIRECTORY".into(),
+                if cwd.is_empty() {
+                    "Unavailable".into()
+                } else {
+                    cwd.into()
+                },
+            ),
+        ],
+    }
+}
+
+fn card_description(card: &Card) -> (String, String) {
+    match card {
+        Card::Message { role, text } => (
+            match role {
+                Role::User => "You",
+                Role::Assistant => "tau",
+                Role::System => "system",
+                Role::Tool => "tool",
+            }
+            .into(),
+            text.clone(),
+        ),
+        Card::Tool {
+            name,
+            input,
+            output,
+            expanded,
+        } => (
+            "tool".into(),
+            if *expanded {
+                format!("{name}\ninput: {input}\noutput: {output}")
+            } else {
+                format!("{name} (click to inspect)")
+            },
+        ),
+        Card::Diff {
+            path,
+            patch,
+            approved,
+        } => (
+            "diff".into(),
+            format!(
+                "{path} ({})\n{patch}",
+                if *approved { "approved" } else { "pending" }
+            ),
+        ),
+        Card::Permission {
+            tool, description, ..
+        } => ("permission".into(), format!("{tool}: {description}")),
+        Card::Question {
+            question, answer, ..
+        } => (
+            "question".into(),
+            format!(
+                "{question}\n{}",
+                answer.as_deref().unwrap_or("awaiting answer")
+            ),
+        ),
+    }
+}
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -49,6 +352,8 @@ pub struct TauView {
     model_index: usize,
     models: Vec<String>,
     sidebar_visible: bool,
+    transcript_scroll: ScrollHandle,
+    follow_output: bool,
 }
 
 impl TauView {
@@ -75,6 +380,8 @@ impl TauView {
             model_index: 0,
             models,
             sidebar_visible: preferences.sidebar,
+            transcript_scroll: ScrollHandle::new(),
+            follow_output: true,
         }
     }
 
@@ -95,6 +402,19 @@ impl TauView {
     fn cycle_model(&mut self, _: &CycleModel, _: &mut Window, cx: &mut Context<Self>) {
         if !self.models.is_empty() {
             self.model_index = (self.model_index + 1) % self.models.len();
+        }
+        cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = next_sidebar_visibility(self.sidebar_visible);
+        cx.notify();
+    }
+
+    fn toggle_follow(&mut self, _: &ToggleFollow, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow_output = next_follow_state(self.follow_output);
+        if self.follow_output {
+            self.transcript_scroll.scroll_to_bottom();
         }
         cx.notify();
     }
@@ -250,6 +570,25 @@ impl Render for TauView {
             .get(self.model_index)
             .map(String::as_str)
             .unwrap_or(self.backend.model());
+        let mut description = describe_chat(
+            &self.chat,
+            self.agent.label(),
+            current_model,
+            self.backend.cwd(),
+        );
+        let backend = self.backend.operational_snapshot();
+        let backend_status = match backend.startup {
+            StartupSnapshot::Loading => "Loading",
+            StartupSnapshot::Ready => "Ready",
+            StartupSnapshot::Unavailable => "Unavailable",
+            StartupSnapshot::Error(_) => "Error",
+        };
+        description
+            .sidebar
+            .push(("BACKEND".into(), backend_status.into()));
+        if self.follow_output {
+            self.transcript_scroll.scroll_to_bottom();
+        }
         let header = div()
             .flex()
             .items_center()
@@ -263,6 +602,33 @@ impl Render for TauView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("tau"),
             )
+            .child(toast_button(
+                if self.sidebar_visible {
+                    "Hide sidebar"
+                } else {
+                    "Show sidebar"
+                },
+                0x33445f,
+                cx.listener(|view, _, _, cx| {
+                    view.sidebar_visible = next_sidebar_visibility(view.sidebar_visible);
+                    cx.notify();
+                }),
+            ))
+            .child(toast_button(
+                if self.follow_output {
+                    "Following"
+                } else {
+                    "Follow output"
+                },
+                0x33445f,
+                cx.listener(|view, _, _, cx| {
+                    view.follow_output = next_follow_state(view.follow_output);
+                    if view.follow_output {
+                        view.transcript_scroll.scroll_to_bottom();
+                    }
+                    cx.notify();
+                }),
+            ))
             .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
                 "{}  ·  {}",
                 current_model,
@@ -309,12 +675,22 @@ impl Render for TauView {
             );
         let transcript = div()
             .id("transcript")
+            .track_scroll(&self.transcript_scroll)
             .flex_1()
             .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_3()
             .p_5()
+            .when(self.chat.cards.is_empty(), |view| {
+                view.child(div().text_sm().text_color(rgb(0x8994a8)).child(
+                    if self.chat.active_assistant.is_some() {
+                        "Loading transcript…"
+                    } else {
+                        "No transcript yet"
+                    },
+                ))
+            })
             .children(self.chat.cards.iter().enumerate().map(|(index, card)| {
                 let (background, label, align_end, text) = match card {
                     Card::Message {
@@ -475,7 +851,35 @@ impl Render for TauView {
                     );
                 }
                 card_view
-            }));
+            }))
+            .children(
+                description
+                    .transcript
+                    .iter()
+                    .skip(self.chat.cards.len())
+                    .map(|(label, text)| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(if label.contains("error") {
+                                0x4a2828
+                            } else if label.contains("tool") {
+                                0x3b3425
+                            } else {
+                                0x202630
+                            }))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8994a8))
+                                    .child(label.clone()),
+                            )
+                            .child(text.clone())
+                    }),
+            );
         let sidebar = div()
             .w(px(260.))
             .flex()
@@ -484,29 +888,12 @@ impl Render for TauView {
             .p_4()
             .border_l_1()
             .border_color(rgb(0x2c3340))
-            .child(sidebar_card("AGENT", self.agent.label()))
-            .child(sidebar_card(
-                "PLAN",
-                if self.chat.status == ChatStatus::Streaming {
-                    "Active"
-                } else {
-                    "No active plan"
-                },
-            ))
-            .child(sidebar_card("LSP", "Connected"))
-            .child(sidebar_card(
-                "TOKENS",
-                &self
-                    .chat
-                    .usage
-                    .map(|v| format!("{v} tokens"))
-                    .unwrap_or_else(|| "No usage yet".into()),
-            ))
-            .child(sidebar_card(
-                "SESSION",
-                self.chat.session_id.as_deref().unwrap_or("Not started"),
-            ))
-            .child(sidebar_card("DIRECTORY", self.backend.cwd()));
+            .children(
+                description
+                    .sidebar
+                    .iter()
+                    .map(|(title, value)| sidebar_card(title, value)),
+            );
         let footer = div()
             .p_4()
             .border_t_1()
@@ -551,6 +938,8 @@ impl Render for TauView {
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::switch_agent));
         root = root.on_action(cx.listener(Self::cycle_model));
+        root = root.on_action(cx.listener(Self::toggle_sidebar));
+        root = root.on_action(cx.listener(Self::toggle_follow));
         if self.toast_visible {
             root = root.child(toast);
         }
@@ -596,4 +985,90 @@ fn toast_button(
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
         .child(label.to_string())
+}
+
+#[cfg(test)]
+mod view_model_tests {
+    use super::*;
+
+    #[test]
+    fn description_exposes_empty_and_operational_states() {
+        let state = ChatState::default();
+        let view = describe_chat(&state, "Code", "model", "/tmp");
+        assert!(!view.loading);
+        assert!(view.transcript.is_empty());
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "LSP" && value == "Unavailable")
+        );
+    }
+
+    #[test]
+    fn description_keeps_lifecycle_and_error_events() {
+        let mut state = ChatState::default();
+        state.events.push(crate::chat::TypedEvent {
+            event_id: "e".into(),
+            session_id: "s".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: None,
+            turn_id: "t".into(),
+            kind: EventKind::Failed {
+                message: "boom".into(),
+            },
+            raw: tau_proto::prelude::TurnEvent::TurnFailed {
+                turn_id: "t".into(),
+                message: "boom".into(),
+            },
+        });
+        let view = describe_chat(&state, "Plan", "model", "/tmp");
+        assert!(
+            view.transcript
+                .iter()
+                .any(|(label, text)| label == "error" && text == "boom")
+        );
+    }
+
+    #[test]
+    fn action_helpers_toggle_sidebar_and_follow_state() {
+        assert!(next_sidebar_visibility(false));
+        assert!(!next_sidebar_visibility(true));
+        assert!(next_follow_state(false));
+        assert!(!next_follow_state(true));
+    }
+
+    #[test]
+    fn description_renders_typed_operational_fields_without_fabrication() {
+        let mut state = ChatState::default();
+        state.sidebar.plan = Some("release".into());
+        state.sidebar.current_step = Some("render".into());
+        state.sidebar.airtight = Some(false);
+        state.sidebar.input_tokens = Some(10);
+        state.sidebar.output_tokens = Some(4);
+        state.sidebar.context_tokens = Some(20);
+        state.sidebar.context_percent = Some(25);
+        state.sidebar.lsp = Some("2 diagnostics".into());
+        let view = describe_chat(&state, "Code", "model", "");
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "PLAN" && value.contains("not airtight"))
+        );
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "TOKENS" && value.contains("25%"))
+        );
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "LSP" && value == "2 diagnostics")
+        );
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "DIRECTORY" && value == "Unavailable")
+        );
+    }
 }

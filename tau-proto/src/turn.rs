@@ -193,7 +193,7 @@ pub struct TurnReplayResult {
     pub gap: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactReference {
     pub artifact_id: String,
     pub media_type: String,
@@ -202,7 +202,7 @@ pub struct ArtifactReference {
     pub storage_ref: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundedOutput {
     pub inline: String,
     pub truncated: bool,
@@ -210,7 +210,7 @@ pub struct BoundedOutput {
     pub artifacts: Vec<ArtifactReference>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnEvent {
     TurnStarted {
@@ -220,9 +220,40 @@ pub enum TurnEvent {
         turn_id: String,
         text: String,
     },
+    ReasoningDelta {
+        turn_id: String,
+        text: String,
+    },
     ToolOutput {
         turn_id: String,
         output: BoundedOutput,
+    },
+    /// A tool invocation has been observed, before its output is available.
+    ToolStarted {
+        turn_id: String,
+        tool_call_id: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+    },
+    /// Incremental tool metadata/status (for example, a subprocess pid).
+    ToolStatus {
+        turn_id: String,
+        tool_call_id: String,
+        status: ToolStatusValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+    ToolCompleted {
+        turn_id: String,
+        tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<BoundedOutput>,
+    },
+    ToolError {
+        turn_id: String,
+        tool_call_id: String,
+        error: String,
     },
     PermissionRequested {
         turn_id: String,
@@ -261,6 +292,52 @@ pub enum TurnEvent {
         turn_id: String,
         message: String,
     },
+    CompactionStarted {
+        turn_id: String,
+    },
+    CompactionCompleted {
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    SystemMessage {
+        turn_id: String,
+        message: String,
+    },
+    IntegrationEvent {
+        turn_id: String,
+        integration: String,
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
+    PlanUpdated {
+        turn_id: String,
+        plan: serde_json::Value,
+    },
+    StatusChanged {
+        turn_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    Telemetry {
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<serde_json::Value>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatusValue {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +423,39 @@ mod tests {
             TurnEvent::DiffRequested { request_id, path, .. }
                 if request_id == "d1" && path == "a.txt"
         ));
+    }
+
+    #[test]
+    fn lifecycle_and_sidebar_events_use_stable_snake_case_tags() {
+        let event = TurnEvent::ToolStatus {
+            turn_id: "t1".into(),
+            tool_call_id: "call1".into(),
+            status: ToolStatusValue::Running,
+            metadata: Some(serde_json::json!({"pid": 42})),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "tool_status");
+        assert_eq!(value["status"], "running");
+        assert_eq!(serde_json::from_value::<TurnEvent>(value).unwrap(), event);
+
+        for (wire, expected) in [
+            (
+                r#"{"type":"compaction_started","turn_id":"t1"}"#,
+                "compaction_started",
+            ),
+            (
+                r#"{"type":"status_changed","turn_id":"t1","status":"thinking"}"#,
+                "status_changed",
+            ),
+            (
+                r#"{"type":"telemetry","turn_id":"t1","usage":{"input":3}}"#,
+                "telemetry",
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(wire).unwrap();
+            assert_eq!(value["type"], expected);
+            let _: TurnEvent = serde_json::from_value(value).unwrap();
+        }
     }
     #[test]
     fn every_public_shape_round_trips() {
