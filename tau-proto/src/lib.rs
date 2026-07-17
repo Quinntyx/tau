@@ -8,6 +8,7 @@
 //! Frame convention: text WebSocket frames carry JSON-RPC 2.0; binary frames
 //! are reserved for multiplexed opaque channels (see [`binary`]).
 
+pub mod completion;
 pub mod constants;
 pub mod envelope;
 pub mod health;

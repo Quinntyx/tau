@@ -18,6 +18,8 @@ use axum::routing::get;
 use tau_proto::prelude::*;
 use tokio::net::UnixListener;
 
+mod completion;
+
 /// Per-process server state shared with every connection.
 #[derive(Clone)]
 pub struct AppState {
@@ -69,9 +71,28 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     while let Some(msg) = socket.recv().await {
         match msg {
             Ok(Message::Text(text)) => {
-                let resp = handle_text(&text, &state);
-                if socket.send(Message::Text(resp.into())).await.is_err() {
-                    break;
+                let req: Request = match serde_json::from_str(&text) {
+                    Ok(req) => req,
+                    Err(error) => {
+                        let response = serde_json::to_string(&Response::<serde_json::Value>::err(
+                            Id::num(0),
+                            PARSE_ERROR,
+                            error.to_string(),
+                        ))
+                        .unwrap_or_default();
+                        if socket.send(Message::Text(response.into())).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if req.method == METHOD_COMPLETION_STREAM {
+                    completion::handle(&mut socket, &state, req.id, req.params).await;
+                } else {
+                    let response = handle_request(req, &state);
+                    if socket.send(Message::Text(response.into())).await.is_err() {
+                        break;
+                    }
                 }
             }
             Ok(Message::Binary(_)) => {
@@ -83,19 +104,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
-/// Dispatch one JSON-RPC text request into a JSON-RPC text response.
-fn handle_text(text: &str, state: &AppState) -> String {
-    let req: Request = match serde_json::from_str(text) {
-        Ok(r) => r,
-        Err(e) => {
-            return serde_json::to_string(&Response::<serde_json::Value>::err(
-                Id::num(0),
-                PARSE_ERROR,
-                e.to_string(),
-            ))
-            .unwrap_or_default();
-        }
-    };
+/// Dispatch one non-streaming JSON-RPC request into a response.
+fn handle_request(req: Request, state: &AppState) -> String {
     let id = req.id;
     match req.method.as_str() {
         METHOD_PING => serde_json::to_string(&Response::ok(id, "pong")).unwrap_or_default(),

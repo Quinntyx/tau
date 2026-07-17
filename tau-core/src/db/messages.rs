@@ -158,7 +158,7 @@ fn load_content_blocks(conn: &Connection, message_id: i64) -> Result<Vec<Content
             )),
         }
     })?;
-let mut blocks = Vec::new();
+    let mut blocks = Vec::new();
     for r in rows {
         blocks.push(r?);
     }

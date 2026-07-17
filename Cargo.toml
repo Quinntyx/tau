@@ -38,6 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 futures-util = "0.3"
+futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 fd-lock = "4"
@@ -48,6 +49,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
 uuid = { version = "1", features = ["v4"] }
 strum = { version = "0.28", features = ["derive"] }
+rig-core = { version = "0.40", features = ["test-utils"] }
 
 # internal
 tau-proto = { path = "tau-proto", version = "0.1.0" }
