@@ -33,9 +33,44 @@ async fn mock_stream_yields_text_then_usage() {
 
 #[test]
 fn unknown_provider_errors() {
-    let err = match Provider::new("nope", "m", "key", None) {
+    let err = match Provider::new("nope", "m", Some("key"), None) {
         Ok(_) => panic!("unknown provider should fail"),
         Err(err) => err,
     };
     assert!(err.to_string().contains("unknown provider"));
+}
+
+#[test]
+fn all_completion_providers_construct_without_network() {
+    let providers = [
+        "anthropic",
+        "azure",
+        "chatgpt",
+        "cohere",
+        "copilot",
+        "deepseek",
+        "gemini",
+        "groq",
+        "huggingface",
+        "hyperbolic",
+        "llamafile",
+        "minimax",
+        "mira",
+        "mistral",
+        "moonshot",
+        "ollama",
+        "openai",
+        "openrouter",
+        "perplexity",
+        "together",
+        "xai",
+        "xiaomimimo",
+        "zai",
+    ];
+
+    for provider in providers {
+        let key = (provider != "llamafile").then_some("test-key");
+        Provider::new(provider, "test-model", key, Some("http://127.0.0.1:1"))
+            .unwrap_or_else(|error| panic!("{provider} should construct: {error}"));
+    }
 }

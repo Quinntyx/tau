@@ -63,20 +63,8 @@ pub(crate) async fn handle(
             return;
         }
     };
-    let api_key = match credentials.get(provider_id, custom_env) {
-        Some(key) => key,
-        None => {
-            send_error(
-                socket,
-                id,
-                INVALID_PARAMS,
-                format!("no API key configured for provider {provider_id}"),
-            )
-            .await;
-            return;
-        }
-    };
-    let provider = match Provider::new(provider_id, model_id, &api_key, api_base) {
+    let api_key = credentials.get(provider_id, custom_env);
+    let provider = match Provider::new(provider_id, model_id, api_key.as_deref(), api_base) {
         Ok(provider) => provider,
         Err(error) => {
             send_error(socket, id, INVALID_PARAMS, error.to_string()).await;
