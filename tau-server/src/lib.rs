@@ -15,10 +15,12 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use serde_json::Value;
 use tau_proto::prelude::*;
 use tokio::net::UnixListener;
 
 mod completion;
+pub mod runtime;
 
 /// Per-process server state shared with every connection.
 #[derive(Clone)]
@@ -26,6 +28,7 @@ pub struct AppState {
     started: Instant,
     config: Arc<tau_core::config::Config>,
     db: Arc<tau_core::db::Db>,
+    runtime: runtime::Runtime,
 }
 
 impl AppState {
@@ -34,6 +37,7 @@ impl AppState {
             started: Instant::now(),
             config,
             db: Arc::new(db),
+            runtime: runtime::Runtime::new(),
         }
     }
 
@@ -47,6 +51,10 @@ impl AppState {
 
     pub fn started(&self) -> Instant {
         self.started
+    }
+
+    pub fn runtime(&self) -> &runtime::Runtime {
+        &self.runtime
     }
 }
 
@@ -68,6 +76,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    let client_id = state.runtime.connections.attach();
     while let Some(msg) = socket.recv().await {
         match msg {
             Ok(Message::Text(text)) => {
@@ -102,6 +111,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             _ => {}
         }
     }
+    state.runtime.connections.detach(client_id);
 }
 
 /// Dispatch one non-streaming JSON-RPC request into a response.
@@ -117,6 +127,27 @@ fn handle_request(req: Request, state: &AppState) -> String {
             };
             serde_json::to_string(&Response::ok(id, result)).unwrap_or_default()
         }
+        "protocol.negotiate" => serde_json::to_string(&Response::ok(
+            id,
+            serde_json::json!({
+                "protocol": "tau-jsonrpc",
+                "version": 1,
+                "methods": [METHOD_PING, METHOD_HEALTH, METHOD_COMPLETION_STREAM, "turn.cancel"],
+                "events": [METHOD_COMPLETION_DELTA],
+            }),
+        ))
+        .unwrap_or_default(),
+        "turn.cancel" => {
+            let turn = req
+                .params
+                .and_then(|params| params.get("turn_id").and_then(Value::as_u64));
+            let cancelled = turn.is_some_and(|turn| state.runtime.cancellation.cancel(turn));
+            serde_json::to_string(&Response::ok(
+                id,
+                serde_json::json!({ "cancelled": cancelled }),
+            ))
+            .unwrap_or_default()
+        }
         other => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             METHOD_NOT_FOUND,
@@ -130,21 +161,23 @@ fn handle_request(req: Request, state: &AppState) -> String {
 pub async fn run(socket_path: PathBuf) -> Result<()> {
     let _lock = acquire_lock()?;
 
-    let config = match tau_core::config::Config::load() {
-        Ok(c) => {
+    let config = match tokio::task::spawn_blocking(tau_core::config::Config::load).await {
+        Ok(Ok(c)) => {
             match tau_core::config::config_path() {
                 Ok(p) if p.exists() => tracing::info!(path = %p.display(), "loaded config"),
                 _ => tracing::info!("no config file found (using defaults)"),
             }
             c
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "config load failed; using defaults");
             tau_core::config::Config::default()
         }
+        Err(e) => return Err(anyhow::anyhow!("config worker failed: {e}")),
     };
     let state = {
-        let db = match tau_core::db::Db::open(&tau_core::db::default_db_path()?) {
+        let path = tokio::task::spawn_blocking(tau_core::db::default_db_path).await??;
+        let db = match tokio::task::spawn_blocking(move || tau_core::db::Db::open(&path)).await? {
             Ok(d) => {
                 tracing::info!("database opened");
                 d

@@ -16,6 +16,16 @@ use tau_proto::prelude::*;
 
 use crate::AppState;
 
+async fn db_blocking<T, F>(db: tau_core::db::Db, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&tau_core::db::Db) -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(&db))
+        .await
+        .map_err(|error| anyhow::anyhow!("database worker failed: {error}"))?
+}
+
 pub(crate) async fn handle(
     socket: &mut WebSocket,
     state: &AppState,
@@ -42,13 +52,19 @@ pub(crate) async fn handle(
         }
     };
 
-    let session = match resolve_session(state, &params).and_then(|session| {
-        state
-            .db()
-            .get_messages(&session.id)
-            .map(|messages| (session, messages))
-    }) {
-        Ok((session, messages)) => (session, messages),
+    let session = match resolve_session(state, &params).await {
+        Ok(session) => match db_blocking(state.db().clone(), {
+            let session_id = session.id.clone();
+            move |db| db.get_messages(&session_id)
+        })
+        .await
+        {
+            Ok(messages) => (session, messages),
+            Err(error) => {
+                send_error(socket, id, INVALID_PARAMS, error.to_string()).await;
+                return;
+            }
+        },
         Err(error) => {
             send_error(socket, id, INVALID_PARAMS, error.to_string()).await;
             return;
@@ -84,11 +100,13 @@ pub(crate) async fn handle(
             return;
         }
     };
-    if let Err(error) = state.db().append_message(
-        &session.0.id,
-        "user",
-        vec![ContentBlock::text(&params.prompt)],
-    ) {
+    if let Err(error) = db_blocking(state.db().clone(), {
+        let session_id = session.0.id.clone();
+        let prompt = params.prompt.clone();
+        move |db| db.append_message(&session_id, "user", vec![ContentBlock::text(&prompt)])
+    })
+    .await
+    {
         send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
         return;
     }
@@ -202,25 +220,36 @@ pub(crate) async fn handle(
         history = OneOrMany::many(next_history).expect("history contains the prompt");
     }
 
-    let assistant =
-        match state
-            .db()
-            .append_message(&session.0.id, "assistant", vec![ContentBlock::text(&text)])
-        {
-            Ok(message) => message,
-            Err(error) => {
-                send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-                return;
-            }
-        };
-    if let Err(error) = state.db().record_usage(
-        &session.0.id,
-        Some(assistant.id),
-        &params.model,
-        usage.input_tokens as i64,
-        usage.output_tokens as i64,
-        Some(usage.cached_input_tokens as i64),
-    ) {
+    let assistant = match db_blocking(state.db().clone(), {
+        let session_id = session.0.id.clone();
+        let text = text.clone();
+        move |db| db.append_message(&session_id, "assistant", vec![ContentBlock::text(&text)])
+    })
+    .await
+    {
+        Ok(message) => message,
+        Err(error) => {
+            send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
+            return;
+        }
+    };
+    if let Err(error) = db_blocking(state.db().clone(), {
+        let session_id = session.0.id.clone();
+        let model = params.model.clone();
+        let message_id = assistant.id;
+        move |db| {
+            db.record_usage(
+                &session_id,
+                Some(message_id),
+                &model,
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                Some(usage.cached_input_tokens as i64),
+            )
+        }
+    })
+    .await
+    {
         send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
         return;
     }
@@ -244,18 +273,20 @@ fn split_model(model: &str) -> Result<(&str, &str)> {
     Ok((provider, model_id))
 }
 
-fn resolve_session(state: &AppState, params: &CompletionStreamParams) -> Result<Session> {
+async fn resolve_session(state: &AppState, params: &CompletionStreamParams) -> Result<Session> {
     if let Some(id) = params.session_id.as_deref() {
-        return state
-            .db()
-            .get_session(id)?
+        let id = id.to_string();
+        let lookup_id = id.clone();
+        return db_blocking(state.db().clone(), move |db| db.get_session(&lookup_id))
+            .await?
             .ok_or_else(|| anyhow::anyhow!("session not found: {id}"));
     }
     let cwd = params
         .cwd
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("cwd is required when session_id is omitted"))?;
-    state.db().create_session(cwd)
+    let cwd = cwd.to_string();
+    db_blocking(state.db().clone(), move |db| db.create_session(&cwd)).await
 }
 
 fn chat_history(messages: &[DbMessage], prompt: &str) -> OneOrMany<RigMessage> {
