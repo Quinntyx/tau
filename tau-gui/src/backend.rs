@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::CompletionEvent;
 use tau_proto::prelude::CompletionStreamParams;
-use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -21,22 +20,32 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn new(socket: PathBuf, runtime: &Runtime) -> Result<Self> {
-        let daemon = runtime.block_on(ensure_daemon(&socket))?;
+    pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, String, String)> {
+        let daemon = ensure_daemon(socket).await?;
         let cwd = std::env::current_dir().context("reading GUI working directory")?;
         let model = tau_core::config::Config::load()
             .ok()
             .and_then(|config| config.model)
             .unwrap_or_else(|| "openai/gpt-4o".into());
+        Ok((daemon, cwd.to_string_lossy().into_owned(), model))
+    }
+
+    pub fn from_parts(
+        socket: PathBuf,
+        handle: tokio::runtime::Handle,
+        daemon: Option<Child>,
+        cwd: String,
+        model: String,
+    ) -> Self {
         let auto_started = daemon.is_some();
-        Ok(Self {
+        Self {
             socket,
-            cwd: cwd.to_string_lossy().into_owned(),
+            cwd,
             model,
-            runtime: runtime.handle().clone(),
+            runtime: handle,
             _daemon: Arc::new(Mutex::new(daemon)),
             auto_started,
-        })
+        }
     }
 
     pub fn model(&self) -> &str {

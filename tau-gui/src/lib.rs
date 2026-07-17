@@ -9,12 +9,28 @@ use std::path::PathBuf;
 use anyhow::Result;
 use backend::Backend;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use view::TauView;
 
 pub fn run(socket: PathBuf) -> Result<()> {
-    let runtime = Runtime::new()?;
-    let backend = Backend::new(socket, &runtime)?;
+    let owned_runtime = Handle::try_current()
+        .is_err()
+        .then(Runtime::new)
+        .transpose()?;
+    let handle = match Handle::try_current() {
+        Ok(handle) => handle,
+        Err(_) => owned_runtime
+            .as_ref()
+            .expect("owned runtime")
+            .handle()
+            .clone(),
+    };
+    let (daemon, cwd, model) = if let Some(runtime) = owned_runtime.as_ref() {
+        runtime.block_on(Backend::prepare(&socket))?
+    } else {
+        tokio::task::block_in_place(|| handle.block_on(Backend::prepare(&socket)))?
+    };
+    let backend = Backend::from_parts(socket, handle, daemon, cwd, model);
     Application::new().run(move |cx: &mut App| {
         input::bind_keys(cx);
         view::bind_keys(cx);
