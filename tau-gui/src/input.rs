@@ -130,6 +130,153 @@ mod editor_tests {
     }
 }
 
+/// Whether the prompt should be interpreted as a command rather than a chat
+/// message.  This deliberately only inspects the first non-whitespace byte;
+/// command arguments may contain arbitrary Unicode.
+pub fn command_mode(input: &str) -> bool {
+    input.trim_start().starts_with('/')
+}
+
+/// The keyboard outcomes a view can map to its own actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAction {
+    Submit,
+    Dismiss,
+    MoveUp,
+    MoveDown,
+    AcceptCompletion,
+    NextCompletion,
+}
+
+/// Translate the prompt's conventional keys without coupling this module to
+/// any particular GPUI action type. The view can bind these outcomes to its
+/// picker/navigation actions.
+pub fn input_action(key: &str, completion_visible: bool) -> Option<InputAction> {
+    match key {
+        "enter" => Some(if completion_visible {
+            InputAction::AcceptCompletion
+        } else {
+            InputAction::Submit
+        }),
+        "escape" => Some(InputAction::Dismiss),
+        "up" => Some(InputAction::MoveUp),
+        "down" => Some(InputAction::MoveDown),
+        "tab" => Some(InputAction::NextCompletion),
+        _ => None,
+    }
+}
+
+/// Pure state for command argument completion.  The view owns this value and
+/// supplies the command's available arguments; input editing remains owned by
+/// `TextInput`/`EditorBuffer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutocompleteState {
+    matches: Vec<String>,
+    selected: usize,
+}
+
+impl AutocompleteState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn matches(&self) -> &[String] {
+        &self.matches
+    }
+    pub fn selected(&self) -> Option<&str> {
+        self.matches.get(self.selected).map(String::as_str)
+    }
+    pub fn is_visible(&self) -> bool {
+        !self.matches.is_empty()
+    }
+
+    /// Refresh suggestions for the current command argument. Matching is
+    /// case-insensitive and prefix-based, preserving caller ordering.
+    pub fn update(&mut self, input: &str, candidates: &[String]) {
+        self.matches.clear();
+        self.selected = 0;
+        if !command_mode(input) {
+            return;
+        }
+        let token = input.split_whitespace().last().unwrap_or("");
+        let needle = token.to_lowercase();
+        self.matches.extend(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.to_lowercase().starts_with(&needle))
+                .cloned(),
+        );
+    }
+
+    pub fn dismiss(&mut self) {
+        self.matches.clear();
+        self.selected = 0;
+    }
+
+    pub fn cycle(&mut self, direction: i32) -> Option<&str> {
+        if self.matches.is_empty() {
+            return None;
+        }
+        let len = self.matches.len() as i32;
+        self.selected = (self.selected as i32 + direction).rem_euclid(len) as usize;
+        self.selected()
+    }
+
+    /// Return the selected value and replace only the final argument token.
+    /// The returned string is safe for UTF-8 input and retains preceding text.
+    pub fn accept(&self, input: &str) -> Option<String> {
+        let value = self.selected()?.to_owned();
+        let end = input.len();
+        let start = input[..end]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map_or(0, |(i, ch)| i + ch.len_utf8());
+        Some(format!("{}{}", &input[..start], value))
+    }
+}
+
+#[cfg(test)]
+mod autocomplete_tests {
+    use super::*;
+
+    fn candidates() -> Vec<String> {
+        ["Plan😀", "Planner", "Build"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn slash_reaches_command_mode() {
+        assert!(command_mode("/agent "));
+        assert!(command_mode("  /model"));
+        assert!(!command_mode("hello /agent"));
+    }
+
+    #[test]
+    fn autocomplete_filters_cycles_and_accepts_unicode() {
+        let mut state = AutocompleteState::new();
+        state.update("/agent pla", &candidates());
+        assert_eq!(state.matches(), &["Plan😀", "Planner"]);
+        assert_eq!(state.selected(), Some("Plan😀"));
+        assert_eq!(state.cycle(1), Some("Planner"));
+        assert_eq!(state.cycle(1), Some("Plan😀"));
+        assert_eq!(state.accept("/agent pla"), Some("/agent Plan😀".into()));
+    }
+
+    #[test]
+    fn dismissal_hides_and_clears_completion() {
+        let mut state = AutocompleteState::new();
+        state.update("/agent b", &candidates());
+        assert!(state.is_visible());
+        state.dismiss();
+        assert!(!state.is_visible());
+        assert_eq!(state.selected(), None);
+        assert_eq!(state.cycle(1), None);
+    }
+}
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: String,
@@ -156,6 +303,13 @@ impl TextInput {
     pub fn reset(&mut self) {
         self.content.clear();
         self.cursor = 0;
+    }
+
+    /// Replace the prompt text while preserving the input entity and focus.
+    /// Picker views use this instead of reaching into the editor's storage.
+    pub fn set_content(&mut self, content: impl Into<String>) {
+        self.content = content.into();
+        self.cursor = self.content.len();
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {

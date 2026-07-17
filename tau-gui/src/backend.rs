@@ -38,6 +38,62 @@ pub enum DaemonAction {
     NeverShowAgain,
 }
 
+/// Typed inputs emitted by the GUI pickers.  These values are identifiers, not
+/// presentation labels, and can be recorded or dispatched without inventing
+/// a separate wire protocol for picker state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerAction {
+    SelectModel(String),
+    SelectAgent(String),
+    ToggleFavorite(String),
+    RecordRecentModel(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnRequest {
+    pub prompt: String,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl TurnRequest {
+    pub fn new(prompt: String, session_id: Option<String>) -> Self {
+        Self {
+            prompt,
+            session_id,
+            ..Self::default()
+        }
+    }
+
+    pub fn apply(&mut self, action: PickerAction) {
+        match action {
+            PickerAction::SelectModel(model) => self.model = Some(model),
+            PickerAction::SelectAgent(agent) => self.agent = Some(agent),
+            PickerAction::ToggleFavorite(_) | PickerAction::RecordRecentModel(_) => {}
+        }
+    }
+
+    fn into_params(self, cwd: String, default_model: String) -> TurnStartParams {
+        TurnStartParams {
+            model: self.model.unwrap_or(default_model),
+            prompt: self.prompt,
+            session_id: self.session_id,
+            cwd: Some(cwd),
+            agent: self.agent,
+            task_tier: None,
+            autonomous: None,
+            action: Some(RequestAction::Submit),
+            idempotency_key: IdempotencyKey::new(format!(
+                "gui-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            )),
+        }
+    }
+}
+
 /// Ownership is explicit: a daemon found before connection is never stopped;
 /// only a child returned by `ensure_daemon` is owned by the GUI.
 fn stop_child(child: &mut Child) {
@@ -92,6 +148,11 @@ impl Backend {
             .ok()
             .and_then(|config| config.model)
             .unwrap_or_else(|| "openai/gpt-4o".into());
+        let model = crate::preferences::path()
+            .ok()
+            .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
+            .and_then(|preferences| preferences.selected_model)
+            .unwrap_or(model);
         Ok((
             daemon,
             auto_started,
@@ -134,6 +195,39 @@ impl Backend {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Apply a picker event using its stable identifier, and persist GUI-only
+    /// state.  Presentation labels are deliberately not interpreted here.
+    pub fn apply_picker_action(&mut self, action: PickerAction) -> Result<()> {
+        let path = crate::preferences::path()?;
+        let mut preferences = crate::preferences::GuiPreferences::load_from(&path)?;
+        match action {
+            PickerAction::SelectModel(model) => {
+                self.model = model.clone();
+                preferences.select_model(model);
+            }
+            PickerAction::SelectAgent(agent) => preferences.select_agent(agent),
+            PickerAction::ToggleFavorite(model) => preferences.toggle_favorite(model),
+            PickerAction::RecordRecentModel(model) => preferences.record_recent_model(model),
+        }
+        preferences.save_to(&path)
+    }
+
+    pub fn select_model(&mut self, model: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::SelectModel(model.into()))
+    }
+
+    pub fn select_agent(&mut self, agent: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::SelectAgent(agent.into()))
+    }
+
+    pub fn toggle_favorite(&mut self, model: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::ToggleFavorite(model.into()))
+    }
+
+    pub fn record_recent_model(&mut self, model: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::RecordRecentModel(model.into()))
     }
 
     pub fn cwd(&self) -> &str {
@@ -209,22 +303,13 @@ impl Backend {
                     *guard = Some(tau_client::Client::connect(&socket).await?);
                 }
                 let client = guard.as_mut().expect("session initialized");
-                let params = TurnStartParams {
-                    model,
+                let params = TurnRequest {
                     prompt,
                     session_id,
-                    cwd: Some(cwd),
+                    model: Some(model),
                     agent,
-                    task_tier: None,
-                    autonomous: None,
-                    action: Some(RequestAction::Submit),
-                    idempotency_key: IdempotencyKey::new(format!(
-                        "gui-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_nanos())
-                    )),
-                };
+                }
+                .into_params(cwd, String::new());
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
@@ -389,5 +474,28 @@ mod tests {
             "test/model".into(),
         );
         drop(backend);
+    }
+
+    #[test]
+    fn picker_actions_build_typed_turn_values() {
+        let mut request = TurnRequest::new("hello".into(), Some("session-1".into()));
+        request.apply(PickerAction::SelectModel("provider/model".into()));
+        request.apply(PickerAction::SelectAgent("build".into()));
+
+        let params = request.into_params("/tmp/project".into(), "fallback/model".into());
+        assert_eq!(params.model, "provider/model");
+        assert_eq!(params.agent.as_deref(), Some("build"));
+        assert_eq!(params.prompt, "hello");
+        assert_eq!(params.session_id.as_deref(), Some("session-1"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(params.action, Some(RequestAction::Submit));
+    }
+
+    #[test]
+    fn turn_request_uses_default_model_without_label_parsing() {
+        let params = TurnRequest::new("hello".into(), None)
+            .into_params("/tmp".into(), "default/model".into());
+        assert_eq!(params.model, "default/model");
+        assert_eq!(params.agent, None);
     }
 }
