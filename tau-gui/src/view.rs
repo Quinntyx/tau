@@ -21,6 +21,7 @@ pub fn bind_keys(cx: &mut App) {
 enum Role {
     User,
     Assistant,
+    Tool,
 }
 
 #[derive(Clone, Copy)]
@@ -148,7 +149,17 @@ impl TauView {
         };
         match event {
             Ok(CompletionEvent::Delta(delta)) => {
-                self.messages[index].text.push_str(&delta.text);
+                if delta.text.starts_with("\n[tool ") {
+                    self.messages[index].role = Role::Tool;
+                    self.messages[index].text = delta.text.trim().to_string();
+                    self.messages.push(Message {
+                        role: Role::Assistant,
+                        text: String::new(),
+                    });
+                    self.assistant_index = Some(self.messages.len() - 1);
+                } else {
+                    self.messages[index].text.push_str(&delta.text);
+                }
                 cx.notify();
             }
             Ok(CompletionEvent::Complete(result)) => self.finish(result, cx),
@@ -235,6 +246,7 @@ impl Render for TauView {
                 let (background, label, align_end) = match message.role {
                     Role::User => (0x274d72, "You", true),
                     Role::Assistant => (0x202630, "tau", false),
+                    Role::Tool => (0x3b3425, "tool", false),
                 };
                 div()
                     .flex()
