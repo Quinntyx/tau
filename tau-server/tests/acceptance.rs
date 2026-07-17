@@ -583,7 +583,7 @@ async fn mandatory_production_agent_workflow_closure() -> Result<()> {
             task_tier: Some(1),
             autonomous: Some(false),
             action: Some(RequestAction::Submit),
-        }
+        },
     )
     .await?;
     assert_eq!(first_text, "first model result");
@@ -623,7 +623,7 @@ async fn mandatory_production_agent_workflow_closure() -> Result<()> {
             task_tier: Some(1),
             autonomous: Some(false),
             action: Some(RequestAction::Submit),
-        }
+        },
     )
     .await?;
     assert_eq!(second_text, "second model result");

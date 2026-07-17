@@ -36,6 +36,7 @@ pub struct AppState {
     sessions: Arc<Mutex<HashMap<String, Arc<runtime::SessionTurnQueue<String>>>>>,
     events: tokio::sync::broadcast::Sender<SequencedEvent>,
     policy: Arc<PolicyBroker>,
+    provider_override: Option<tau_core::provider::Provider>,
 }
 
 struct PolicyBroker {
@@ -63,8 +64,7 @@ impl PolicyBroker {
         for (_, waiter) in waiters.drain() {
             let _ = waiter.send(Err("prompt interrupted by daemon restart".to_owned()));
         }
-    provider_override: Option<tau_core::provider::Provider>,
-}
+    }
 }
 
 impl AppState {
