@@ -23,6 +23,8 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 
+mod completion;
+
 pub mod runtime;
 
 /// Per-process server state shared with every connection.
@@ -33,6 +35,7 @@ pub struct AppState {
     db: Arc<tau_core::db::Db>,
     runtime: runtime::Runtime,
     sessions: Arc<Mutex<HashMap<String, Arc<runtime::SessionTurnQueue<String>>>>>,
+    events: tokio::sync::broadcast::Sender<SequencedEvent>,
 }
 
 impl AppState {
@@ -43,6 +46,7 @@ impl AppState {
             db: Arc::new(db),
             runtime: runtime::Runtime::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            events: tokio::sync::broadcast::channel(4096).0,
         }
     }
 
@@ -60,6 +64,27 @@ impl AppState {
 
     pub fn runtime(&self) -> &runtime::Runtime {
         &self.runtime
+    }
+
+    pub(crate) fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<SequencedEvent> {
+        self.events.subscribe()
+    }
+
+    pub(crate) async fn publish_event(
+        &self,
+        session_id: &str,
+        event: TurnEvent,
+        request_id: Option<&Id>,
+    ) -> anyhow::Result<SequencedEvent> {
+        let db = Arc::clone(&self.db);
+        let session_id = session_id.to_owned();
+        let request = request_id.map(serde_json::to_string).transpose()?;
+        let persisted = tokio::task::spawn_blocking(move || {
+            db.append_event(&session_id, &event, request.as_deref())
+        })
+        .await??;
+        let _ = self.events.send(persisted.clone());
+        Ok(persisted)
     }
 }
 
@@ -84,6 +109,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let client_id = state.runtime.connections.attach();
     let (mut sink, mut input) = futures::StreamExt::split(socket);
     let (out, mut outgoing) = mpsc::channel::<Message>(128);
+    let mut events = state.subscribe_events();
+    let event_out = out.clone();
+    let event_forwarder = tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            let notification = Notification {
+                jsonrpc: JsonRpc::default(),
+                method: METHOD_TURN_EVENT.to_string(),
+                params: Some(event),
+            };
+            let Ok(text) = serde_json::to_string(&notification) else {
+                continue;
+            };
+            if event_out.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
     let writer = tokio::spawn(async move {
         while let Some(message) = outgoing.recv().await {
             if sink.send(message).await.is_err() {
@@ -124,6 +166,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
     drop(out);
+    event_forwarder.abort();
     let _ = writer.await;
     state.runtime.connections.detach(client_id);
 }
@@ -192,7 +235,7 @@ async fn start_turn(
     id: Id,
     value: Option<serde_json::Value>,
     state: &AppState,
-    out: &mpsc::Sender<Message>,
+    _out: &mpsc::Sender<Message>,
 ) -> String {
     let Some(params) = value.and_then(|v| serde_json::from_value::<TurnStartParams>(v).ok()) else {
         return serde_json::to_string(&Response::<serde_json::Value>::err(
@@ -206,14 +249,37 @@ async fn start_turn(
     let request_id = id.clone();
     let session = params.session_id.clone();
     let cwd = params.cwd.clone().unwrap_or_else(|| ".".into());
+    let request_hash = {
+        let bytes = serde_json::to_vec(&params).unwrap_or_default();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    };
+    let params_for_db = params.clone();
     let result = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(String, String, SequencedEvent)> {
+        move || -> anyhow::Result<(String, String, Option<SequencedEvent>, Option<TurnStartResult>)> {
             let session_id = match session {
                 Some(id) if db.get_session(&id)?.is_some() => id,
                 Some(id) => id,
                 None => db.create_session(&cwd)?.id,
             };
             let turn_id = uuid::Uuid::new_v4().to_string();
+            let result = TurnStartResult { session_id: session_id.clone(), turn_id: turn_id.clone() };
+            // Reserve the idempotency key before journaling.  This is the
+            // admission gate: concurrent retries must observe the winner and
+            // cannot append a second TurnStarted event or enqueue execution.
+            if !db.remember_idempotency(&session_id, &params_for_db.idempotency_key, &request_hash, &result)? {
+                let existing = db
+                    .idempotent_result::<TurnStartResult>(&session_id, &params_for_db.idempotency_key)?
+                    .context("idempotency record missing result")?;
+                return Ok((
+                    existing.session_id.clone(),
+                    existing.turn_id.clone(),
+                    None,
+                    Some(existing),
+                ));
+            }
             let event = db.append_event(
                 &session_id,
                 &TurnEvent::TurnStarted {
@@ -221,16 +287,19 @@ async fn start_turn(
                 },
                 Some(&serde_json::to_string(&request_id)?),
             )?;
-            Ok((session_id, turn_id, event))
+            Ok((session_id, turn_id, Some(event), Some(result)))
         },
     )
     .await;
     match result {
-        Ok(Ok((session_id, turn_id, event))) => {
+        Ok(Ok((session_id, turn_id, event, Some(result)))) => {
+            if event.is_none() {
+                return serde_json::to_string(&Response::ok(id, result)).unwrap_or_default();
+            }
             // Keep the wire turn identifier as the cancellation key.  Runtime
             // queue identifiers are admission counters and must never leak
             // into the typed protocol.
-            let _ = state.runtime.cancellation.register(turn_id.clone());
+            let cancel = state.runtime.cancellation.register(turn_id.clone());
             let queue = {
                 let mut sessions = state.sessions.lock().await;
                 sessions
@@ -239,27 +308,34 @@ async fn start_turn(
                     .clone()
             };
             let (_admission_id, _completion) = queue.submit(turn_id.clone());
-            let active = queue.next().await;
-            let mut params = serde_json::to_value(&event).unwrap_or_default();
-            params["request_id"] = serde_json::to_value(&id).unwrap_or_default();
-            let notification = Notification {
-                jsonrpc: JsonRpc::default(),
-                method: METHOD_TURN_EVENT.to_string(),
-                params: Some(params),
+            let _ = state
+                .events
+                .send(event.expect("new turn has a start event"));
+            let job = completion::TurnJob {
+                params,
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                request_id: id.clone(),
+                cancellation: cancel,
             };
-            if let Ok(text) = serde_json::to_string(&notification) {
-                let _ = out.send(Message::Text(text.into())).await;
-            }
-            let response = serde_json::to_string(&Response::ok(
+            let worker_queue = queue.clone();
+            let worker_state = state.clone();
+            tokio::spawn(async move {
+                worker_queue
+                    .run_next(|_| async move {
+                        completion::execute_turn(worker_state, job).await;
+                    })
+                    .await;
+            });
+            serde_json::to_string(&Response::ok(id, result)).unwrap_or_default()
+        }
+        Ok(Ok((_session_id, _turn_id, _event, None))) => {
+            serde_json::to_string(&Response::<serde_json::Value>::err(
                 id,
-                TurnStartResult {
-                    session_id,
-                    turn_id,
-                },
+                INTERNAL_ERROR,
+                "missing turn result",
             ))
-            .unwrap_or_default();
-            active.finish(Ok(()));
-            response
+            .unwrap_or_default()
         }
         Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,

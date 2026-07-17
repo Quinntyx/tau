@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use std::future::Future;
 use tokio::sync::{Notify, oneshot};
 
 pub type ClientId = u64;
@@ -86,8 +87,9 @@ impl CancellationHandle {
         self.cancel.cancelled.load(Ordering::Acquire)
     }
     pub async fn cancelled(&self) {
+        let notified = self.cancel.notify.notified();
         if !self.is_cancelled() {
-            self.cancel.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -96,29 +98,37 @@ struct Turn<T> {
     id: TurnId,
     value: T,
     done: Option<oneshot::Sender<Result<(), WaitError>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct ActiveState {
+    id: TurnId,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// One active turn per session; admission order is assigned by the server.
 pub struct SessionTurnQueue<T> {
     next: AtomicU64,
-    state: Mutex<(bool, VecDeque<Turn<T>>)>,
+    state: Mutex<(Option<ActiveState>, VecDeque<Turn<T>>)>,
     wake: Notify,
 }
 impl<T> SessionTurnQueue<T> {
     pub fn new() -> Self {
         Self {
             next: AtomicU64::new(1),
-            state: Mutex::new((false, VecDeque::new())),
+            state: Mutex::new((None, VecDeque::new())),
             wake: Notify::new(),
         }
     }
     pub fn submit(&self, value: T) -> (TurnId, oneshot::Receiver<Result<(), WaitError>>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.state.lock().unwrap().1.push_back(Turn {
             id,
             value,
             done: Some(tx),
+            cancelled,
         });
         self.wake.notify_one();
         (id, rx)
@@ -127,9 +137,15 @@ impl<T> SessionTurnQueue<T> {
         loop {
             if let Some(turn) = {
                 let mut state = self.state.lock().unwrap();
-                if !state.0 && !state.1.is_empty() {
-                    state.0 = true;
-                    state.1.pop_front()
+                if state.0.is_none() && !state.1.is_empty() {
+                    let turn = state.1.pop_front();
+                    if let Some(turn) = &turn {
+                        state.0 = Some(ActiveState {
+                            id: turn.id,
+                            cancelled: turn.cancelled.clone(),
+                        });
+                    }
+                    turn
                 } else {
                     None
                 }
@@ -142,17 +158,78 @@ impl<T> SessionTurnQueue<T> {
             self.wake.notified().await;
         }
     }
+
+    /// Run one admitted item while retaining the queue's active slot.  This is
+    /// the production-facing form of the queue: callers cannot accidentally
+    /// release the slot before the terminal result has been produced.
+    pub async fn run_next<F, Fut>(&self, run: F)
+    where
+        T: Clone,
+        F: FnOnce(T) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let active = self.next().await;
+        let value = active.value().clone();
+        run(value).await;
+        active.finish(Ok(()));
+    }
     fn finish(&self, turn: Turn<T>, result: Result<(), WaitError>) {
+        let result = if turn.cancelled.load(Ordering::Acquire) {
+            Err(WaitError::Cancelled)
+        } else {
+            result
+        };
         if let Some(done) = turn.done {
             let _ = done.send(result);
         }
-        self.state.lock().unwrap().0 = false;
+        let mut state = self.state.lock().unwrap();
+        // Only the currently admitted turn may release the slot.  This keeps
+        // cancellation from allowing a second turn to run concurrently.
+        if state.0.as_ref().is_some_and(|active| active.id == turn.id) {
+            state.0 = None;
+        }
+        drop(state);
         self.wake.notify_one();
+    }
+
+    /// Cancel a turn without admitting another one.  Queued work is settled
+    /// immediately; admitted work remains active until its executor drops or
+    /// explicitly finishes its guard.
+    pub fn cancel(&self, id: TurnId) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let Some(active) = state.0.as_ref().filter(|active| active.id == id) {
+            active.cancelled.store(true, Ordering::Release);
+            return true;
+        }
+        let Some(position) = state.1.iter().position(|turn| turn.id == id) else {
+            return false;
+        };
+        let mut turn = state.1.remove(position).expect("position was found");
+        turn.cancelled.store(true, Ordering::Release);
+        if let Some(done) = turn.done.take() {
+            let _ = done.send(Err(WaitError::Cancelled));
+        }
+        true
     }
 }
 impl<T> Default for SessionTurnQueue<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T> Drop for SessionTurnQueue<T> {
+    fn drop(&mut self) {
+        // An ActiveTurn borrows the queue, so only queued items can remain at
+        // this point.  Do not strand their admission waiters.
+        if let Ok(state) = self.state.get_mut() {
+            for mut turn in state.1.drain(..) {
+                turn.cancelled.store(true, Ordering::Release);
+                if let Some(done) = turn.done.take() {
+                    let _ = done.send(Err(WaitError::Interrupted));
+                }
+            }
+        }
     }
 }
 
@@ -348,6 +425,24 @@ mod tests {
         active.finish(Ok(()));
         assert_eq!(first_done.await.unwrap(), Ok(()));
         assert_eq!(second_done.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_settles_queued_turn_without_releasing_active_slot() {
+        let queue = Arc::new(SessionTurnQueue::new());
+        let (first, first_done) = queue.submit("first");
+        let (second, second_done) = queue.submit("second");
+        let active = queue.next().await;
+        assert!(queue.cancel(second));
+        assert_eq!(second_done.await.unwrap(), Err(WaitError::Cancelled));
+        assert!(queue.cancel(first));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), queue.next())
+                .await
+                .is_err()
+        );
+        active.finish(Ok(()));
+        assert_eq!(first_done.await.unwrap(), Err(WaitError::Cancelled));
     }
 
     #[tokio::test]

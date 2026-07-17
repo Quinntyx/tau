@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::Id;
 
-/// Compile-time migration aliases; the wire methods are session.turn.*.
-pub const METHOD_COMPLETION_STREAM: &str = crate::turn::METHOD_TURN_START;
-pub const METHOD_COMPLETION_DELTA: &str = crate::turn::METHOD_TURN_EVENT;
+/// Legacy names remain source-compatible for clients while the server no
+/// longer dispatches either completion method. Typed turns use `session.turn.*`.
+pub const METHOD_COMPLETION_STREAM: &str = "completion.stream";
+pub const METHOD_COMPLETION_DELTA: &str = "completion.delta";
 
 /// Params for `completion.stream`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
