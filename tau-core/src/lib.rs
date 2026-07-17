@@ -4,6 +4,7 @@
 //! tau's runtime files live, and (as milestones land) config, credentials,
 //! sessions, tools, and the agent runtime built on `rig`.
 
+pub mod agent;
 pub mod config;
 pub mod credentials;
 pub mod db;

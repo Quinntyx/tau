@@ -7,6 +7,7 @@ use rig_core::OneOrMany;
 use rig_core::completion::{CompletionRequest, Message as RigMessage, Usage};
 use serde::Serialize;
 use serde_json::Value;
+use tau_core::agent::AgentRunner;
 use tau_core::credentials::CredentialStore;
 use tau_core::db::{ContentBlock, Message as DbMessage, Session};
 use tau_core::provider::{Provider, TauDelta};
@@ -93,7 +94,7 @@ pub(crate) async fn handle(
         return;
     }
 
-    let mut stream = match provider.stream(request).await {
+    let mut stream = match AgentRunner::new(provider).stream(request).await {
         Ok(stream) => stream,
         Err(error) => {
             send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
