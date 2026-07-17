@@ -8,6 +8,7 @@ pub mod config;
 pub mod credentials;
 pub mod db;
 pub mod provider;
+pub mod tools;
 
 use std::path::PathBuf;
 
