@@ -15,11 +15,12 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 enum Incoming {
     Response(Response),
     Notification(Notification<serde_json::Value>),
+    Closed,
 }
 
 struct Inner {
     sink: Mutex<futures_util::stream::SplitSink<WebSocketStream<UnixStream>, Message>>,
-    pending: Mutex<HashMap<Id, mpsc::Sender<Incoming>>>,
+    pending: Mutex<HashMap<Id, mpsc::UnboundedSender<Incoming>>>,
     events: broadcast::Sender<SequencedEvent>,
 }
 
@@ -38,19 +39,19 @@ pub enum CompletionEvent {
 }
 
 pub struct CompletionStream {
-    rx: mpsc::Receiver<Incoming>,
+    rx: mpsc::UnboundedReceiver<Incoming>,
     inner: Arc<Inner>,
     id: Id,
     done: bool,
 }
 pub struct TurnStream {
-    rx: mpsc::Receiver<Incoming>,
+    rx: mpsc::UnboundedReceiver<Incoming>,
     inner: Arc<Inner>,
     id: Id,
     done: bool,
 }
 pub struct EventStream {
-    rx: mpsc::Receiver<SequencedEvent>,
+    rx: mpsc::UnboundedReceiver<SequencedEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +69,7 @@ impl Client {
             .await
             .context("websocket handshake")?;
         let (sink, mut reader) = ws.split();
-        let (events, _) = broadcast::channel(256);
+        let (events, _) = broadcast::channel(4096);
         let inner = Arc::new(Inner {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
@@ -107,16 +108,20 @@ impl Client {
                         .and_then(|v| serde_json::from_value(v.clone()).ok());
                     if let Some(id) = request_id {
                         if let Some(tx) = routed.pending.lock().await.get(&id).cloned() {
-                            let _ = tx.send(Incoming::Notification(notification)).await;
+                            let _ = tx.send(Incoming::Notification(notification));
                         }
                     }
                 } else if let Ok(response) = serde_json::from_value::<Response>(value) {
                     if let Some(tx) = routed.pending.lock().await.get(&response.id).cloned() {
-                        let _ = tx.send(Incoming::Response(response)).await;
+                        let _ = tx.send(Incoming::Response(response));
                     }
                 }
             };
             let _ = error;
+            let pending = routed.pending.lock().await;
+            for tx in pending.values() {
+                let _ = tx.send(Incoming::Closed);
+            }
         });
         Ok(Self {
             inner,
@@ -135,9 +140,9 @@ impl Client {
         &self,
         method: &str,
         params: Option<P>,
-    ) -> Result<(Id, mpsc::Receiver<Incoming>)> {
+    ) -> Result<(Id, mpsc::UnboundedReceiver<Incoming>)> {
         let id = self.next_id();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::unbounded_channel();
         self.inner.pending.lock().await.insert(id.clone(), tx);
         let request = Request::new(id.clone(), method, params);
         let text = serde_json::to_string(&request)?;
@@ -229,11 +234,11 @@ impl Client {
         })
     }
     pub fn events(&self) -> EventStream {
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::unbounded_channel();
         let mut source = self.inner.events.subscribe();
         tokio::spawn(async move {
             while let Ok(event) = source.recv().await {
-                if tx.send(event).await.is_err() {
+                if tx.send(event).is_err() {
                     break;
                 }
             }
@@ -301,7 +306,12 @@ impl Stream for CompletionStream {
                         }),
                 ))
             }
+            std::task::Poll::Ready(Some(Incoming::Closed)) => {
+                self.done = true;
+                std::task::Poll::Ready(Some(Err(anyhow::anyhow!("connection closed"))))
+            }
             std::task::Poll::Ready(None) => {
+                self.done = true;
                 std::task::Poll::Ready(Some(Err(anyhow::anyhow!("connection closed"))))
             }
         }
@@ -335,7 +345,12 @@ impl Stream for TurnStream {
                         }),
                 ))
             }
+            std::task::Poll::Ready(Some(Incoming::Closed)) => {
+                self.done = true;
+                std::task::Poll::Ready(Some(Err(anyhow::anyhow!("connection closed"))))
+            }
             std::task::Poll::Ready(None) => {
+                self.done = true;
                 std::task::Poll::Ready(Some(Err(anyhow::anyhow!("connection closed"))))
             }
         }

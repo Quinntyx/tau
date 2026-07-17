@@ -32,8 +32,7 @@ pub struct AppState {
     config: Arc<tau_core::config::Config>,
     db: Arc<tau_core::db::Db>,
     runtime: runtime::Runtime,
-    #[allow(dead_code)]
-    sessions: Arc<Mutex<HashMap<String, Arc<runtime::SessionTurnQueue<()>>>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<runtime::SessionTurnQueue<String>>>>>,
 }
 
 impl AppState {
@@ -146,14 +145,16 @@ async fn handle_request(req: Request, state: &AppState, out: &mpsc::Sender<Messa
             .params
             .and_then(|p| serde_json::from_value::<ProtocolNegotiateParams>(p).ok())
         {
-            Some(params) if params.version.major == 1 => serde_json::to_string(&Response::ok(
-                id,
-                ProtocolNegotiateResult {
-                    version: ProtocolVersion { major: 1, minor: 0 },
-                    capabilities: params.capabilities,
-                },
-            ))
-            .unwrap_or_default(),
+            Some(params) if params.version.major == 1 && params.version.minor == 0 => {
+                serde_json::to_string(&Response::ok(
+                    id,
+                    ProtocolNegotiateResult {
+                        version: ProtocolVersion { major: 1, minor: 0 },
+                        capabilities: params.capabilities,
+                    },
+                ))
+                .unwrap_or_default()
+            }
             _ => serde_json::to_string(&Response::<serde_json::Value>::err(
                 id,
                 INVALID_PARAMS,
@@ -212,6 +213,19 @@ async fn start_turn(
     .await;
     match result {
         Ok(Ok((session_id, turn_id, event))) => {
+            // Keep the wire turn identifier as the cancellation key.  Runtime
+            // queue identifiers are admission counters and must never leak
+            // into the typed protocol.
+            let _ = state.runtime.cancellation.register(turn_id.clone());
+            let queue = {
+                let mut sessions = state.sessions.lock().await;
+                sessions
+                    .entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(runtime::SessionTurnQueue::new()))
+                    .clone()
+            };
+            let (_admission_id, _completion) = queue.submit(turn_id.clone());
+            let active = queue.next().await;
             let mut params = serde_json::to_value(&event).unwrap_or_default();
             params["request_id"] = serde_json::to_value(&id).unwrap_or_default();
             let notification = Notification {
@@ -222,14 +236,16 @@ async fn start_turn(
             if let Ok(text) = serde_json::to_string(&notification) {
                 let _ = out.send(Message::Text(text.into())).await;
             }
-            serde_json::to_string(&Response::ok(
+            let response = serde_json::to_string(&Response::ok(
                 id,
                 TurnStartResult {
                     session_id,
                     turn_id,
                 },
             ))
-            .unwrap_or_default()
+            .unwrap_or_default();
+            active.finish(Ok(()));
+            response
         }
         Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
@@ -256,10 +272,7 @@ async fn cancel_turn(id: Id, value: Option<serde_json::Value>, state: &AppState)
         ))
         .unwrap_or_default();
     };
-    let cancelled = state
-        .runtime
-        .cancellation
-        .cancel(params.turn_id.parse().unwrap_or_default());
+    let cancelled = state.runtime.cancellation.cancel(&params.turn_id);
     serde_json::to_string(&Response::ok(
         id,
         TurnCancelResult {
@@ -288,12 +301,13 @@ async fn replay_turn(id: Id, value: Option<serde_json::Value>, state: &AppState)
     .await;
     match result {
         Ok(Ok(events)) => {
-            let next_sequence = events.last().map(|e| e.sequence);
+            let next_sequence = events.last().map(|e| e.sequence + 1);
             serde_json::to_string(&Response::ok(
                 id,
                 TurnReplayResult {
                     events,
                     next_sequence,
+                    gap: false,
                 },
             ))
             .unwrap_or_default()

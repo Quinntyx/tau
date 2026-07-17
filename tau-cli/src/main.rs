@@ -74,14 +74,14 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => tau_server::run(socket).await,
         Command::Ping => {
-            let mut c = tau_client::Client::connect(&socket)
+            let c = tau_client::Client::connect(&socket)
                 .await
                 .context("connecting to daemon (is it running? try `tau serve`)")?;
             println!("{}", c.ping().await?);
             Ok(())
         }
         Command::Health => {
-            let mut c = tau_client::Client::connect(&socket)
+            let c = tau_client::Client::connect(&socket)
                 .await
                 .context("connecting to daemon (is it running? try `tau serve`)")?;
             let h = c.health().await?;

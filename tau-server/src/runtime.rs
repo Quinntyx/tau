@@ -20,7 +20,7 @@ pub enum WaitError {
 
 #[derive(Clone)]
 pub struct CancellationAuthority {
-    inner: Arc<Mutex<HashMap<TurnId, Arc<Cancel>>>>,
+    inner: Arc<Mutex<HashMap<String, Arc<Cancel>>>>,
 }
 
 struct Cancel {
@@ -34,7 +34,8 @@ impl CancellationAuthority {
             inner: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-    pub fn register(&self, turn: TurnId) -> CancellationHandle {
+    pub fn register<T: ToString>(&self, turn: T) -> CancellationHandle {
+        let turn = turn.to_string();
         let cancel = Arc::new(Cancel {
             cancelled: AtomicBool::new(false),
             notify: Notify::new(),
@@ -44,7 +45,8 @@ impl CancellationAuthority {
     }
     /// Any attached client may invoke this.  The caller is intentionally not
     /// accepted here: authorization belongs to the protocol adapter.
-    pub fn cancel(&self, turn: TurnId) -> bool {
+    pub fn cancel<T: ToString>(&self, turn: T) -> bool {
+        let turn = turn.to_string();
         let Some(cancel) = self.inner.lock().unwrap().get(&turn).cloned() else {
             return false;
         };
@@ -52,7 +54,8 @@ impl CancellationAuthority {
         cancel.notify.notify_waiters();
         true
     }
-    pub fn remove(&self, turn: TurnId) {
+    pub fn remove<T: ToString>(&self, turn: T) {
+        let turn = turn.to_string();
         self.inner.lock().unwrap().remove(&turn);
     }
     pub fn interrupt_all(&self) {
@@ -61,7 +64,7 @@ impl CancellationAuthority {
             .lock()
             .unwrap()
             .keys()
-            .copied()
+            .cloned()
             .collect::<Vec<_>>();
         for turn in turns {
             self.cancel(turn);

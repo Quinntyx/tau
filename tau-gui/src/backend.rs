@@ -110,7 +110,7 @@ impl Backend {
         let model = self.model.clone();
         self.runtime.spawn(async move {
             let result = async {
-                let mut client = tau_client::Client::connect(&socket).await?;
+                let client = tau_client::Client::connect(&socket).await?;
                 let params = CompletionStreamParams {
                     model,
                     prompt,

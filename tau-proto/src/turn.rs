@@ -90,6 +90,9 @@ pub struct TurnReplayParams {
 pub struct TurnReplayResult {
     pub events: Vec<SequencedEvent>,
     pub next_sequence: Option<u64>,
+    /// True when the requested cursor predates retained history.
+    #[serde(default)]
+    pub gap: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
