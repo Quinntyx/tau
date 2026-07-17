@@ -86,6 +86,35 @@ pub struct QaRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InteractivePrompt {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub kind: String,
+    pub payload_json: String,
+    pub initiating_client_id: String,
+    pub owner_client_id: String,
+    pub status: String,
+    pub idempotency_key: Option<String>,
+    pub reply_idempotency_key: Option<String>,
+    pub takeover_idempotency_key: Option<String>,
+    pub reply_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PolicyDecisionRecord {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub scope: String,
+    pub actor: String,
+    pub pattern: String,
+    pub decision_json: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlanRevision {
     pub plan_id: String,
     pub revision: i64,

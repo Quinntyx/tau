@@ -5,6 +5,7 @@ mod epochs;
 mod journal;
 mod messages;
 mod policy;
+mod prompts;
 mod qa_records;
 mod sessions;
 mod usage;
@@ -17,8 +18,8 @@ use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
 
 pub use domain::{
-    ContentBlock, ContextEpochRecord, Message, PlanRevision, QaRecord, Session, SteeringMode,
-    SteeringRun, Usage, default_db_path,
+    ContentBlock, ContextEpochRecord, InteractivePrompt, Message, PlanRevision,
+    PolicyDecisionRecord, QaRecord, Session, SteeringMode, SteeringRun, Usage, default_db_path,
 };
 pub use journal::StoredArtifact;
 
@@ -68,6 +69,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("sql/v1.sql")),
         M::up(include_str!("sql/v2.sql")),
         M::up(include_str!("sql/v3.sql")),
+        M::up(include_str!("sql/v4.sql")),
     ])
 }
 

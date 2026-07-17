@@ -5,6 +5,68 @@ use anyhow::{Result, bail};
 use uuid::Uuid;
 
 impl Db {
+    pub fn save_policy_decision(
+        &self,
+        session_id: Option<&str>,
+        scope: &str,
+        actor: &str,
+        pattern: &str,
+        decision_json: &str,
+    ) -> Result<PolicyDecisionRecord> {
+        if !matches!(scope, "session" | "global") {
+            bail!("unsupported policy decision scope: {scope}");
+        }
+        if scope == "session" && session_id.is_none() {
+            bail!("session policy decisions require a session");
+        }
+        let id = Uuid::new_v4().to_string();
+        let created_at = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO policy_decisions(id,session_id,scope,actor,pattern,decision_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO UPDATE SET actor=excluded.actor,decision_json=excluded.decision_json,created_at=excluded.created_at",
+            rusqlite::params![id, session_id, scope, actor, pattern, decision_json, created_at],
+        )?;
+        Ok(conn.query_row(
+            "SELECT id,session_id,scope,actor,pattern,decision_json,created_at FROM policy_decisions WHERE scope=?1 AND pattern=?2 AND (scope='global' OR session_id=?3)",
+            rusqlite::params![scope, pattern, session_id],
+            |row| {
+                Ok(PolicyDecisionRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    scope: row.get(2)?,
+                    actor: row.get(3)?,
+                    pattern: row.get(4)?,
+                    decision_json: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )?)
+    }
+
+    pub fn list_policy_decisions(
+        &self,
+        session_id: Option<&str>,
+        scope: &str,
+    ) -> Result<Vec<PolicyDecisionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,scope,actor,pattern,decision_json,created_at FROM policy_decisions WHERE scope=?1 AND (scope='global' OR session_id=?2) ORDER BY created_at,id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![scope, session_id], |row| {
+            Ok(PolicyDecisionRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                scope: row.get(2)?,
+                actor: row.get(3)?,
+                pattern: row.get(4)?,
+                decision_json: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Persist the canonical ordered session rules. Replacing the full set in
     /// one transaction prevents a partially updated policy from authorizing a
     /// call after a client reconnects.

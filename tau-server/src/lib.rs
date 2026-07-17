@@ -20,7 +20,7 @@ use futures::{SinkExt, StreamExt};
 use tau_proto::prelude::*;
 use tokio::{
     net::UnixListener,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, broadcast, mpsc, oneshot},
 };
 
 mod completion;
@@ -36,6 +36,35 @@ pub struct AppState {
     runtime: runtime::Runtime,
     sessions: Arc<Mutex<HashMap<String, Arc<runtime::SessionTurnQueue<String>>>>>,
     events: tokio::sync::broadcast::Sender<SequencedEvent>,
+    policy: Arc<PolicyBroker>,
+}
+
+struct PolicyBroker {
+    events: broadcast::Sender<Notification<serde_json::Value>>,
+    waiters: Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>>,
+}
+
+impl PolicyBroker {
+    fn new() -> Self {
+        let (events, _) = broadcast::channel(4096);
+        Self {
+            events,
+            waiters: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn resolve(&self, request_id: &str, value: Result<serde_json::Value, String>) {
+        if let Some(waiter) = self.waiters.lock().await.remove(request_id) {
+            let _ = waiter.send(value);
+        }
+    }
+
+    async fn interrupt_all(&self) {
+        let mut waiters = self.waiters.lock().await;
+        for (_, waiter) in waiters.drain() {
+            let _ = waiter.send(Err("prompt interrupted by daemon restart".to_owned()));
+        }
+}
 }
 
 impl AppState {
@@ -47,6 +76,7 @@ impl AppState {
             runtime: runtime::Runtime::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             events: tokio::sync::broadcast::channel(4096).0,
+            policy: Arc::new(PolicyBroker::new()),
         }
     }
 
@@ -86,6 +116,73 @@ impl AppState {
         let _ = self.events.send(persisted.clone());
         Ok(persisted)
     }
+
+    /// Publish a durable typed policy request and wait indefinitely for its
+    /// terminal reply. The caller is the turn runner: resolving the prompt
+    /// wakes this future, while the database remains the replay authority.
+    pub async fn request_policy_prompt(
+        &self,
+        method: &str,
+        session_id: &str,
+        turn_id: &str,
+        kind: &str,
+        mut payload: serde_json::Value,
+        client_id: &str,
+    ) -> Result<serde_json::Value> {
+        let _requested_id = payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .context("policy request missing request_id")?
+            .to_owned();
+        let db = Arc::clone(&self.db);
+        let session_id_owned = session_id.to_owned();
+        let turn_id_owned = turn_id.to_owned();
+        let kind_owned = kind.to_owned();
+        let payload_json = serde_json::to_string(&payload)?;
+        let client_id_owned = client_id.to_owned();
+        let idempotency_owned = payload
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned);
+        let prompt = tokio::task::spawn_blocking(move || {
+            db.create_interactive_prompt(
+                &session_id_owned,
+                &turn_id_owned,
+                &kind_owned,
+                &payload_json,
+                &client_id_owned,
+                idempotency_owned.as_deref(),
+            )
+        })
+        .await??;
+        if prompt.status != "pending" {
+            return prompt
+                .reply_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .context("terminal policy prompt has no reply");
+        }
+        let request_id = prompt.id.clone();
+        payload["request_id"] = serde_json::Value::String(request_id.clone());
+        let (tx, rx) = oneshot::channel();
+        self.policy
+            .waiters
+            .lock()
+            .await
+            .insert(request_id.clone(), tx);
+        let _ = self.policy.events.send(Notification {
+            jsonrpc: JsonRpc::default(),
+            method: method.to_owned(),
+            params: Some(payload),
+        });
+        match rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(error)) => anyhow::bail!(error),
+            Err(_) => anyhow::bail!("policy prompt broker closed"),
+        }
+    }
 }
 
 impl Default for AppState {
@@ -106,7 +203,8 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    let client_id = state.runtime.connections.attach();
+    let connection_id = state.runtime.connections.attach();
+    let client_id = connection_id.to_string();
     let (mut sink, mut input) = futures::StreamExt::split(socket);
     let (out, mut outgoing) = mpsc::channel::<Message>(128);
     let mut events = state.subscribe_events();
@@ -122,6 +220,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 continue;
             };
             if event_out.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut policy_events = state.policy.events.subscribe();
+    let policy_out = out.clone();
+    let policy_forwarder = tokio::spawn(async move {
+        while let Ok(notification) = policy_events.recv().await {
+            let Ok(text) = serde_json::to_string(&notification) else {
+                continue;
+            };
+            if policy_out.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
         }
@@ -153,8 +263,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 };
                 let state = state.clone();
                 let out = out.clone();
+                let client_id = client_id.clone();
                 tokio::spawn(async move {
-                    let response = handle_request(req, &state, &out).await;
+                    let response = handle_request(req, &state, &out, &client_id).await;
                     let _ = out.send(Message::Text(response.into())).await;
                 });
             }
@@ -165,14 +276,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             _ => {}
         }
     }
+    policy_forwarder.abort();
     drop(out);
     event_forwarder.abort();
     let _ = writer.await;
-    state.runtime.connections.detach(client_id);
+    state.runtime.connections.detach(connection_id);
 }
 
 /// Dispatch one non-streaming JSON-RPC request into a response.
-async fn handle_request(req: Request, state: &AppState, out: &mpsc::Sender<Message>) -> String {
+async fn handle_request(
+    req: Request,
+    state: &AppState,
+    out: &mpsc::Sender<Message>,
+    client_id: &str,
+) -> String {
     let id = req.id;
     match req.method.as_str() {
         METHOD_PING => serde_json::to_string(&Response::ok(id, "pong")).unwrap_or_default(),
@@ -222,10 +339,264 @@ async fn handle_request(req: Request, state: &AppState, out: &mpsc::Sender<Messa
         METHOD_TURN_START => start_turn(id, req.params, state, out).await,
         METHOD_TURN_CANCEL => cancel_turn(id, req.params, state).await,
         METHOD_TURN_REPLAY => replay_turn(id, req.params, state).await,
+        METHOD_PERMISSION_REPLY => {
+            resolve_prompt(id, req.params, state, client_id, "permission", true).await
+        }
+        METHOD_QUESTION_REPLY => {
+            resolve_prompt(id, req.params, state, client_id, "question", false).await
+        }
+        METHOD_DIFF_DECISION => {
+            resolve_prompt(id, req.params, state, client_id, "diff", true).await
+        }
+        METHOD_PLAN_REPLY => resolve_prompt(id, req.params, state, client_id, "plan", true).await,
+        METHOD_AIRTIGHT_REPLY => {
+            resolve_prompt(id, req.params, state, client_id, "airtight", true).await
+        }
+        METHOD_PROMPT_TAKEOVER => takeover_prompt(id, req.params, state, client_id).await,
         other => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             METHOD_NOT_FOUND,
             format!("unknown method: {other}"),
+        ))
+        .unwrap_or_default(),
+    }
+}
+
+async fn resolve_prompt(
+    id: Id,
+    value: Option<serde_json::Value>,
+    state: &AppState,
+    client_id: &str,
+    kind: &str,
+    owner_required: bool,
+) -> String {
+    let Some(value) = value else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "missing prompt reply",
+        ))
+        .unwrap_or_default();
+    };
+    let request_id = value
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let key = value
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if request_id.is_empty() || key.is_empty() {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "request_id and idempotency_key are required",
+        ))
+        .unwrap_or_default();
+    }
+    let validation = match kind {
+        "permission" => serde_json::from_value::<PermissionReply>(value.clone())
+            .map_err(|error| error.to_string())
+            .and_then(|reply| reply.validate().map_err(|error| error.to_string())),
+        "question" => serde_json::from_value::<QuestionReply>(value.clone())
+            .map_err(|error| error.to_string())
+            .and_then(|reply| reply.validate().map_err(|error| error.to_string())),
+        "diff" => serde_json::from_value::<DiffDecision>(value.clone())
+            .map_err(|error| error.to_string())
+            .and_then(|reply| reply.validate().map_err(|error| error.to_string())),
+        "plan" => serde_json::from_value::<PlanReply>(value.clone())
+            .map_err(|error| error.to_string())
+            .and_then(|reply| reply.validate().map_err(|error| error.to_string())),
+        "airtight" => serde_json::from_value::<AirtightPromptReply>(value.clone())
+            .map_err(|error| error.to_string())
+            .and_then(|reply| reply.validate().map_err(|error| error.to_string())),
+        _ => Err("unknown prompt kind".to_owned()),
+    };
+    if let Err(error) = validation {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            format!("invalid {kind} reply: {error}"),
+        ))
+        .unwrap_or_default();
+    }
+    // Keep the wire boundary typed.  The database deliberately stores the
+    // reply as JSON, but accepting an arbitrary object here would let a
+    // client smuggle a reply for a different prompt kind (or actor policy).
+    let actor = match kind {
+        "permission" => {
+            serde_json::from_value::<PermissionReply>(value.clone()).map(|reply| reply.actor)
+        }
+        "question" => {
+            serde_json::from_value::<QuestionReply>(value.clone()).map(|reply| reply.actor)
+        }
+        "diff" => serde_json::from_value::<DiffDecision>(value.clone()).map(|reply| reply.actor),
+        "plan" => serde_json::from_value::<PlanReply>(value.clone()).map(|reply| reply.actor),
+        "airtight" => {
+            serde_json::from_value::<AirtightPromptReply>(value.clone()).map(|reply| reply.actor)
+        }
+        _ => {
+            return serde_json::to_string(&Response::<serde_json::Value>::err(
+                id,
+                INVALID_PARAMS,
+                "unknown prompt kind",
+            ))
+            .unwrap_or_default();
+        }
+    };
+    let actor = match actor {
+        Ok(actor) => actor,
+        Err(error) => {
+            return serde_json::to_string(&Response::<serde_json::Value>::err(
+                id,
+                INVALID_PARAMS,
+                format!("invalid {kind} reply: {error}"),
+            ))
+            .unwrap_or_default();
+        }
+    };
+    // Airtight/policy-affecting decisions cannot be delegated to the super
+    // agent.  Super may answer only the soft question prompt; the canonical
+    // policy engine remains the authority for permissions.
+    if matches!(actor, PromptActor::SuperAgent) && kind != "question" {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            -32001,
+            "actor is not authorized for this prompt",
+        ))
+        .unwrap_or_default();
+    }
+    let db = Arc::clone(&state.db);
+    let reply = value.to_string();
+    let client = client_id.to_string();
+    let kind = kind.to_string();
+    let broker_request_id = request_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let prompt = db.get_interactive_prompt(&request_id)?;
+        if prompt.kind != kind {
+            anyhow::bail!("prompt kind mismatch")
+        };
+        let resolved = if kind == "permission" {
+            let permission: PermissionReply = serde_json::from_str(&reply)?;
+            let resolved = match permission.choice {
+                PermissionChoice::Reject => db.reject_interactive_prompt(
+                    &request_id,
+                    &client,
+                    &reply,
+                    &key,
+                    owner_required,
+                )?,
+                PermissionChoice::Allow => db.resolve_interactive_prompt(
+                    &request_id,
+                    &client,
+                    &reply,
+                    &key,
+                    owner_required,
+                )?,
+            };
+            if matches!(
+                permission.scope,
+                PermissionScope::Session | PermissionScope::Global
+            ) {
+                let payload: PermissionRequest = serde_json::from_str(&prompt.payload_json)?;
+                let scope = match permission.scope {
+                    PermissionScope::Session => "session",
+                    PermissionScope::Global => "global",
+                    _ => unreachable!(),
+                };
+                let pattern = format!("{}:{}", payload.tool, payload.arguments);
+                db.save_policy_decision(
+                    (scope == "session").then_some(prompt.session_id.as_str()),
+                    scope,
+                    &serde_json::to_string(&permission.actor)?,
+                    &pattern,
+                    &serde_json::to_string(&permission.choice)?,
+                )?;
+            }
+            resolved
+        } else {
+            db.resolve_interactive_prompt(&request_id, &client, &reply, &key, owner_required)?
+        };
+        Ok::<_, anyhow::Error>(resolved)
+    })
+    .await;
+    match result {
+        Ok(Ok(prompt)) => {
+            if let Some(reply_json) = prompt.reply_json.as_deref() {
+                match serde_json::from_str(reply_json) {
+                    Ok(reply) => state.policy.resolve(&broker_request_id, Ok(reply)).await,
+                    Err(error) => {
+                        state
+                            .policy
+                            .resolve(&broker_request_id, Err(error.to_string()))
+                            .await;
+                    }
+                }
+            }
+            serde_json::to_string(&Response::ok(id, prompt)).unwrap_or_default()
+        }
+        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
+        ))
+        .unwrap_or_default(),
+        Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
+        ))
+        .unwrap_or_default(),
+    }
+}
+
+async fn takeover_prompt(
+    id: Id,
+    value: Option<serde_json::Value>,
+    state: &AppState,
+    client_id: &str,
+) -> String {
+    let Some(value) = value else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "missing takeover",
+        ))
+        .unwrap_or_default();
+    };
+    let takeover = match serde_json::from_value::<PromptTakeover>(value) {
+        Ok(value) if !value.request_id.is_empty() && !value.idempotency_key.is_empty() => value,
+        _ => {
+            return serde_json::to_string(&Response::<serde_json::Value>::err(
+                id,
+                INVALID_PARAMS,
+                "request_id and idempotency_key are required",
+            ))
+            .unwrap_or_default();
+        }
+    };
+    let request_id = takeover.request_id;
+    let idempotency_key = takeover.idempotency_key;
+    let db = Arc::clone(&state.db);
+    let client = client_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        db.take_over_interactive_prompt(&request_id, &client, &idempotency_key)
+    })
+    .await;
+    match result {
+        Ok(Ok(prompt)) => serde_json::to_string(&Response::ok(id, prompt)).unwrap_or_default(),
+        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
+        ))
+        .unwrap_or_default(),
+        Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
         ))
         .unwrap_or_default(),
     }
@@ -447,7 +818,16 @@ pub async fn run(socket_path: PathBuf) -> Result<()> {
                 return Err(e);
             }
         };
-        AppState::new(Arc::new(config), db)
+        // A daemon restart is an explicit interruption boundary. Pending prompts
+        // remain replayable, but can never silently resume an old live turn.
+        let _ = db.interrupt_interactive_prompts();
+        let state = AppState::new(Arc::new(config), db);
+        // The in-memory side of the boundary matters as well: queued turns
+        // must not survive a daemon lifecycle even when their durable prompt
+        // rows have already been marked interrupted.
+        state.runtime.interrupt_for_restart();
+        state.policy.interrupt_all().await;
+        state
     };
 
     // Stale-socket cleanup is safe: we hold the single-instance lock, so any

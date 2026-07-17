@@ -18,10 +18,23 @@ enum Incoming {
     Closed,
 }
 
+/// Server-originated interactive policy requests.  These are delivered on the
+/// client event stream so a broker can answer them without sharing the wire
+/// envelope or guessing at JSON fields.
+#[derive(Debug, Clone)]
+pub enum PolicyEvent {
+    Permission(PermissionRequest),
+    Question(QuestionRequest),
+    Diff(DiffRequest),
+    Plan(PlanRequest),
+    Airtight(AirtightPromptRequest),
+}
+
 struct Inner {
     sink: Mutex<futures_util::stream::SplitSink<WebSocketStream<UnixStream>, Message>>,
     pending: Mutex<HashMap<Id, mpsc::UnboundedSender<Incoming>>>,
     events: broadcast::Sender<SequencedEvent>,
+    policy_events: broadcast::Sender<PolicyEvent>,
 }
 
 /// A connected tau daemon client. All reads are performed by one background
@@ -54,6 +67,10 @@ pub struct EventStream {
     rx: mpsc::UnboundedReceiver<SequencedEvent>,
 }
 
+pub struct PolicyEventStream {
+    rx: mpsc::UnboundedReceiver<PolicyEvent>,
+}
+
 #[derive(Debug, Clone)]
 pub enum TurnStreamEvent {
     Event(SequencedEvent),
@@ -70,10 +87,12 @@ impl Client {
             .context("websocket handshake")?;
         let (sink, mut reader) = ws.split();
         let (events, _) = broadcast::channel(4096);
+        let (policy_events, _) = broadcast::channel(4096);
         let inner = Arc::new(Inner {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
             events,
+            policy_events,
         });
         let routed = Arc::clone(&inner);
         tokio::spawn(async move {
@@ -100,6 +119,30 @@ impl Client {
                                 let _ = routed.events.send(event);
                             }
                         }
+                    }
+                    let policy = notification
+                        .params
+                        .clone()
+                        .and_then(|params| match notification.method.as_str() {
+                            METHOD_PERMISSION_REQUEST => serde_json::from_value(params)
+                                .ok()
+                                .map(PolicyEvent::Permission),
+                            METHOD_QUESTION_REQUEST => serde_json::from_value(params)
+                                .ok()
+                                .map(PolicyEvent::Question),
+                            METHOD_DIFF_REQUEST => {
+                                serde_json::from_value(params).ok().map(PolicyEvent::Diff)
+                            }
+                            METHOD_PLAN_REQUEST => {
+                                serde_json::from_value(params).ok().map(PolicyEvent::Plan)
+                            }
+                            METHOD_AIRTIGHT_REQUEST => serde_json::from_value(params)
+                                .ok()
+                                .map(PolicyEvent::Airtight),
+                            _ => None,
+                        });
+                    if let Some(event) = policy {
+                        let _ = routed.policy_events.send(event);
                     }
                     let request_id = notification
                         .params
@@ -169,6 +212,10 @@ impl Client {
         let response = loop {
             match rx.recv().await.context("connection closed")? {
                 Incoming::Response(r) if r.id == id => break r,
+                Incoming::Closed => {
+                    self.inner.pending.lock().await.remove(&id);
+                    anyhow::bail!("connection closed (request interrupted)");
+                }
                 _ => {}
             }
         };
@@ -194,6 +241,33 @@ impl Client {
     }
     pub async fn health(&self) -> Result<HealthResult> {
         serde_json::from_value(self.call0(METHOD_HEALTH).await?).context("decoding health result")
+    }
+    pub async fn permission_reply(&self, params: PermissionReply) -> Result<serde_json::Value> {
+        self.call(METHOD_PERMISSION_REPLY, Some(params)).await
+    }
+    pub async fn question_reply(&self, params: QuestionReply) -> Result<serde_json::Value> {
+        self.call(METHOD_QUESTION_REPLY, Some(params)).await
+    }
+    pub async fn diff_decision(&self, params: DiffDecision) -> Result<serde_json::Value> {
+        self.call(METHOD_DIFF_DECISION, Some(params)).await
+    }
+    pub async fn diff_reply(&self, params: DiffReply) -> Result<serde_json::Value> {
+        self.call(METHOD_DIFF_DECISION, Some(params)).await
+    }
+    pub async fn plan_reply(&self, params: PlanReply) -> Result<serde_json::Value> {
+        self.call(METHOD_PLAN_REPLY, Some(params)).await
+    }
+    pub async fn airtight_reply(&self, params: AirtightPromptReply) -> Result<serde_json::Value> {
+        self.call(METHOD_AIRTIGHT_REPLY, Some(params)).await
+    }
+    pub async fn set_autonomy(&self, params: AutonomySet) -> Result<serde_json::Value> {
+        self.call(METHOD_AUTONOMY_SET, Some(params)).await
+    }
+    pub async fn steering_action(&self, params: SteeringAction) -> Result<serde_json::Value> {
+        self.call(METHOD_STEERING_ACTION, Some(params)).await
+    }
+    pub async fn prompt_takeover(&self, params: PromptTakeover) -> Result<serde_json::Value> {
+        self.call(METHOD_PROMPT_TAKEOVER, Some(params)).await
     }
 
     pub async fn negotiate(
@@ -245,6 +319,19 @@ impl Client {
         });
         EventStream { rx }
     }
+
+    pub fn policy_events(&self) -> PolicyEventStream {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut source = self.inner.policy_events.subscribe();
+        tokio::spawn(async move {
+            while let Ok(event) = source.recv().await {
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        PolicyEventStream { rx }
+    }
 }
 
 impl Drop for CompletionStream {
@@ -275,6 +362,16 @@ impl Stream for EventStream {
         std::pin::Pin::new(&mut self.rx)
             .poll_recv(cx)
             .map(|r| r.map(Ok))
+    }
+}
+
+impl Stream for PolicyEventStream {
+    type Item = PolicyEvent;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.rx).poll_recv(cx)
     }
 }
 

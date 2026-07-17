@@ -19,6 +19,36 @@ pub enum Decision {
     RejectAlways,
 }
 
+/// Lifetime requested for a human or steering decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionScope {
+    Once,
+    Session,
+    Global,
+    AlwaysAllow,
+    AlwaysReject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptActor {
+    Human,
+    SteeringAgent,
+    SuperAgent,
+}
+
+impl Decision {
+    pub fn from_scope(choice: PermissionReply, scope: PermissionScope) -> Self {
+        match (choice, scope) {
+            (PermissionReply::Allow, PermissionScope::AlwaysAllow) => Self::AllowAlways,
+            (PermissionReply::Reject, PermissionScope::AlwaysReject) => Self::RejectAlways,
+            (PermissionReply::Allow, _) => Self::Allow,
+            (PermissionReply::Reject, _) => Self::Reject,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub pattern: String,
@@ -148,7 +178,41 @@ pub enum PermissionReply {
     Reject,
 }
 
-type PendingPermission = (PermissionRequest, Option<PermissionReply>);
+impl PermissionReply {
+    pub fn decision(self, scope: PermissionScope) -> Decision {
+        Decision::from_scope(self, scope)
+    }
+}
+
+/// Super mode may answer informational/soft prompts, but it is never a
+/// policy or plan authority. Airtight transitions require a human or the
+/// explicitly authorized steering actor.
+pub fn actor_may_answer_soft_prompt(actor: PromptActor) -> bool {
+    matches!(
+        actor,
+        PromptActor::Human | PromptActor::SteeringAgent | PromptActor::SuperAgent
+    )
+}
+
+pub fn actor_may_grant_airtight(actor: PromptActor) -> bool {
+    matches!(actor, PromptActor::Human | PromptActor::SteeringAgent)
+}
+
+pub fn actor_may_apply_permission(actor: PromptActor) -> bool {
+    matches!(actor, PromptActor::Human | PromptActor::SteeringAgent)
+}
+
+/// A prompt may be interrupted by a daemon restart, but never expires while
+/// the daemon is alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptStatus {
+    Pending,
+    Resolved,
+    Interrupted,
+}
+
+type PendingPermission = (PermissionRequest, Option<PermissionReply>, String);
 
 #[derive(Clone, Default)]
 pub struct PermissionBroker {
@@ -172,14 +236,15 @@ impl PermissionBroker {
         self.pending
             .lock()
             .await
-            .insert(request.id.clone(), (request.clone(), None));
+            .insert(request.id.clone(), (request.clone(), None, String::new()));
         request
     }
 
     pub async fn wait(&self, id: &str) -> Option<PermissionReply> {
         loop {
+            let notified = self.changed.notified();
             let mut pending = self.pending.lock().await;
-            if let Some((_, Some(reply))) = pending.get(id) {
+            if let Some((_, Some(reply), _)) = pending.get(id) {
                 let reply = *reply;
                 pending.remove(id);
                 return Some(reply);
@@ -188,18 +253,86 @@ impl PermissionBroker {
                 return None;
             }
             drop(pending);
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            notified.await;
         }
     }
 
     pub async fn reply(&self, id: &str, reply: PermissionReply) -> bool {
         let mut pending = self.pending.lock().await;
-        let Some((_, slot)) = pending.get_mut(id) else {
+        let Some((_, slot, _)) = pending.get_mut(id) else {
             return false;
         };
+        if slot.is_some() {
+            return false;
+        }
         *slot = Some(reply);
         self.changed.notify_one();
         true
+    }
+
+    pub async fn request_for_client(
+        &self,
+        client_id: impl Into<String>,
+        run_id: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> PermissionRequest {
+        let request = PermissionRequest {
+            id: Uuid::new_v4().to_string(),
+            run_id: run_id.into(),
+            tool: tool.into(),
+            arguments,
+        };
+        let owner = client_id.into();
+        self.pending
+            .lock()
+            .await
+            .insert(request.id.clone(), (request.clone(), None, owner));
+        request
+    }
+
+    pub async fn reply_owned(&self, id: &str, client_id: &str, reply: PermissionReply) -> bool {
+        let mut pending = self.pending.lock().await;
+        let Some((_, slot, owner)) = pending.get_mut(id) else {
+            return false;
+        };
+        if (!owner.is_empty() && owner != client_id) || slot.is_some() {
+            return false;
+        }
+        *slot = Some(reply);
+        self.changed.notify_one();
+        true
+    }
+
+    pub async fn take_over(&self, id: &str, client_id: impl Into<String>) -> bool {
+        let mut pending = self.pending.lock().await;
+        let Some((_, slot, owner)) = pending.get_mut(id) else {
+            return false;
+        };
+        if slot.is_some() {
+            return false;
+        }
+        *owner = client_id.into();
+        true
+    }
+
+    /// Mark all unresolved prompts as interrupted during daemon shutdown or
+    /// restart. Waiters observe removal and stop rather than executing stale
+    /// work; resolved prompts remain available for their owners to consume.
+    pub async fn interrupt_pending(&self) -> usize {
+        let mut pending = self.pending.lock().await;
+        let ids: Vec<_> = pending
+            .iter()
+            .filter_map(|(id, (_, reply, _))| reply.is_none().then_some(id.clone()))
+            .collect();
+        let count = ids.len();
+        for id in ids {
+            pending.remove(&id);
+        }
+        if count != 0 {
+            self.changed.notify_waiters();
+        }
+        count
     }
 
     pub async fn pending(&self) -> Vec<PermissionRequest> {
@@ -207,7 +340,7 @@ impl PermissionBroker {
             .lock()
             .await
             .values()
-            .map(|(request, _)| request.clone())
+            .map(|(request, _, _)| request.clone())
             .filter(|r| !r.run_id.is_empty())
             .collect()
     }
@@ -275,5 +408,43 @@ mod tests {
             restored.evaluate("bash", &serde_json::json!({"command":"ls"})),
             Decision::Ask
         );
+    }
+
+    #[test]
+    fn prompt_authority_never_lets_super_agent_change_policy() {
+        assert!(actor_may_answer_soft_prompt(PromptActor::SuperAgent));
+        assert!(!actor_may_apply_permission(PromptActor::SuperAgent));
+        assert!(!actor_may_grant_airtight(PromptActor::SuperAgent));
+        assert!(actor_may_apply_permission(PromptActor::Human));
+    }
+
+    #[tokio::test]
+    async fn permission_broker_enforces_owner_and_interrupts_waiters() {
+        let broker = PermissionBroker::default();
+        let request = broker
+            .request_for_client("owner", "run", "write", serde_json::json!({}))
+            .await;
+        assert!(
+            !broker
+                .reply_owned(&request.id, "other", PermissionReply::Allow)
+                .await
+        );
+        assert!(
+            broker
+                .reply_owned(&request.id, "owner", PermissionReply::Allow)
+                .await
+        );
+        assert_eq!(broker.wait(&request.id).await, Some(PermissionReply::Allow));
+
+        let pending = broker
+            .request_for_client("owner", "run", "write", serde_json::json!({}))
+            .await;
+        let waiter = {
+            let broker = broker.clone();
+            let id = pending.id.clone();
+            tokio::spawn(async move { broker.wait(&id).await })
+        };
+        assert_eq!(broker.interrupt_pending().await, 1);
+        assert_eq!(waiter.await.unwrap(), None);
     }
 }

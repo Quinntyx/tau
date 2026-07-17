@@ -13,6 +13,30 @@ fn migration_idempotent() {
 }
 
 #[test]
+fn policy_decisions_round_trip_by_scope_and_replace_idempotently() {
+    let db = test_db();
+    let session = db.create_session("/tmp/policy").unwrap();
+    let first = db
+        .save_policy_decision(Some(&session.id), "session", "human", "read:*", "allow")
+        .unwrap();
+    let second = db
+        .save_policy_decision(Some(&session.id), "session", "human", "read:*", "reject")
+        .unwrap();
+    assert_eq!(first.id, second.id);
+    assert_eq!(second.decision_json, "reject");
+    assert_eq!(
+        db.list_policy_decisions(Some(&session.id), "session")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    db.save_policy_decision(None, "global", "human", "network:*", "allow")
+        .unwrap();
+    assert_eq!(db.list_policy_decisions(None, "global").unwrap().len(), 1);
+}
+
+#[test]
 fn v1_database_upgrades_forward_to_event_storage() {
     let file = tempfile::NamedTempFile::new().unwrap();
     {
