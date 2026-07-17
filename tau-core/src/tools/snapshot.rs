@@ -159,6 +159,16 @@ impl SnapshotStore {
         }
         let mut restored = 0;
         for entry in manifest.entries {
+            let relative = Path::new(&entry.path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+            {
+                return Err(ToolError::Snapshot(
+                    "snapshot entry is outside snapshot root".into(),
+                ));
+            }
             let target = self.base.join(&entry.path);
             if entry.kind == "directory" {
                 std::fs::create_dir_all(&target).map_err(|e| ToolError::Snapshot(e.to_string()))?;
@@ -174,6 +184,9 @@ impl SnapshotStore {
             let Some(digest) = entry.digest else {
                 continue;
             };
+            if digest.is_empty() || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(ToolError::Snapshot("invalid snapshot blob digest".into()));
+            }
             let source = snapshot_dir.join("blobs").join(digest);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| ToolError::Snapshot(e.to_string()))?;
@@ -214,8 +227,12 @@ impl SnapshotStore {
                 digest: None,
                 skipped: false,
             });
-            for child in std::fs::read_dir(path).map_err(|e| ToolError::Snapshot(e.to_string()))? {
-                let child = child.map_err(|e| ToolError::Snapshot(e.to_string()))?;
+            let mut children = std::fs::read_dir(path)
+                .map_err(|e| ToolError::Snapshot(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ToolError::Snapshot(e.to_string()))?;
+            children.sort_by_key(|child| child.file_name());
+            for child in children {
                 if matches!(child.file_name().to_str(), Some(".git" | ".tau")) {
                     continue;
                 }

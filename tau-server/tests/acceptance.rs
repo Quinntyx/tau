@@ -194,6 +194,22 @@ async fn websocket_protocol_negotiation_and_scripted_provider_round_trip() -> Re
     let fixture = fixtures::ServerFixture::start().await?;
     let mut client = fixtures::client(&fixture).await?;
     assert_eq!(client.ping().await?, "pong");
+    let negotiated = client.negotiate(request.clone()).await?;
+    assert_eq!(negotiated.version.major, 1);
+    assert!(negotiated.capabilities.contains(&Capability::EventReplay));
+    let mismatch = client
+        .call(
+            METHOD_PROTOCOL_NEGOTIATE,
+            Some(serde_json::json!({
+                "version": {"major": 99, "minor": 0},
+                "capabilities": []
+            })),
+        )
+        .await;
+    assert!(
+        mismatch.is_err(),
+        "server must reject incompatible protocol majors"
+    );
     fixture.task.abort();
     Ok(())
 }
@@ -315,6 +331,73 @@ fn snapshot_and_daemon_fixtures_cover_traversal_replay_and_ownership() -> Result
     assert!(registry.is_attached(owner));
     assert!(registry.detach(owner));
     assert!(!registry.is_attached(owner));
+    Ok(())
+}
+
+#[test]
+fn production_plan_gate_migration_and_git_preview_are_not_fixture_state() -> Result<()> {
+    let mut plan = tau_core::plan::Plan::new("acceptance", "contract");
+    let step = plan.add_step("mutate");
+    assert!(tau_core::plan::allows_tool(&plan, true, "edit").is_err());
+    assert!(tau_core::plan::allows_tool(&plan, false, "read").is_ok());
+    assert!(plan.airtight_step(step));
+    assert!(tau_core::plan::allows_tool(&plan, false, "bash").is_ok());
+    plan.revoke_airtight();
+    assert!(tau_core::plan::allows_tool(&plan, true, "write").is_err());
+
+    let db = tau_core::db::Db::open_in_memory()?;
+    let session = db.create_session("/tmp/acceptance")?;
+    let event = tau_proto::turn::TurnEvent::TextDelta {
+        turn_id: "turn".into(),
+        text: "replayed".into(),
+    };
+    db.append_event(&session.id, &event, None)?;
+    assert_eq!(db.replay_events(&session.id, 0, None)?.len(), 1);
+
+    let git = fixtures::GitFixture::new()?;
+    let worktree = git
+        .workspace
+        .managed_worktree("acceptance/model", &git.root)?;
+    std::fs::write(worktree.path.join("preview.txt"), "preview\n")?;
+    let hash = git
+        .workspace
+        .commit(&worktree.path, "preview", &["preview.txt".into()])?;
+    assert!(!hash.is_empty());
+    let preview = git
+        .workspace
+        .preview_integration(&git.root, &worktree.branch, "master")?;
+    assert!(preview.commits.iter().any(|commit| commit == &hash));
+    assert!(!preview.conflicts);
+    Ok(())
+}
+
+#[test]
+fn snapshot_restore_rejects_manifest_escape_and_compaction_preserves_summary() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let file = root.path().join("safe.txt");
+    std::fs::write(&file, "before")?;
+    let store = tau_core::tools::SnapshotStore::for_cwd(root.path());
+    let capture = store.capture_paths(std::slice::from_ref(&file))?;
+    let manifest = std::fs::read_to_string(&capture.manifest)?;
+    std::fs::write(
+        &capture.manifest,
+        manifest.replace("safe.txt", "../escaped.txt"),
+    )?;
+    assert!(store.restore(&capture.id).is_err());
+
+    let mut context = tau_core::context::ContextAssembler::new(1);
+    context.set_plan_context("# Plan");
+    context.set_provider_metadata("production", "compactor");
+    context.push("user", "long input");
+    let old = context.compact("durable summary");
+    assert_eq!(old.number, 0);
+    assert_eq!(context.epoch().number, 1);
+    assert!(
+        context.epoch().messages[0]
+            .content
+            .contains("durable summary")
+    );
+    assert_eq!(context.epoch().provider.as_deref(), Some("production"));
     Ok(())
 }
 

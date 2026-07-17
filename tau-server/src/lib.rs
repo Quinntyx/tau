@@ -141,27 +141,41 @@ async fn handle_request(req: Request, state: &AppState, out: &mpsc::Sender<Messa
             };
             serde_json::to_string(&Response::ok(id, result)).unwrap_or_default()
         }
-        METHOD_PROTOCOL_NEGOTIATE => match req
-            .params
-            .and_then(|p| serde_json::from_value::<ProtocolNegotiateParams>(p).ok())
-        {
-            Some(params) if params.version.major == 1 && params.version.minor == 0 => {
-                serde_json::to_string(&Response::ok(
+        METHOD_PROTOCOL_NEGOTIATE => {
+            let Some(params) = req
+                .params
+                .and_then(|value| serde_json::from_value::<ProtocolNegotiateParams>(value).ok())
+            else {
+                return serde_json::to_string(&Response::<serde_json::Value>::err(
                     id,
-                    ProtocolNegotiateResult {
-                        version: ProtocolVersion { major: 1, minor: 0 },
-                        capabilities: params.capabilities,
-                    },
+                    INVALID_PARAMS,
+                    "invalid protocol negotiation parameters",
                 ))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            };
+            if params.version.major != 1 {
+                return serde_json::to_string(&Response::<serde_json::Value>::err(
+                    id,
+                    INVALID_PARAMS,
+                    "unsupported protocol major version",
+                ))
+                .unwrap_or_default();
             }
-            _ => serde_json::to_string(&Response::<serde_json::Value>::err(
+            serde_json::to_string(&Response::ok(
                 id,
-                INVALID_PARAMS,
-                "unsupported protocol version",
+                ProtocolNegotiateResult {
+                    version: ProtocolVersion { major: 1, minor: 0 },
+                    capabilities: vec![
+                        Capability::TurnStreaming,
+                        Capability::TurnCancellation,
+                        Capability::EventReplay,
+                        Capability::Idempotency,
+                        Capability::ArtifactReferences,
+                    ],
+                },
             ))
-            .unwrap_or_default(),
-        },
+            .unwrap_or_default()
+        }
         METHOD_TURN_START => start_turn(id, req.params, state, out).await,
         METHOD_TURN_CANCEL => cancel_turn(id, req.params, state).await,
         METHOD_TURN_REPLAY => replay_turn(id, req.params, state).await,
