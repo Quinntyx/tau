@@ -110,6 +110,7 @@ pub(crate) async fn handle(
                     jsonrpc: JsonRpc::default(),
                     method: METHOD_COMPLETION_DELTA.to_string(),
                     params: Some(CompletionDelta {
+                        request_id: id.clone(),
                         session_id: session.0.id.clone(),
                         text: chunk,
                         usage: None,
@@ -125,6 +126,7 @@ pub(crate) async fn handle(
                     jsonrpc: JsonRpc::default(),
                     method: METHOD_COMPLETION_DELTA.to_string(),
                     params: Some(CompletionDelta {
+                        request_id: id.clone(),
                         session_id: session.0.id.clone(),
                         text: String::new(),
                         usage: Some(usage_summary(usage)),
@@ -194,10 +196,7 @@ fn resolve_session(state: &AppState, params: &CompletionStreamParams) -> Result<
         .cwd
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("cwd is required when session_id is omitted"))?;
-    Ok(state
-        .db()
-        .get_session_by_cwd(cwd)?
-        .unwrap_or(state.db().create_session(cwd)?))
+    state.db().create_session(cwd)
 }
 
 fn chat_history(messages: &[DbMessage], prompt: &str) -> OneOrMany<RigMessage> {

@@ -56,6 +56,7 @@ async fn completion_stream_round_trip() -> Result<()> {
             jsonrpc: JsonRpc::default(),
             method: METHOD_COMPLETION_DELTA.to_string(),
             params: Some(CompletionDelta {
+                request_id: Id::num(1),
                 session_id: "session-1".into(),
                 text: "hello".into(),
                 usage: None,

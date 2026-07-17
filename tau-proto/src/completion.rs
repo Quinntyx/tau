@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::envelope::Id;
+
 pub const METHOD_COMPLETION_STREAM: &str = "completion.stream";
 pub const METHOD_COMPLETION_DELTA: &str = "completion.delta";
 
@@ -38,6 +40,7 @@ pub struct CompletionStreamResult {
 /// One streaming delta notification (`completion.delta`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionDelta {
+    pub request_id: Id,
     pub session_id: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

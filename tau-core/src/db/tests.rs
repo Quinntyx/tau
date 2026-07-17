@@ -35,18 +35,6 @@ fn session_list() {
 }
 
 #[test]
-fn session_lookup_by_cwd_returns_latest() {
-    let db = test_db();
-    let first = db.create_session("/same").unwrap();
-    db.append_message(&first.id, "user", vec![ContentBlock::text("first")])
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let second = db.create_session("/same").unwrap();
-    let found = db.get_session_by_cwd("/same").unwrap().unwrap();
-    assert_eq!(found.id, second.id);
-}
-
-#[test]
 fn message_append_and_get() {
     let db = test_db();
     let s = db.create_session("/tmp/proj").unwrap();

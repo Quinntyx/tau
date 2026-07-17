@@ -71,25 +71,4 @@ impl Db {
             None => Ok(None),
         }
     }
-
-    pub fn get_session_by_cwd(&self, cwd: &str) -> Result<Option<Session>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, cwd, title, created_at, updated_at FROM sessions \
-             WHERE cwd = ?1 ORDER BY updated_at DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map([cwd], |row| {
-            Ok(Session {
-                id: row.get(0)?,
-                cwd: row.get(1)?,
-                title: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-            })
-        })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
-    }
 }
