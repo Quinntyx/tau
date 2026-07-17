@@ -40,6 +40,24 @@ pub struct CompletionStream<'a> {
     done: bool,
 }
 
+/// Stream of durable, typed session events from the daemon.
+pub struct EventStream<'a> {
+    ws: &'a mut WebSocketStream<UnixStream>,
+    done: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum TurnStreamEvent {
+    Event(SequencedEvent),
+    Complete(TurnStartResult),
+}
+
+pub struct TurnStream<'a> {
+    ws: &'a mut WebSocketStream<UnixStream>,
+    request_id: Id,
+    done: bool,
+}
+
 impl Client {
     /// Connect to the daemon at the given Unix socket path.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Client> {
@@ -144,13 +162,162 @@ impl Client {
         })
     }
 
+    /// Start a typed session turn. The returned stream contains turn events and
+    /// the final turn response using the replacement session.turn.start method.
+    pub async fn turn_start(&mut self, params: TurnStartParams) -> Result<TurnStream<'_>> {
+        let id = self.next_id();
+        let req = Request::new(id.clone(), METHOD_TURN_START, Some(params));
+        let text = serde_json::to_string(&req)?;
+        self.ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+            .await
+            .context("sending turn request")?;
+        Ok(TurnStream {
+            ws: &mut self.ws,
+            request_id: id,
+            done: false,
+        })
+    }
+
     /// Server→client notification stream.
     ///
     /// Completion notifications are consumed by [`Client::completion_stream`].
     /// This general event surface remains reserved for notifications that are
     /// not tied to a request, such as tool events or permission requests.
-    pub fn events(&mut self) -> impl futures_util::Stream<Item = Result<Notification>> + '_ {
-        futures_util::stream::pending()
+    pub fn events(&mut self) -> EventStream<'_> {
+        EventStream {
+            ws: &mut self.ws,
+            done: false,
+        }
+    }
+}
+
+impl Stream for EventStream<'_> {
+    type Item = Result<SequencedEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        loop {
+            let message = match Pin::new(&mut *self.ws).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(anyhow::anyhow!("connection closed"))));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(anyhow::anyhow!(error))));
+                }
+                Poll::Ready(Some(Ok(message))) => message,
+            };
+            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            let value: serde_json::Value = match serde_json::from_str(text.as_str()) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+            };
+            if value.get("method").and_then(serde_json::Value::as_str) != Some(METHOD_TURN_EVENT) {
+                continue;
+            }
+            let notification: Notification<serde_json::Value> = match serde_json::from_value(value)
+            {
+                Ok(notification) => notification,
+                Err(error) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+            };
+            let Some(params) = notification.params else {
+                continue;
+            };
+            return Poll::Ready(Some(
+                serde_json::from_value(params).context("decoding turn event"),
+            ));
+        }
+    }
+}
+
+impl Stream for TurnStream<'_> {
+    type Item = Result<TurnStreamEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        loop {
+            let message = match Pin::new(&mut *self.ws).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(anyhow::anyhow!("connection closed"))));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(anyhow::anyhow!(error))));
+                }
+                Poll::Ready(Some(Ok(message))) => message,
+            };
+            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            let value: serde_json::Value = match serde_json::from_str(text.as_str()) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+            };
+            if value.get("method").and_then(serde_json::Value::as_str) == Some(METHOD_TURN_EVENT) {
+                let notification: Notification<serde_json::Value> =
+                    match serde_json::from_value(value) {
+                        Ok(notification) => notification,
+                        Err(error) => {
+                            self.done = true;
+                            return Poll::Ready(Some(Err(error.into())));
+                        }
+                    };
+                if let Some(params) = notification.params {
+                    return Poll::Ready(Some(
+                        serde_json::from_value(params)
+                            .map(TurnStreamEvent::Event)
+                            .context("decoding turn event"),
+                    ));
+                }
+                continue;
+            }
+            let response: Response<serde_json::Value> = match serde_json::from_value(value) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+            };
+            if response.id != self.request_id {
+                continue;
+            }
+            self.done = true;
+            if let Some(error) = response.error {
+                return Poll::Ready(Some(Err(anyhow::anyhow!(
+                    "rpc error {}: {}",
+                    error.code,
+                    error.message
+                ))));
+            }
+            let Some(result) = response.result else {
+                return Poll::Ready(Some(Err(anyhow::anyhow!("response had no result"))));
+            };
+            return Poll::Ready(Some(
+                serde_json::from_value(result)
+                    .map(TurnStreamEvent::Complete)
+                    .map_err(Into::into),
+            ));
+        }
     }
 }
 

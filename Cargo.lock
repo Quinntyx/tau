@@ -6210,6 +6210,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "strum 0.28.0",
+ "tau-proto",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -13,6 +13,19 @@ fn migration_idempotent() {
 }
 
 #[test]
+fn v1_database_upgrades_forward_to_event_storage() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    {
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch(include_str!("sql/v1.sql")).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let db = Db::open(file.path()).unwrap();
+    let session = db.create_session("/tmp/upgrade").unwrap();
+    assert_eq!(db.replay_events(&session.id, 0, None).unwrap().len(), 0);
+}
+
+#[test]
 fn session_create_and_get() {
     let db = test_db();
     let s = db.create_session("/tmp/project").unwrap();
@@ -140,4 +153,60 @@ fn session_updated_on_message_append() {
         .unwrap();
     let fetched = db.get_session(&s.id).unwrap().unwrap();
     assert!(fetched.updated_at > original_updated);
+}
+
+#[test]
+fn event_journal_sequences_replay_and_idempotency() {
+    let db = test_db();
+    let session = db.create_session("/tmp/proj").unwrap();
+    let event = tau_proto::turn::TurnEvent::TextDelta {
+        turn_id: "t".into(),
+        text: "hello".into(),
+    };
+    assert_eq!(
+        db.append_event(&session.id, &event, None).unwrap().sequence,
+        1
+    );
+    assert_eq!(
+        db.append_event(&session.id, &event, None).unwrap().sequence,
+        2
+    );
+    assert_eq!(db.replay_events(&session.id, 1, None).unwrap().len(), 1);
+    let key = tau_proto::turn::IdempotencyKey::new("request-1");
+    assert!(
+        db.remember_idempotency(&session.id, &key, "hash", &"result")
+            .unwrap()
+    );
+    assert!(
+        !db.remember_idempotency(&session.id, &key, "hash", &"result")
+            .unwrap()
+    );
+    assert_eq!(
+        db.idempotent_result::<String>(&session.id, &key).unwrap(),
+        Some("result".into())
+    );
+    assert!(
+        db.remember_idempotency(&session.id, &key, "other", &"result")
+            .is_err()
+    );
+}
+
+#[test]
+fn artifact_reference_round_trip() {
+    let db = test_db();
+    let session = db.create_session("/tmp/proj").unwrap();
+    let reference = tau_proto::turn::ArtifactReference {
+        artifact_id: "a".into(),
+        media_type: "text/plain".into(),
+        size_bytes: 4,
+        content_hash: "sha".into(),
+        storage_ref: "file:///a".into(),
+    };
+    db.create_artifact(&session.id, reference).unwrap();
+    assert_eq!(
+        db.list_artifacts(&session.id).unwrap()[0]
+            .reference
+            .artifact_id,
+        "a"
+    );
 }
