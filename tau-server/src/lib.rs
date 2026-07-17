@@ -5,6 +5,7 @@
 //! are reserved (logged + ignored in M0). systemd-friendly: clean SIGTERM/SIGINT
 //! shutdown, single-instance via an advisory lockfile.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,11 +16,13 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use serde_json::Value;
+use futures::{SinkExt, StreamExt};
 use tau_proto::prelude::*;
-use tokio::net::UnixListener;
+use tokio::{
+    net::UnixListener,
+    sync::{Mutex, mpsc},
+};
 
-mod completion;
 pub mod runtime;
 
 /// Per-process server state shared with every connection.
@@ -29,6 +32,8 @@ pub struct AppState {
     config: Arc<tau_core::config::Config>,
     db: Arc<tau_core::db::Db>,
     runtime: runtime::Runtime,
+    #[allow(dead_code)]
+    sessions: Arc<Mutex<HashMap<String, Arc<runtime::SessionTurnQueue<()>>>>>,
 }
 
 impl AppState {
@@ -38,6 +43,7 @@ impl AppState {
             config,
             db: Arc::new(db),
             runtime: runtime::Runtime::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -75,9 +81,18 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState) {
     let client_id = state.runtime.connections.attach();
-    while let Some(msg) = socket.recv().await {
+    let (mut sink, mut input) = futures::StreamExt::split(socket);
+    let (out, mut outgoing) = mpsc::channel::<Message>(128);
+    let writer = tokio::spawn(async move {
+        while let Some(message) = outgoing.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    while let Some(msg) = input.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 let req: Request = match serde_json::from_str(&text) {
@@ -89,20 +104,18 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             error.to_string(),
                         ))
                         .unwrap_or_default();
-                        if socket.send(Message::Text(response.into())).await.is_err() {
+                        if out.send(Message::Text(response.into())).await.is_err() {
                             break;
                         }
                         continue;
                     }
                 };
-                if req.method == METHOD_COMPLETION_STREAM {
-                    completion::handle(&mut socket, &state, req.id, req.params).await;
-                } else {
-                    let response = handle_request(req, &state);
-                    if socket.send(Message::Text(response.into())).await.is_err() {
-                        break;
-                    }
-                }
+                let state = state.clone();
+                let out = out.clone();
+                tokio::spawn(async move {
+                    let response = handle_request(req, &state, &out).await;
+                    let _ = out.send(Message::Text(response.into())).await;
+                });
             }
             Ok(Message::Binary(_)) => {
                 tracing::debug!("ignoring reserved binary frame");
@@ -111,11 +124,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             _ => {}
         }
     }
+    drop(out);
+    let _ = writer.await;
     state.runtime.connections.detach(client_id);
 }
 
 /// Dispatch one non-streaming JSON-RPC request into a response.
-fn handle_request(req: Request, state: &AppState) -> String {
+async fn handle_request(req: Request, state: &AppState, out: &mpsc::Sender<Message>) -> String {
     let id = req.id;
     match req.method.as_str() {
         METHOD_PING => serde_json::to_string(&Response::ok(id, "pong")).unwrap_or_default(),
@@ -127,31 +142,172 @@ fn handle_request(req: Request, state: &AppState) -> String {
             };
             serde_json::to_string(&Response::ok(id, result)).unwrap_or_default()
         }
-        "protocol.negotiate" => serde_json::to_string(&Response::ok(
-            id,
-            serde_json::json!({
-                "protocol": "tau-jsonrpc",
-                "version": 1,
-                "methods": [METHOD_PING, METHOD_HEALTH, METHOD_COMPLETION_STREAM, "turn.cancel"],
-                "events": [METHOD_COMPLETION_DELTA],
-            }),
-        ))
-        .unwrap_or_default(),
-        "turn.cancel" => {
-            let turn = req
-                .params
-                .and_then(|params| params.get("turn_id").and_then(Value::as_u64));
-            let cancelled = turn.is_some_and(|turn| state.runtime.cancellation.cancel(turn));
-            serde_json::to_string(&Response::ok(
+        METHOD_PROTOCOL_NEGOTIATE => match req
+            .params
+            .and_then(|p| serde_json::from_value::<ProtocolNegotiateParams>(p).ok())
+        {
+            Some(params) if params.version.major == 1 => serde_json::to_string(&Response::ok(
                 id,
-                serde_json::json!({ "cancelled": cancelled }),
+                ProtocolNegotiateResult {
+                    version: ProtocolVersion { major: 1, minor: 0 },
+                    capabilities: params.capabilities,
+                },
             ))
-            .unwrap_or_default()
-        }
+            .unwrap_or_default(),
+            _ => serde_json::to_string(&Response::<serde_json::Value>::err(
+                id,
+                INVALID_PARAMS,
+                "unsupported protocol version",
+            ))
+            .unwrap_or_default(),
+        },
+        METHOD_TURN_START => start_turn(id, req.params, state, out).await,
+        METHOD_TURN_CANCEL => cancel_turn(id, req.params, state).await,
+        METHOD_TURN_REPLAY => replay_turn(id, req.params, state).await,
         other => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             METHOD_NOT_FOUND,
             format!("unknown method: {other}"),
+        ))
+        .unwrap_or_default(),
+    }
+}
+
+async fn start_turn(
+    id: Id,
+    value: Option<serde_json::Value>,
+    state: &AppState,
+    out: &mpsc::Sender<Message>,
+) -> String {
+    let Some(params) = value.and_then(|v| serde_json::from_value::<TurnStartParams>(v).ok()) else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "invalid turn.start params",
+        ))
+        .unwrap_or_default();
+    };
+    let db = Arc::clone(&state.db);
+    let request_id = id.clone();
+    let session = params.session_id.clone();
+    let cwd = params.cwd.clone().unwrap_or_else(|| ".".into());
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(String, String, SequencedEvent)> {
+            let session_id = match session {
+                Some(id) if db.get_session(&id)?.is_some() => id,
+                Some(id) => id,
+                None => db.create_session(&cwd)?.id,
+            };
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let event = db.append_event(
+                &session_id,
+                &TurnEvent::TurnStarted {
+                    turn_id: turn_id.clone(),
+                },
+                Some(&serde_json::to_string(&request_id)?),
+            )?;
+            Ok((session_id, turn_id, event))
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok((session_id, turn_id, event))) => {
+            let mut params = serde_json::to_value(&event).unwrap_or_default();
+            params["request_id"] = serde_json::to_value(&id).unwrap_or_default();
+            let notification = Notification {
+                jsonrpc: JsonRpc::default(),
+                method: METHOD_TURN_EVENT.to_string(),
+                params: Some(params),
+            };
+            if let Ok(text) = serde_json::to_string(&notification) {
+                let _ = out.send(Message::Text(text.into())).await;
+            }
+            serde_json::to_string(&Response::ok(
+                id,
+                TurnStartResult {
+                    session_id,
+                    turn_id,
+                },
+            ))
+            .unwrap_or_default()
+        }
+        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
+        ))
+        .unwrap_or_default(),
+        Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
+        ))
+        .unwrap_or_default(),
+    }
+}
+
+async fn cancel_turn(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let Some(params) = value.and_then(|v| serde_json::from_value::<TurnCancelParams>(v).ok())
+    else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "invalid turn.cancel params",
+        ))
+        .unwrap_or_default();
+    };
+    let cancelled = state
+        .runtime
+        .cancellation
+        .cancel(params.turn_id.parse().unwrap_or_default());
+    serde_json::to_string(&Response::ok(
+        id,
+        TurnCancelResult {
+            session_id: params.session_id,
+            turn_id: params.turn_id,
+            cancelled,
+        },
+    ))
+    .unwrap_or_default()
+}
+
+async fn replay_turn(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let Some(params) = value.and_then(|v| serde_json::from_value::<TurnReplayParams>(v).ok())
+    else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "invalid replay params",
+        ))
+        .unwrap_or_default();
+    };
+    let db = Arc::clone(&state.db);
+    let result = tokio::task::spawn_blocking(move || {
+        db.replay_events(&params.session_id, params.after_sequence, params.limit)
+    })
+    .await;
+    match result {
+        Ok(Ok(events)) => {
+            let next_sequence = events.last().map(|e| e.sequence);
+            serde_json::to_string(&Response::ok(
+                id,
+                TurnReplayResult {
+                    events,
+                    next_sequence,
+                },
+            ))
+            .unwrap_or_default()
+        }
+        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
+        ))
+        .unwrap_or_default(),
+        Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INTERNAL_ERROR,
+            e.to_string(),
         ))
         .unwrap_or_default(),
     }
