@@ -14,3 +14,4 @@ ratatui.workspace = true
 tau-client.workspace = true
 tau-proto.workspace = true
 tokio.workspace = true
+serde_json.workspace = true

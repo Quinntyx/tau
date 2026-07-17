@@ -6370,6 +6370,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "ratatui",
+ "serde_json",
  "tau-client",
  "tau-proto",
  "tokio",

@@ -1,55 +1,52 @@
-//! Minimal power-user terminal client. Unlike the GUI, it never auto-starts tau.
-
-use std::path::PathBuf;
-use std::time::Duration;
+//! Functional, reducer-driven terminal client.  The terminal shell is deliberately
+//! thin; all interesting behaviour lives in typed state and renderable components.
+mod adapter;
+pub mod components;
+pub mod reducer;
+pub mod state;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures_util::StreamExt;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use tau_client::CompletionEvent;
-use tau_proto::prelude::CompletionStreamParams;
-use tokio::time::sleep;
+use ratatui::{Terminal, backend::CrosstermBackend};
+use std::{io, path::PathBuf, time::Duration};
+use tau_client::Client;
 
+pub use adapter::{ClientEvent, ScriptedClient};
+pub use reducer::{Action, apply as reduce};
+pub use state::AppState;
+
+/// Start the client without ever starting a daemon for the user.
 pub async fn run(socket: PathBuf) -> Result<()> {
-    let mut client = tau_client::Client::connect(&socket)
-        .await
-        .with_context(|| {
-            format!(
-                "daemon unavailable at {}\nhelp: run `tau serve` first",
-                socket.display()
-            )
-        })?;
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
+    let mut client = Client::connect(&socket).await.with_context(|| {
+        format!(
+            "daemon unavailable at {}\nhelp: run `tau serve` first",
+            socket.display()
+        )
+    })?;
+    terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = session(&mut terminal, &mut client).await;
-    disable_raw_mode()?;
+    terminal::disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
 
 async fn session(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    client: &mut tau_client::Client,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    client: &mut Client,
 ) -> Result<()> {
-    let mut input = String::new();
-    let mut transcript = String::new();
-    let mut session_id = None;
+    let mut state = AppState::default();
     loop {
-        draw(terminal, &input, &transcript)?;
+        terminal.draw(|frame| components::render(frame, &state))?;
         if !event::poll(Duration::from_millis(50))? {
-            sleep(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -58,57 +55,34 @@ async fn session(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match key.code {
-            KeyCode::Esc => break,
-            KeyCode::Backspace => {
-                input.pop();
+        if matches!(key.code, KeyCode::Esc) {
+            break;
+        }
+        if let Some(action) = reducer::key_action(&state, key) {
+            if let Some(prompt) = reducer::apply(&mut state, action) {
+                adapter::complete(&mut state, client, prompt).await?;
             }
-            KeyCode::Enter if !input.trim().is_empty() => {
-                transcript.push_str(&format!("\nYou: {input}\ntau: "));
-                let prompt = std::mem::take(&mut input);
-                let params = CompletionStreamParams {
-                    model: "openai/gpt-4o".into(),
-                    prompt,
-                    session_id: session_id.clone(),
-                    cwd: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-                };
-                let mut stream = client.completion_stream(params).await?;
-                while let Some(event) = stream.next().await {
-                    match event? {
-                        CompletionEvent::Delta(delta) => transcript.push_str(&delta.text),
-                        CompletionEvent::Complete(result) => session_id = Some(result.session_id),
-                    }
-                    draw(terminal, &input, &transcript)?;
-                }
-                transcript.push('\n');
-            }
-            KeyCode::Char(character) => input.push(character),
-            _ => {}
         }
     }
     Ok(())
 }
 
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    input: &str,
-    transcript: &str,
-) -> Result<()> {
-    terminal.draw(|frame| {
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
-            .split(frame.area());
-        frame.render_widget(
-            Paragraph::new(transcript)
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(" tau ")),
-            areas[0],
-        );
-        frame.render_widget(
-            Paragraph::new(input).block(Block::default().borders(Borders::ALL).title(" prompt ")),
-            areas[1],
-        );
-    })?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn initial_buffer_has_client_chrome() {
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| components::render(f, &AppState::default()))
+            .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("tau") && text.contains("prompt"));
+    }
 }
