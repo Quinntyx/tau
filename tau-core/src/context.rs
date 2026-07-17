@@ -43,6 +43,17 @@ impl ContextAssembler {
         &self.epoch
     }
 
+    /// Return the provider-ready messages for the current epoch.
+    pub fn messages(&self) -> &[ContextMessage] {
+        &self.epoch.messages
+    }
+
+    /// Compact the current epoch without losing the active plan or provider metadata.
+    /// The caller supplies the compaction agent's summary.
+    pub fn compact_with_summary(&mut self, summary: impl Into<String>) -> ContextEpoch {
+        self.compact(summary)
+    }
+
     pub fn push(&mut self, role: impl Into<String>, content: impl Into<String>) -> bool {
         self.epoch.messages.push(ContextMessage {
             role: role.into(),

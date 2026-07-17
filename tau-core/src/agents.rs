@@ -48,6 +48,18 @@ pub struct Skill {
     pub trusted: bool,
 }
 
+impl Skill {
+    /// Whether this skill is permitted to request a tool.  An empty allowlist
+    /// is intentionally deny-all; skills must opt into every capability.
+    pub fn allows_tool(&self, tool: &str) -> bool {
+        self.trusted
+            && self
+                .allowed_tools
+                .iter()
+                .any(|allowed| allowed == "*" || allowed == tool)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillSource {
     Global,
@@ -244,7 +256,10 @@ fn parse_skill(text: &str) -> (BTreeMap<String, String>, String) {
     else {
         return (BTreeMap::new(), text.to_owned());
     };
-    let Some((front, body)) = rest.split_once("\n---\n") else {
+    let Some((front, body)) = rest
+        .split_once("\n---\n")
+        .or_else(|| rest.split_once("\r\n---\r\n"))
+    else {
         return (BTreeMap::new(), text.to_owned());
     };
     let metadata = front

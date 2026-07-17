@@ -83,9 +83,9 @@ impl GitWorkspace {
         // Keep the human-readable model name, but disambiguate an existing
         // folder that was created for a different full model identifier.
         let marker = self.manifest.tau_metadata.join("model-map").join(&branch);
-        if folder.exists()
-            && marker.is_file()
-            && std::fs::read_to_string(&marker).ok().as_deref() != Some(model)
+        if (folder.exists() || branch_exists(repository, &branch))
+            && (!marker.is_file()
+                || std::fs::read_to_string(&marker).ok().as_deref() != Some(model))
         {
             branch = format!("{branch}-{}", short_model_hash(model));
             folder = self.manifest.root.join(&branch);
@@ -171,6 +171,9 @@ impl GitWorkspace {
         target: &str,
         force: bool,
     ) -> Result<()> {
+        if !source.starts_with("tau/") || !target.starts_with("tau/") {
+            bail!("integration is restricted to tau-managed branches");
+        }
         ensure_clean(repository, "integrating managed worktree")?;
         let preview = self.preview_integration(repository, source, target)?;
         if preview.conflicts && !force {
@@ -184,6 +187,9 @@ impl GitWorkspace {
             git(repository, &["checkout", target])?;
         }
         let merged = git(repository, &["merge", "--no-ff", source]);
+        if merged.is_err() {
+            let _ = git(repository, &["merge", "--abort"]);
+        }
         if current != target {
             let _ = git(repository, &["checkout", &current]);
         }

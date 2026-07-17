@@ -55,9 +55,10 @@ pub struct SnapshotTransaction {
 }
 impl SnapshotTransaction {
     pub fn begin(root: impl Into<PathBuf>, paths: &[PathBuf]) -> Result<Self, TransactionError> {
-        let root = root.into();
+        let root = std::fs::canonicalize(root.into())?;
         let mut before = HashMap::new();
         for p in paths {
+            ensure_within(&root, p)?;
             before.insert(p.clone(), read(p)?);
         }
         Ok(Self {
@@ -128,6 +129,8 @@ impl SnapshotTransaction {
         force: bool,
     ) -> Result<usize, TransactionError> {
         let mut n = 0;
+        // Preflight every decision before mutating anything.  A failed later
+        // decision must not leave a partially applied transaction behind.
         for (path, decision) in decisions {
             let c = self
                 .changes
@@ -137,6 +140,14 @@ impl SnapshotTransaction {
             if !force && *decision != FileDecision::Force && read(path)? != c.after {
                 return Err(TransactionError::Conflict(path.clone()));
             }
+            ensure_within(&self.root, path)?;
+        }
+        for (path, decision) in decisions {
+            let c = self
+                .changes
+                .iter()
+                .find(|c| &c.path == path)
+                .expect("preflight checked");
             let target = match decision {
                 // Accept materializes the proposed state. Restore is the
                 // explicit operation for putting the snapshot back.
@@ -186,7 +197,13 @@ fn write(path: &Path, bytes: Option<Vec<u8>>) -> Result<(), std::io::Error> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, v)
+            let temp = path.with_file_name(format!(
+                ".{}.tau-tmp-{}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                std::process::id()
+            ));
+            std::fs::write(&temp, v)?;
+            std::fs::rename(temp, path)
         }
         None => match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -194,6 +211,20 @@ fn write(path: &Path, bytes: Option<Vec<u8>>) -> Result<(), std::io::Error> {
             Err(e) => Err(e),
         },
     }
+}
+
+fn ensure_within(root: &Path, path: &Path) -> Result<(), TransactionError> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let parent = candidate.parent().unwrap_or(root);
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    if !canonical_parent.starts_with(root) {
+        return Err(TransactionError::Conflict(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

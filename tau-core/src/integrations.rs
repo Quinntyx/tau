@@ -353,7 +353,7 @@ impl LspClient {
         uri: &str,
         position: LspPosition,
     ) -> Result<Vec<LspLocation>> {
-        Ok(serde_json::from_value(
+        let result = serde_json::from_value(
             self.rpc
                 .request(
                     method,
@@ -361,7 +361,9 @@ impl LspClient {
                 )
                 .await?,
         )
-        .unwrap_or_default())
+        .unwrap_or_default();
+        self.dispatch_notifications();
+        Ok(result)
     }
     pub async fn definition(
         &mut self,
@@ -448,6 +450,9 @@ impl LspClient {
         language_id: &str,
         version: i32,
     ) -> Result<()> {
+        if self.open_documents.contains_key(uri) {
+            bail!("LSP document is already open: {uri}");
+        }
         self.open_documents.insert(
             uri.to_owned(),
             (text.to_owned(), language_id.to_owned(), version),
@@ -455,10 +460,14 @@ impl LspClient {
         self.rpc.notification("textDocument/didOpen", serde_json::json!({"textDocument":{"uri":uri,"languageId":language_id,"version":version,"text":text}})).await
     }
     pub async fn change(&mut self, uri: &str, text: &str, version: i32) -> Result<()> {
-        if let Some(document) = self.open_documents.get_mut(uri) {
-            document.0 = text.to_owned();
-            document.2 = version;
+        let Some(document) = self.open_documents.get_mut(uri) else {
+            bail!("LSP document is not open: {uri}");
+        };
+        if version <= document.2 {
+            bail!("LSP document version must increase: {uri}");
         }
+        document.0 = text.to_owned();
+        document.2 = version;
         self.rpc.notification("textDocument/didChange", serde_json::json!({"textDocument":{"uri":uri,"version":version},"contentChanges":[{"text":text}]})).await
     }
     pub async fn close(&mut self, uri: &str) -> Result<()> {
@@ -474,12 +483,38 @@ impl LspClient {
         self.diagnostics.insert(uri.into(), diagnostics);
     }
     pub async fn apply_edits(&mut self, uri: &str, edits: Vec<LspTextEdit>) -> Result<Value> {
-        self.rpc
-            .request(
-                "workspace/applyEdit",
-                serde_json::json!({"edit":{"changes":{uri:edits}}}),
-            )
-            .await
+        let Some((text, _, version)) = self.open_documents.get(uri).cloned() else {
+            bail!("cannot apply edits to unopened document: {uri}");
+        };
+        let mut updated = text;
+        // Apply from the end so ranges remain valid.  This accepts the full
+        // document changes emitted by common LSP servers and never asks the
+        // server to mutate the client's workspace.
+        let mut edits = edits;
+        edits.sort_by(|a, b| {
+            (b.range.start.line, b.range.start.character)
+                .cmp(&(a.range.start.line, a.range.start.character))
+        });
+        for edit in edits {
+            let start = lsp_offset(&updated, &edit.range.start)?;
+            let end = lsp_offset(&updated, &edit.range.end)?;
+            if start > end {
+                bail!("invalid LSP edit range");
+            }
+            updated.replace_range(start..end, &edit.new_text);
+        }
+        let path = uri.strip_prefix("file://").unwrap_or(uri);
+        atomic_write(PathBuf::from(path).as_path(), updated.as_bytes()).await?;
+        self.open_documents.insert(
+            uri.to_owned(),
+            (
+                updated.clone(),
+                self.config.language_id.clone(),
+                version + 1,
+            ),
+        );
+        self.rpc.notification("textDocument/didChange", serde_json::json!({"textDocument":{"uri":uri,"version":version + 1},"contentChanges":[{"text":updated}]})).await?;
+        Ok(serde_json::json!({"applied":true}))
     }
     pub async fn restart(&mut self) -> Result<()> {
         self.rpc.shutdown().await?;
@@ -495,6 +530,36 @@ impl LspClient {
         }
         Ok(())
     }
+}
+
+fn lsp_offset(text: &str, position: &LspPosition) -> Result<usize> {
+    let mut offset = 0;
+    for (line, value) in text.split_inclusive('\n').enumerate() {
+        if line == position.line as usize {
+            let character = position.character as usize;
+            if character > value.trim_end_matches('\n').len() {
+                bail!("LSP character is outside the line");
+            }
+            return Ok(offset + character);
+        }
+        offset += value.len();
+    }
+    if position.line as usize == text.lines().count() {
+        return Ok(text.len());
+    }
+    bail!("LSP line is outside the document")
+}
+
+async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("file URI has no parent")?;
+    let name = path
+        .file_name()
+        .context("file URI has no file name")?
+        .to_string_lossy();
+    let temp = parent.join(format!(".{name}.tau-edit-{}", std::process::id()));
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, path)?;
+    Ok(())
 }
 pub struct LspManager {
     configs: std::collections::HashMap<String, LspServerConfig>,

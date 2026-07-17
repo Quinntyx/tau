@@ -8,6 +8,7 @@ use rig_core::completion::{AssistantContent, CompletionRequest, Message as RigMe
 use serde::Serialize;
 use serde_json::Value;
 use tau_core::agent::AgentRunner;
+use tau_core::context::{ContextAssembler, ContextEpoch};
 use tau_core::credentials::CredentialStore;
 use tau_core::db::{ContentBlock, Message as DbMessage, Session};
 use tau_core::permissions::{Decision, PermissionEngine, authorize};
@@ -91,7 +92,22 @@ pub(crate) async fn handle(
         }
     };
 
-    let mut history = chat_history(&session.1, &params.prompt);
+    // Assemble every turn through the context epoch boundary.  This keeps the
+    // 80% guard and the one-shot overflow retry in the production path rather
+    // than leaving them as an unused library helper.
+    let mut context = ContextAssembler::new(context_limit());
+    context.set_provider_metadata(provider_id, model_id);
+    for message in &session.1 {
+        if let Some(message) = to_context_message(message) {
+            context.push(message.0, message.1);
+        }
+    }
+    context.push("user", params.prompt.clone());
+    if context.should_compact_at(context_limit()) {
+        let previous = compact_context(&mut context);
+        persist_epoch(state, &session.0.id, &previous, "automatic").await;
+    }
+    let mut history = context_history(&context);
     let runner = AgentRunner::new(provider);
     let tool_definitions = runner.tool_definitions();
     let tool_context = match ToolContext::new(&session.0.cwd) {
@@ -135,6 +151,19 @@ pub(crate) async fn handle(
         let mut stream = match runner.stream(request).await {
             Ok(stream) => stream,
             Err(error) => {
+                // Providers differ in their error types; all supported
+                // providers expose overflow text in their display form.  A
+                // single retry is deliberately consumed by the context epoch
+                // so a permanently-too-large request cannot loop forever.
+                if is_context_overflow(&error.to_string()) && context.mark_overflow_retry() {
+                    let previous = compact_context(&mut context);
+                    persist_epoch(state, &session.0.id, &previous, "overflow_retry").await;
+                    // Compaction starts a new epoch; retain the fact that
+                    // this request has already consumed its sole retry.
+                    let _ = context.mark_overflow_retry();
+                    history = context_history(&context);
+                    continue;
+                }
                 send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
                 return;
             }
@@ -302,16 +331,15 @@ async fn resolve_session(state: &AppState, params: &CompletionStreamParams) -> R
     db_blocking(state.db().clone(), move |db| db.create_session(&cwd)).await
 }
 
-fn chat_history(messages: &[DbMessage], prompt: &str) -> OneOrMany<RigMessage> {
-    let mut history = messages
-        .iter()
-        .filter_map(to_rig_message)
-        .collect::<Vec<_>>();
-    history.push(RigMessage::user(prompt));
-    OneOrMany::many(history).expect("chat history always contains the prompt")
+fn context_limit() -> usize {
+    std::env::var("TAU_CONTEXT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128_000)
 }
 
-fn to_rig_message(message: &DbMessage) -> Option<RigMessage> {
+fn to_context_message(message: &DbMessage) -> Option<(String, String)> {
     let text = message
         .blocks
         .iter()
@@ -320,15 +348,68 @@ fn to_rig_message(message: &DbMessage) -> Option<RigMessage> {
             _ => None,
         })
         .collect::<String>();
-    if text.is_empty() {
+    if text.is_empty() || !matches!(message.role.as_str(), "system" | "user" | "assistant") {
         return None;
     }
-    match message.role.as_str() {
-        "system" => Some(RigMessage::system(text)),
-        "user" => Some(RigMessage::user(text)),
-        "assistant" => Some(RigMessage::assistant(text)),
-        _ => None,
-    }
+    Some((message.role.clone(), text))
+}
+
+fn context_history(context: &ContextAssembler) -> OneOrMany<RigMessage> {
+    let messages = context
+        .messages()
+        .iter()
+        .map(|message| match message.role.as_str() {
+            "system" => RigMessage::system(message.content.clone()),
+            "assistant" => RigMessage::assistant(message.content.clone()),
+            _ => RigMessage::user(message.content.clone()),
+        })
+        .collect::<Vec<_>>();
+    OneOrMany::many(messages).expect("context always contains a user turn")
+}
+
+fn compact_context(context: &mut ContextAssembler) -> ContextEpoch {
+    let summary = context
+        .messages()
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    context.compact_with_summary(summary)
+}
+
+async fn persist_epoch(state: &AppState, session_id: &str, epoch: &ContextEpoch, trigger: &str) {
+    let mut record = tau_core::db::ContextEpochRecord::new(
+        session_id,
+        epoch.number as i64,
+        epoch
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        trigger,
+    );
+    record.plan_context = epoch.plan_context.clone();
+    record.provider = epoch.provider.clone();
+    record.model = epoch.compaction_model.clone();
+    record.retry_marker = epoch.retry_marker;
+    let _ = db_blocking(state.db().clone(), move |db| {
+        db.append_context_epoch(&record)
+    })
+    .await;
+}
+
+fn is_context_overflow(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "context length",
+        "context window",
+        "too many tokens",
+        "maximum context",
+        "prompt is too long",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 fn usage_summary(usage: Usage) -> UsageSummary {
