@@ -53,3 +53,20 @@ CREATE TABLE IF NOT EXISTS session_permissions (
     ordinal INTEGER NOT NULL, pattern TEXT NOT NULL, decision TEXT NOT NULL,
     PRIMARY KEY(session_id, ordinal)
 );
+
+-- M9 append-only context epochs and compaction metadata.
+CREATE TABLE IF NOT EXISTS context_epochs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    epoch INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    plan_context TEXT,
+    provider TEXT,
+    model TEXT,
+    input_tokens INTEGER,
+    trigger TEXT NOT NULL,
+    retry_marker INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    UNIQUE(session_id, epoch)
+);
+CREATE INDEX IF NOT EXISTS idx_context_epochs_session ON context_epochs(session_id, epoch);

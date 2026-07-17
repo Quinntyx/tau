@@ -23,6 +23,18 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderConfig>,
     /// Ordered global permission rules. Session rules are persisted separately.
     pub permissions: PermissionEngine,
+    /// Named primary and compaction agent definitions.
+    pub agents: BTreeMap<String, AgentConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub prompt: Option<String>,
+    pub model: Option<String>,
+    pub primary: bool,
+    pub compaction_agent: Option<String>,
+    pub cycle: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -42,6 +54,25 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 impl Config {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(default) = &self.default_agent {
+            if !self.agents.is_empty() && !self.agents.contains_key(default) {
+                anyhow::bail!("default agent {default} is not configured");
+            }
+        }
+        for (name, agent) in &self.agents {
+            if agent.primary
+                && agent
+                    .compaction_agent
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                anyhow::bail!("primary agent {name} must declare compaction_agent");
+            }
+        }
+        Ok(())
+    }
     /// Load config from the default path. Missing file ⇒ defaults.
     pub fn load() -> Result<Config> {
         let path = config_path()?;
@@ -98,6 +129,28 @@ impl Config {
                     let decision = parse_decision(decision)?;
                     cfg.permissions.add_rule(Rule::new(pattern, decision)?);
                 }
+                "agent" => {
+                    let id = string_arg(node, "agent")?;
+                    let children = node
+                        .children()
+                        .ok_or_else(|| anyhow::anyhow!("agent `{id}` requires a child block"))?;
+                    let mut agent = AgentConfig {
+                        primary: bool_property(node, "primary").unwrap_or(false),
+                        cycle: bool_property(node, "cycle").unwrap_or(false),
+                        ..AgentConfig::default()
+                    };
+                    for child in children.nodes() {
+                        match child.name().value() {
+                            "prompt" => agent.prompt = Some(string_arg(child, "prompt")?),
+                            "model" => agent.model = Some(string_arg(child, "model")?),
+                            "compaction_agent" => {
+                                agent.compaction_agent = Some(string_arg(child, "compaction_agent")?)
+                            }
+                            other => anyhow::bail!("unknown agent field `{other}`"),
+                        }
+                    }
+                    cfg.agents.insert(id, agent);
+                }
                 other => anyhow::bail!("unknown KDL config node `{other}`"),
             }
         }
@@ -124,6 +177,16 @@ fn property<'a>(node: &'a kdl::KdlNode, key: &str) -> Option<&'a str> {
             .name()
             .is_some_and(|name| name.value() == key)
             .then(|| entry.value().as_string())
+            .flatten()
+    })
+}
+
+fn bool_property(node: &kdl::KdlNode, key: &str) -> Option<bool> {
+    node.entries().iter().find_map(|entry| {
+        entry
+            .name()
+            .is_some_and(|name| name.value() == key)
+            .then(|| entry.value().as_bool())
             .flatten()
     })
 }

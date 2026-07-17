@@ -192,6 +192,14 @@ fn truncate_output(bytes: &[u8], max_lines: usize, max_bytes: usize) -> (String,
 
 pub fn classify_command(command: &str) -> CommandClass {
     let lower = command.to_ascii_lowercase();
+    if lower.contains('>')
+        || lower.contains("$(")
+        || lower.contains('`')
+        || lower.contains("&&")
+        || lower.contains(';')
+    {
+        return CommandClass::PotentialMutation;
+    }
     if ["sed", "perl", "python", "python3", "ruby", "node", "awk"]
         .iter()
         .any(|name| {

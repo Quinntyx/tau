@@ -13,6 +13,9 @@ pub struct ContextEpoch {
     pub number: u32,
     pub messages: Vec<ContextMessage>,
     pub plan_context: Option<String>,
+    pub provider: Option<String>,
+    pub compaction_model: Option<String>,
+    pub retry_marker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +32,9 @@ impl ContextAssembler {
                 number: 0,
                 messages: Vec::new(),
                 plan_context: None,
+                provider: None,
+                compaction_model: None,
+                retry_marker: false,
             },
         }
     }
@@ -49,6 +55,47 @@ impl ContextAssembler {
         self.epoch.plan_context = Some(markdown.into());
     }
 
+    pub fn set_provider_metadata(
+        &mut self,
+        provider: impl Into<String>,
+        compaction_model: impl Into<String>,
+    ) {
+        self.epoch.provider = Some(provider.into());
+        self.epoch.compaction_model = Some(compaction_model.into());
+    }
+
+    pub fn should_compact(&self) -> bool {
+        self.estimated_tokens() > self.limit
+    }
+    pub fn automatic_threshold(compaction_limit: usize) -> usize {
+        compaction_limit.saturating_mul(80) / 100
+    }
+    pub fn should_compact_at(&self, compaction_limit: usize) -> bool {
+        self.estimated_tokens() >= Self::automatic_threshold(compaction_limit)
+    }
+    pub fn mark_overflow_retry(&mut self) -> bool {
+        if self.epoch.retry_marker {
+            false
+        } else {
+            self.epoch.retry_marker = true;
+            true
+        }
+    }
+
+    pub fn validate_selected_ranges(
+        content: &str,
+        ranges: &[(usize, usize)],
+    ) -> Result<(), String> {
+        let count = content.lines().count();
+        if ranges
+            .iter()
+            .any(|(start, end)| *start == 0 || start > end || *end > count)
+        {
+            return Err("selected hashline range is outside the artifact".into());
+        }
+        Ok(())
+    }
+
     pub fn estimated_tokens(&self) -> usize {
         let messages = self
             .epoch
@@ -63,12 +110,17 @@ impl ContextAssembler {
     pub fn compact(&mut self, summary: impl Into<String>) -> ContextEpoch {
         let next_number = self.epoch.number + 1;
         let plan_context = self.epoch.plan_context.clone();
+        let provider = self.epoch.provider.clone();
+        let compaction_model = self.epoch.compaction_model.clone();
         let previous = std::mem::replace(
             &mut self.epoch,
             ContextEpoch {
                 number: next_number,
                 messages: Vec::new(),
                 plan_context,
+                provider,
+                compaction_model,
+                retry_marker: false,
             },
         );
         self.epoch.messages.push(ContextMessage {

@@ -26,6 +26,32 @@ fn v1_database_upgrades_forward_to_event_storage() {
 }
 
 #[test]
+fn context_epochs_are_append_only_and_reloaded() {
+    let db = test_db();
+    let session = db.create_session("/tmp/project").unwrap();
+    let first = db
+        .append_context_epoch(&ContextEpochRecord::new(&session.id, 0, "first", "manual"))
+        .unwrap();
+    let second = db
+        .append_context_epoch(&ContextEpochRecord::new(
+            &session.id,
+            1,
+            "second",
+            "automatic",
+        ))
+        .unwrap();
+    assert!(first.id < second.id);
+    assert_eq!(db.context_epochs(&session.id).unwrap().len(), 2);
+    assert_eq!(
+        db.latest_context_epoch(&session.id)
+            .unwrap()
+            .unwrap()
+            .summary,
+        "second"
+    );
+}
+
+#[test]
 fn session_create_and_get() {
     let db = test_db();
     let s = db.create_session("/tmp/project").unwrap();

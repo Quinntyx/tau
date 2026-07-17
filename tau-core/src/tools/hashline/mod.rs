@@ -1,5 +1,6 @@
 //! Hashline references used by read output and the later edit tool.
 
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 
 use super::types::DirectoryEntry;
@@ -22,6 +23,51 @@ pub struct ParsedRef {
     pub line: usize,
     pub hash: String,
     pub anchor: Option<String>,
+}
+
+/// An immutable tool-result artifact. The digest and revision make it safe to
+/// retain selected lines while a later compaction is running.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImmutableHashlineArtifact {
+    pub id: String,
+    pub revision: String,
+    pub content: String,
+}
+
+impl ImmutableHashlineArtifact {
+    pub fn new(content: impl Into<String>) -> Self {
+        let content = content.into();
+        let revision = compute_file_rev(&content);
+        let id = format!("artifact-{revision}");
+        Self {
+            id,
+            revision,
+            content,
+        }
+    }
+
+    pub fn select_ranges(&self, ranges: &[(usize, usize)]) -> Result<String, String> {
+        let lines = self.content.lines().collect::<Vec<_>>();
+        if ranges
+            .iter()
+            .any(|(start, end)| *start == 0 || start > end || *end > lines.len())
+        {
+            return Err("selected range is outside immutable artifact".into());
+        }
+        Ok(ranges
+            .iter()
+            .flat_map(|(start, end)| lines[start - 1..*end].iter().copied())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    pub fn validate_revision(&self, revision: &str) -> Result<(), String> {
+        if self.revision == revision {
+            Ok(())
+        } else {
+            Err("artifact revision mismatch".into())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

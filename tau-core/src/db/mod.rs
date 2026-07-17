@@ -2,6 +2,7 @@
 
 pub mod domain;
 mod journal;
+mod epochs;
 mod messages;
 mod policy;
 mod qa_records;
@@ -16,8 +17,8 @@ use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
 
 pub use domain::{
-    ContentBlock, Message, PlanRevision, QaRecord, Session, SteeringMode, SteeringRun, Usage,
-    default_db_path,
+    ContentBlock, ContextEpochRecord, Message, PlanRevision, QaRecord, Session, SteeringMode,
+    SteeringRun, Usage, default_db_path,
 };
 pub use journal::StoredArtifact;
 

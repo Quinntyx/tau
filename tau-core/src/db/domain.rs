@@ -125,3 +125,41 @@ impl SteeringRun {
         self.status == "running"
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextEpochRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub epoch: i64,
+    pub summary: String,
+    pub plan_context: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub trigger: String,
+    pub retry_marker: bool,
+    pub created_at: i64,
+}
+
+impl ContextEpochRecord {
+    pub fn new(
+        session_id: impl Into<String>,
+        epoch: i64,
+        summary: impl Into<String>,
+        trigger: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: 0,
+            session_id: session_id.into(),
+            epoch,
+            summary: summary.into(),
+            plan_context: None,
+            provider: None,
+            model: None,
+            input_tokens: None,
+            trigger: trigger.into(),
+            retry_marker: false,
+            created_at: now_ms(),
+        }
+    }
+}
