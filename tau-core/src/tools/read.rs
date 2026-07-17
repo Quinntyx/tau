@@ -26,7 +26,7 @@ impl Tool for ReadTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "read".into(),
-            description: "Read a file or directory with bounded hashline output.".into(),
+            description: "Read a file or directory with bounded hashline output; directory IDs and refs are read-only until M5 edit support.".into(),
         }
     }
 

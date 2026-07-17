@@ -195,3 +195,14 @@ fn registry_dispatches_typed_tools_and_rejects_duplicates() {
     assert!(result.rendered.contains("#HL REV:"));
     assert!(registry.execute("missing", json!({}), &context).is_err());
 }
+
+#[test]
+fn builtin_registry_exposes_all_m4_tools() {
+    let registry = ToolRegistry::with_builtins().unwrap();
+    let names = registry
+        .descriptors()
+        .into_iter()
+        .map(|descriptor| descriptor.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["glob", "grep", "list", "read"]);
+}

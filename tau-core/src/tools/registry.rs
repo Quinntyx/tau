@@ -66,6 +66,15 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub fn with_builtins() -> Result<Self, ToolError> {
+        let mut registry = Self::default();
+        registry.register(super::glob::GlobTool)?;
+        registry.register(super::grep::GrepTool)?;
+        registry.register(super::list::ListTool)?;
+        registry.register(super::read::ReadTool)?;
+        Ok(registry)
+    }
+
     pub fn register<T: Tool>(&mut self, tool: T) -> Result<(), ToolError> {
         let descriptor = tool.descriptor();
         if self.tools.contains_key(&descriptor.name) {
