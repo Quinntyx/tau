@@ -12,6 +12,35 @@ pub struct ToolDescriptor {
     pub description: String,
 }
 
+/// Provider-facing JSON schema.  Keeping this at the registry boundary means
+/// typed tools remain independent of Rig while providers never receive the
+/// old, unusable `{type: object}` placeholder.
+pub fn schema_for(name: &str) -> serde_json::Value {
+    let string = |required: &[&str]| {
+        serde_json::json!({
+            "type":"object", "properties": { "file_path":{"type":"string"}, "path":{"type":"string"}, "command":{"type":"string"}, "pattern":{"type":"string"}, "include":{"type":"string"}, "content":{"type":"string"}, "ref":{"type":"string"}, "start_ref":{"type":"string"}, "end_ref":{"type":"string"}, "workdir":{"type":"string"} }, "required":required, "additionalProperties":false
+        })
+    };
+    match name {
+        "read" => {
+            serde_json::json!({"type":"object","properties":{"file_path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["file_path"],"additionalProperties":false})
+        }
+        "write" => {
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false})
+        }
+        "bash" => {
+            serde_json::json!({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"},"timeout":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false})
+        }
+        "glob" => string(&["pattern"]),
+        "grep" => string(&["pattern"]),
+        "list" => {
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false})
+        }
+        "edit" => string(&["path"]),
+        _ => serde_json::json!({"type":"object","additionalProperties":false}),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolResult {
     pub output: serde_json::Value,
@@ -23,6 +52,9 @@ pub trait Tool: Send + Sync + 'static {
     type Output: Serialize;
 
     fn descriptor(&self) -> ToolDescriptor;
+    fn schema(&self) -> serde_json::Value {
+        schema_for(&self.descriptor().name)
+    }
     fn execute(&self, input: Self::Input, context: &ToolContext)
     -> Result<Self::Output, ToolError>;
     fn render(&self, output: &Self::Output) -> String;
@@ -30,6 +62,7 @@ pub trait Tool: Send + Sync + 'static {
 
 trait ErasedTool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
+    fn schema(&self) -> serde_json::Value;
     fn execute(
         &self,
         input: serde_json::Value,
@@ -43,6 +76,10 @@ where
 {
     fn descriptor(&self) -> ToolDescriptor {
         Tool::descriptor(self)
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        Tool::schema(self)
     }
 
     fn execute(
@@ -89,6 +126,13 @@ impl ToolRegistry {
 
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.tools.values().map(|tool| tool.descriptor()).collect()
+    }
+
+    pub fn schemas(&self) -> Vec<(ToolDescriptor, serde_json::Value)> {
+        self.tools
+            .values()
+            .map(|tool| (tool.descriptor(), tool.schema()))
+            .collect()
     }
 
     pub fn execute(

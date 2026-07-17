@@ -2,13 +2,11 @@
 //! `tau-client`, and assert `ping` / `health` work. No subprocess spawn.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
-use futures::{SinkExt, StreamExt};
-use tau_client::CompletionEvent;
-use tau_proto::prelude::*;
+use futures::StreamExt;
 use tokio::net::UnixListener;
-use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[tokio::test]
 async fn ping_and_health_round_trip() -> Result<()> {
@@ -23,7 +21,7 @@ async fn ping_and_health_round_trip() -> Result<()> {
             .await
     });
 
-    let mut client = tau_client::Client::connect(&socket).await?;
+    let client = tau_client::Client::connect(&socket).await?;
 
     assert_eq!(client.ping().await?, "pong");
 
@@ -36,73 +34,111 @@ async fn ping_and_health_round_trip() -> Result<()> {
 }
 
 #[tokio::test]
-async fn completion_stream_round_trip() -> Result<()> {
+async fn negotiation_rejects_unsupported_minor_and_clients_multiplex() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let socket = dir.path().join("tau-completion.sock");
+    let socket = dir.path().join("tau.sock");
     let listener = UnixListener::bind(&socket)?;
+    let app = tau_server::router(tau_server::AppState::default());
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await?;
-        let mut ws = accept_async(stream).await?;
-        let request = ws
-            .next()
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(std::future::pending::<()>())
             .await
-            .ok_or_else(|| anyhow::anyhow!("no request"))??;
-        let Message::Text(request) = request else {
-            anyhow::bail!("expected text request");
-        };
-        let _: Request = serde_json::from_str(request.as_str())?;
-
-        let delta = Notification {
-            jsonrpc: JsonRpc::default(),
-            method: METHOD_COMPLETION_DELTA.to_string(),
-            params: Some(CompletionDelta {
-                request_id: Id::num(1),
-                session_id: "session-1".into(),
-                text: "hello".into(),
-                usage: None,
-            }),
-        };
-        ws.send(Message::Text(serde_json::to_string(&delta)?.into()))
-            .await?;
-
-        let result = CompletionStreamResult {
-            session_id: "session-1".into(),
-            message_id: 7,
-            text: "hello".into(),
-            usage: UsageSummary {
-                input_tokens: 2,
-                output_tokens: 3,
-                total_tokens: 5,
-            },
-        };
-        let response = Response::ok(Id::num(1), result);
-        ws.send(Message::Text(serde_json::to_string(&response)?.into()))
-            .await?;
-        Ok::<_, anyhow::Error>(())
     });
 
-    let mut client = tau_client::Client::connect(&socket).await?;
-    let params = CompletionStreamParams {
-        model: "mock/model".into(),
-        prompt: "hi".into(),
-        session_id: None,
-        cwd: Some("/tmp".into()),
-    };
-    let mut completion = client.completion_stream(params).await?;
-    let mut text = String::new();
-    let mut final_result = None;
-    while let Some(event) = completion.next().await {
-        match event? {
-            CompletionEvent::Delta(delta) => text.push_str(&delta.text),
-            CompletionEvent::Complete(result) => final_result = Some(result),
-        }
-    }
-    drop(completion);
+    let first = tau_client::Client::connect(&socket).await?;
+    let second = tau_client::Client::connect(&socket).await?;
+    let unsupported = first
+        .negotiate(tau_proto::prelude::ProtocolNegotiateParams {
+            version: tau_proto::prelude::ProtocolVersion { major: 1, minor: 1 },
+            capabilities: vec![],
+        })
+        .await;
+    assert!(unsupported.is_err());
+    let (left, right) = tokio::join!(first.ping(), second.health());
+    assert_eq!(left?, "pong");
+    assert!(right?.pid > 0);
+    server.abort();
+    Ok(())
+}
 
-    let result = final_result.expect("completion should finish");
-    assert_eq!(text, "hello");
-    assert_eq!(result.message_id, 7);
-    assert_eq!(result.usage.total_tokens, 5);
-    server.await??;
+#[tokio::test]
+async fn durable_policy_prompt_broadcasts_to_multiple_clients_and_resumes_owner() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("tau.sock");
+    let listener = UnixListener::bind(&socket)?;
+    let state = tau_server::AppState::default();
+    let session_id = state.db().create_session("/tmp/policy-test")?.id;
+    let app = tau_server::router(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(std::future::pending::<()>())
+            .await
+    });
+
+    let owner = tau_client::Client::connect(&socket).await?;
+    let other = tau_client::Client::connect(&socket).await?;
+    let mut owner_events = owner.policy_events();
+    let mut other_events = other.policy_events();
+    let request_state = state.clone();
+    let request_session_id = session_id.clone();
+    let request = tokio::spawn(async move {
+        request_state
+            .request_policy_prompt(
+                tau_proto::prelude::METHOD_PERMISSION_REQUEST,
+                &request_session_id,
+                "turn",
+                "permission",
+                serde_json::json!({
+                    "request_id": "prompt-1",
+                    "session_id": request_session_id,
+                    "turn_id": "turn",
+                    "tool": "write",
+                    "arguments": {"path": "file"},
+                    "initiating_client_id": "1",
+                    "idempotency_key": "create-1"
+                }),
+                "1",
+            )
+            .await
+    });
+
+    let owner_prompt = tokio::time::timeout(Duration::from_secs(5), owner_events.next())
+        .await?
+        .expect("owner prompt");
+    let other_prompt = tokio::time::timeout(Duration::from_secs(5), other_events.next())
+        .await?
+        .expect("other prompt");
+    let request_id = match owner_prompt {
+        tau_client::PolicyEvent::Permission(request) => request.request_id,
+        _ => panic!("expected permission prompt"),
+    };
+    assert!(matches!(
+        other_prompt,
+        tau_client::PolicyEvent::Permission(_)
+    ));
+
+    let unauthorized = other
+        .permission_reply(tau_proto::prelude::PermissionReply {
+            request_id: request_id.clone(),
+            idempotency_key: "reply-other".into(),
+            choice: tau_proto::prelude::PermissionChoice::Allow,
+            scope: tau_proto::prelude::PermissionScope::Once,
+            actor: tau_proto::prelude::PromptActor::Human,
+        })
+        .await;
+    assert!(unauthorized.is_err());
+    owner
+        .permission_reply(tau_proto::prelude::PermissionReply {
+            request_id,
+            idempotency_key: "reply-owner".into(),
+            choice: tau_proto::prelude::PermissionChoice::Allow,
+            scope: tau_proto::prelude::PermissionScope::Session,
+            actor: tau_proto::prelude::PromptActor::Human,
+        })
+        .await?;
+    let resolved = tokio::time::timeout(Duration::from_secs(5), request).await???;
+    assert_eq!(resolved["choice"], "allow");
+
+    server.abort();
     Ok(())
 }

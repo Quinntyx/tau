@@ -6,6 +6,7 @@
 //! browser client.
 
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -73,14 +74,14 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => tau_server::run(socket).await,
         Command::Ping => {
-            let mut c = tau_client::Client::connect(&socket)
+            let c = tau_client::Client::connect(&socket)
                 .await
                 .context("connecting to daemon (is it running? try `tau serve`)")?;
             println!("{}", c.ping().await?);
             Ok(())
         }
         Command::Health => {
-            let mut c = tau_client::Client::connect(&socket)
+            let c = tau_client::Client::connect(&socket)
                 .await
                 .context("connecting to daemon (is it running? try `tau serve`)")?;
             let h = c.health().await?;
@@ -113,9 +114,25 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Tui => bail!("`tau tui` is not implemented yet"),
-        Command::Gui => tau_gui::run(socket).await,
+        Command::Tui => tau_tui::run(socket).await,
+        Command::Gui => launch_gui(socket),
         Command::Config => bail!("`tau config` is not implemented yet"),
         Command::Resume => bail!("`tau resume` is not implemented yet"),
+    }
+}
+
+fn launch_gui(socket: PathBuf) -> Result<()> {
+    let mut command = ProcessCommand::new(std::env::current_exe()?.with_file_name("tau-gui"));
+    command.arg("--socket").arg(socket);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        Err(error).context("exec tau-gui")
+    }
+    #[cfg(not(unix))]
+    {
+        command.spawn().context("launch tau-gui")?;
+        Ok(())
     }
 }

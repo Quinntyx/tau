@@ -20,12 +20,16 @@ rusqlite_migration.workspace = true
 uuid.workspace = true
 strum.workspace = true
 rig-core.workspace = true
+rmcp.workspace = true
 futures.workspace = true
 globset.workspace = true
+kdl.workspace = true
 ignore.workspace = true
 mime_guess.workspace = true
 regex.workspace = true
 sha1.workspace = true
+tau-proto.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }
 
 [dev-dependencies]
 tempfile.workspace = true

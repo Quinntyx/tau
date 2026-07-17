@@ -52,7 +52,7 @@ impl AccessPolicy {
         let resolved =
             canonicalize_target(&absolute).map_err(|e| io("canonicalize", &absolute, e))?;
         let roots = self.roots();
-        let Some(root) = roots.iter().find(|root| resolved.starts_with(root)) else {
+        let Some(root) = roots.iter().find(|root| is_within(root, &resolved)) else {
             return Err(ToolError::ApprovalNeeded {
                 operation,
                 path: resolved,
@@ -87,4 +87,20 @@ fn canonicalize_target(path: &Path) -> std::io::Result<PathBuf> {
         result.push(part);
     }
     Ok(result)
+}
+
+fn is_within(root: &Path, path: &Path) -> bool {
+    path == root || path.strip_prefix(root).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn containment_does_not_accept_sibling_prefixes() {
+        let root = Path::new("/tmp/work");
+        assert!(is_within(root, Path::new("/tmp/work/file")));
+        assert!(!is_within(root, Path::new("/tmp/worktree/file")));
+    }
 }

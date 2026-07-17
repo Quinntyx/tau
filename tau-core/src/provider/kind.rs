@@ -40,7 +40,6 @@ pub enum Provider {
     XAI(xai::CompletionModel),
     XiaomiMimo(openai::completion::GenericCompletionModel<xiaomimimo::XiaomiMimoExt>),
     ZAI(openai::completion::GenericCompletionModel<zai::ZAiExt>),
-    #[cfg(test)]
     Mock(rig_core::test_utils::MockCompletionModel),
 }
 
@@ -130,6 +129,13 @@ impl Provider {
         }
     }
 
+    /// Construct a scripted provider for integration tests.  This is kept at
+    /// the provider boundary so server/core/client tests still exercise the
+    /// production request and streaming path rather than replacing it.
+    pub fn scripted(model: rig_core::test_utils::MockCompletionModel) -> Self {
+        Self::Mock(model)
+    }
+
     /// Stream a completion request, returning a provider-agnostic [`TauStream`].
     pub async fn stream(&self, request: CompletionRequest) -> Result<TauStream, CompletionError> {
         match self {
@@ -156,7 +162,6 @@ impl Provider {
             Self::XAI(m) => super::ops::stream_with_model(m, request).await,
             Self::XiaomiMimo(m) => super::ops::stream_with_model(m, request).await,
             Self::ZAI(m) => super::ops::stream_with_model(m, request).await,
-            #[cfg(test)]
             Self::Mock(m) => super::ops::stream_with_model(m, request).await,
         }
     }

@@ -1,7 +1,11 @@
 //! `Db` type, connection management, and schema migration.
 
 pub mod domain;
+mod epochs;
+mod journal;
 mod messages;
+mod policy;
+mod prompts;
 mod qa_records;
 mod sessions;
 mod usage;
@@ -13,7 +17,11 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
 
-pub use domain::{ContentBlock, Message, QaRecord, Session, Usage, default_db_path};
+pub use domain::{
+    ContentBlock, ContextEpochRecord, InteractivePrompt, Message, PlanRevision,
+    PolicyDecisionRecord, QaRecord, Session, SteeringMode, SteeringRun, Usage, default_db_path,
+};
+pub use journal::StoredArtifact;
 
 /// Wrapper around a single SQLite connection (behind `Arc<Mutex>`).
 /// Cloning is cheap — it clones the `Arc`, not the connection.
@@ -57,7 +65,13 @@ impl Db {
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!("sql/v1.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("sql/v1.sql")),
+        M::up(include_str!("sql/v2.sql")),
+        M::up(include_str!("sql/v3.sql")),
+        M::up(include_str!("sql/v4.sql")),
+        M::up(include_str!("sql/v5.sql")),
+    ])
 }
 
 #[cfg(test)]

@@ -32,6 +32,9 @@ fn extract_delta<R: GetTokenUsage>(
 ) -> Option<Result<TauDelta, CompletionError>> {
     match item {
         Ok(StreamedAssistantContent::Text(t)) => Some(Ok(TauDelta::Text(t.text))),
+        Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+            Some(Ok(TauDelta::ToolCall(tool_call)))
+        }
         Ok(StreamedAssistantContent::Final(r)) => Some(Ok(TauDelta::Usage(r.token_usage()))),
         Ok(_) => None,
         Err(e) => Some(Err(e)),

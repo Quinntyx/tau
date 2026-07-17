@@ -8,11 +8,12 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
+gpui.workspace = true
 futures-util.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+dirs.workspace = true
+tempfile.workspace = true
 tau-client.workspace = true
 tau-core.workspace = true
 tau-proto.workspace = true
 tokio.workspace = true
+kdl.workspace = true

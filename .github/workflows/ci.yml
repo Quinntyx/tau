@@ -16,6 +16,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install GPUI system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

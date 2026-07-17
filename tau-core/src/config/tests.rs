@@ -6,23 +6,21 @@ use super::*;
 
 #[test]
 fn missing_file_is_default() {
-    let cfg = Config::load_from(Path::new("/nonexistent/tau/config.toml")).unwrap();
+    let cfg = Config::load_from(Path::new("/nonexistent/tau/config.kdl")).unwrap();
     assert!(cfg.model.is_none());
     assert!(cfg.providers.is_empty());
 }
 
 #[test]
 fn parses_minimal() {
-    let text = r#"
-            model = "claude-opus"
-            default_agent = "plan"
-
-            [providers.anthropic]
-            api_base = "https://custom.example.com"
-            api_key_env = "MY_ANTHROPIC_KEY"
-        "#;
+    let text = r#"model "claude-opus"
+default_agent "plan"
+provider "anthropic" {
+  api_base "https://custom.example.com"
+  api_key_env "MY_ANTHROPIC_KEY"
+}"#;
     let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("config.toml");
+    let p = dir.path().join("config.kdl");
     std::fs::write(&p, text).unwrap();
     let cfg = Config::load_from(&p).unwrap();
     assert_eq!(cfg.model.as_deref(), Some("claude-opus"));
@@ -37,13 +35,40 @@ fn parses_minimal() {
 
 #[test]
 fn unknown_fields_ignored() {
-    let text = r#"
-            model = "x"
-            future_field = "ignored"
-        "#;
+    let text = "model \"x\"\nfuture_field \"ignored\"";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.kdl");
+    std::fs::write(&p, text).unwrap();
+    assert!(Config::load_from(&p).is_err());
+}
+
+#[test]
+fn toml_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("config.toml");
-    std::fs::write(&p, text).unwrap();
-    let cfg = Config::load_from(&p).unwrap();
-    assert_eq!(cfg.model.as_deref(), Some("x"));
+    std::fs::write(&p, "model = 'x'").unwrap();
+    assert!(Config::load_from(&p).is_err());
+}
+
+#[test]
+fn primary_compaction_agent_must_be_named_and_non_primary() {
+    let mut config = Config::default();
+    config.agents.insert(
+        "build".into(),
+        AgentConfig {
+            primary: true,
+            compaction_agent: Some("missing".into()),
+            ..AgentConfig::default()
+        },
+    );
+    assert!(config.validate().is_err());
+
+    config.agents.insert(
+        "missing".into(),
+        AgentConfig {
+            primary: true,
+            ..AgentConfig::default()
+        },
+    );
+    assert!(config.validate().is_err());
 }

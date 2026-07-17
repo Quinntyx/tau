@@ -1,249 +1,316 @@
-//! `completion.stream` WebSocket request handling.
+//! The single canonical typed-turn executor.
+//!
+//! Transport code only admits work and sends the response.  Everything after
+//! admission happens here, including context assembly, the Rig AgentRunner
+//! loop, policy gates, persistence, compaction, and terminal events.
 
-use anyhow::{Result, bail};
-use axum::extract::ws::{Message as WsMessage, WebSocket};
-use futures::StreamExt;
+use anyhow::{Context, Result, bail};
 use rig_core::OneOrMany;
-use rig_core::completion::{CompletionRequest, Message as RigMessage, Usage};
-use serde::Serialize;
-use serde_json::Value;
-use tau_core::agent::AgentRunner;
+use rig_core::completion::{CompletionRequest, Message as RigMessage};
+use tau_core::agent::{AgentRunner, CancellationToken, LifecycleEvent, RunnerPolicy};
+use tau_core::context::{ContextAssembler, ContextEpoch};
 use tau_core::credentials::CredentialStore;
-use tau_core::db::{ContentBlock, Message as DbMessage, Session};
-use tau_core::provider::{Provider, TauDelta};
+use tau_core::db::{ContentBlock, Message as DbMessage};
+use tau_core::provider::Provider;
+use tau_core::tools::ToolContext;
 use tau_proto::prelude::*;
 
-use crate::AppState;
+use crate::{AppState, runtime::CancellationHandle};
 
-pub(crate) async fn handle(
-    socket: &mut WebSocket,
-    state: &AppState,
-    id: Id,
-    raw_params: Option<Value>,
-) {
-    let params = match raw_params
-        .ok_or_else(|| anyhow::anyhow!("completion.stream requires params"))
-        .and_then(|value| {
-            serde_json::from_value::<CompletionStreamParams>(value).map_err(Into::into)
-        }) {
-        Ok(params) => params,
-        Err(error) => {
-            send_error(socket, id, INVALID_PARAMS, error.to_string()).await;
-            return;
+#[derive(Clone)]
+pub(crate) struct TurnJob {
+    pub params: TurnStartParams,
+    pub session_id: String,
+    pub turn_id: String,
+    pub request_id: Id,
+    pub cancellation: CancellationHandle,
+}
+
+pub(crate) async fn execute_turn(state: AppState, job: TurnJob) {
+    let result = execute_inner(&state, &job).await;
+    let terminal = match result {
+        Ok(message_id) => TurnEvent::TurnCompleted {
+            turn_id: job.turn_id.clone(),
+            message_id,
+        },
+        Err(_error) if job.cancellation.is_cancelled() => TurnEvent::TurnCancelled {
+            turn_id: job.turn_id.clone(),
+        },
+        Err(error) => TurnEvent::TurnFailed {
+            turn_id: job.turn_id.clone(),
+            message: error.to_string(),
+        },
+    };
+    let _ = state
+        .publish_event(&job.session_id, terminal, Some(&job.request_id))
+        .await;
+    state.runtime().cancellation.remove(&job.turn_id);
+}
+
+async fn execute_inner(state: &AppState, job: &TurnJob) -> Result<Option<i64>> {
+    if job.cancellation.is_cancelled() {
+        bail!("turn cancelled")
+    }
+    let session = db(state, {
+        let id = job.session_id.clone();
+        move |db| db.get_session(&id)
+    })
+    .await?
+    .context("session disappeared")?;
+    let messages = db(state, {
+        let id = job.session_id.clone();
+        move |db| db.get_messages(&id)
+    })
+    .await?;
+    let (provider_id, model_id) = split_model(&job.params.model)?;
+    let provider = match state.provider_override().cloned() {
+        Some(provider) => provider,
+        None => {
+            let provider_config = state.config().providers.get(provider_id);
+            let credentials = CredentialStore::new()?;
+            let key = credentials.get(
+                provider_id,
+                provider_config.and_then(|c| c.api_key_env.as_deref()),
+            );
+            Provider::new(
+                provider_id,
+                model_id,
+                key.as_deref(),
+                provider_config.and_then(|c| c.api_base.as_deref()),
+            )?
         }
     };
 
-    let (provider_id, model_id) = match split_model(&params.model) {
-        Ok(parts) => parts,
-        Err(error) => {
-            send_error(socket, id, INVALID_PARAMS, error.to_string()).await;
-            return;
+    let mut context = ContextAssembler::new(context_limit());
+    context.set_provider_metadata(provider_id, model_id);
+    for message in &messages {
+        if let Some((role, text)) = to_context_message(message) {
+            context.push(role, text);
         }
-    };
+    }
+    context.push("user", job.params.prompt.clone());
+    if context.should_compact() {
+        let old = compact_context(&mut context);
+        persist_epoch(state, &job.session_id, &old, "automatic").await?;
+    }
+    db(state, {
+        let id = job.session_id.clone();
+        let prompt = job.params.prompt.clone();
+        move |db| db.append_message(&id, "user", vec![ContentBlock::text(prompt)])
+    })
+    .await?;
 
-    let session = match resolve_session(state, &params).and_then(|session| {
-        state
-            .db()
-            .get_messages(&session.id)
-            .map(|messages| (session, messages))
-    }) {
-        Ok((session, messages)) => (session, messages),
-        Err(error) => {
-            send_error(socket, id, INVALID_PARAMS, error.to_string()).await;
-            return;
-        }
-    };
-
-    let provider_config = state.config().providers.get(provider_id);
-    let custom_env = provider_config.and_then(|config| config.api_key_env.as_deref());
-    let api_base = provider_config.and_then(|config| config.api_base.as_deref());
-    let credentials = match CredentialStore::new() {
-        Ok(store) => store,
-        Err(error) => {
-            send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-            return;
-        }
-    };
-    let api_key = credentials.get(provider_id, custom_env);
-    let provider = match Provider::new(provider_id, model_id, api_key.as_deref(), api_base) {
-        Ok(provider) => provider,
-        Err(error) => {
-            send_error(socket, id, INVALID_PARAMS, error.to_string()).await;
-            return;
-        }
-    };
-
+    let runner = AgentRunner::new(provider);
     let request = CompletionRequest {
         model: None,
         preamble: None,
-        chat_history: chat_history(&session.1, &params.prompt),
+        chat_history: context_history(&context),
         documents: vec![],
-        tools: vec![],
+        tools: runner.tool_definitions(),
         temperature: None,
         max_tokens: None,
         tool_choice: None,
         additional_params: None,
         output_schema: None,
     };
-    if let Err(error) = state.db().append_message(
-        &session.0.id,
-        "user",
-        vec![ContentBlock::text(&params.prompt)],
-    ) {
-        send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-        return;
-    }
-
-    let mut stream = match AgentRunner::new(provider).stream(request).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-            return;
+    let tool_context = ToolContext::new(&session.cwd)?;
+    let policy = RunnerPolicy {
+        permissions: std::sync::Arc::new(tokio::sync::Mutex::new(
+            tau_core::permissions::PermissionEngine::default()
+                .with_default(tau_core::permissions::Decision::Allow),
+        )),
+        autonomous: job.params.autonomous.unwrap_or(false),
+        ..RunnerPolicy::default()
+    };
+    let token = CancellationToken::default();
+    let token_for_wait = token.clone();
+    let cancellation = job.cancellation.clone();
+    let run = runner.run_loop(request, tool_context, policy, token, 16);
+    tokio::pin!(run);
+    let output = tokio::select! {
+        result = &mut run => result.map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        _ = cancellation.cancelled() => {
+            token_for_wait.cancel();
+            // Do not wait for a provider stream after cancellation.  Provider
+            // implementations are not required to observe tau's cancellation
+            // token, and waiting here would make the protocol terminal event
+            // depend on an unbounded network timeout.  The runner token is
+            // still cancelled so an implementation which does observe it can
+            // stop its work while this task reports the typed terminal state.
+            bail!("turn cancelled")
         }
     };
-    let mut text = String::new();
-    let mut usage = Usage::default();
-    while let Some(delta) = stream.next().await {
-        match delta {
-            Ok(TauDelta::Text(chunk)) => {
-                text.push_str(&chunk);
-                let notification = Notification {
-                    jsonrpc: JsonRpc::default(),
-                    method: METHOD_COMPLETION_DELTA.to_string(),
-                    params: Some(CompletionDelta {
-                        request_id: id.clone(),
-                        session_id: session.0.id.clone(),
-                        text: chunk,
-                        usage: None,
-                    }),
-                };
-                if !send(socket, &notification).await {
-                    return;
-                }
-            }
-            Ok(TauDelta::Usage(final_usage)) => {
-                usage = final_usage;
-                let notification = Notification {
-                    jsonrpc: JsonRpc::default(),
-                    method: METHOD_COMPLETION_DELTA.to_string(),
-                    params: Some(CompletionDelta {
-                        request_id: id.clone(),
-                        session_id: session.0.id.clone(),
-                        text: String::new(),
-                        usage: Some(usage_summary(usage)),
-                    }),
-                };
-                if !send(socket, &notification).await {
-                    return;
-                }
-            }
-            Err(error) => {
-                send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-                return;
-            }
-        }
-    }
 
-    let assistant =
-        match state
-            .db()
-            .append_message(&session.0.id, "assistant", vec![ContentBlock::text(&text)])
-        {
-            Ok(message) => message,
-            Err(error) => {
-                send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-                return;
-            }
+    for event in &output.events {
+        let rendered = match event {
+            LifecycleEvent::ToolCallFinished { result, .. } => result.to_string(),
+            LifecycleEvent::ToolCallFailed { error, .. } => error.clone(),
+            _ => continue,
         };
-    if let Err(error) = state.db().record_usage(
-        &session.0.id,
-        Some(assistant.id),
-        &params.model,
-        usage.input_tokens as i64,
-        usage.output_tokens as i64,
-        Some(usage.cached_input_tokens as i64),
-    ) {
-        send_error(socket, id, INTERNAL_ERROR, error.to_string()).await;
-        return;
+        state
+            .publish_event(
+                &job.session_id,
+                TurnEvent::ToolOutput {
+                    turn_id: job.turn_id.clone(),
+                    output: BoundedOutput {
+                        inline: rendered,
+                        truncated: false,
+                        artifacts: vec![],
+                    },
+                },
+                Some(&job.request_id),
+            )
+            .await?;
     }
+    if !output.text.is_empty() {
+        state
+            .publish_event(
+                &job.session_id,
+                TurnEvent::TextDelta {
+                    turn_id: job.turn_id.clone(),
+                    text: output.text.clone(),
+                },
+                Some(&job.request_id),
+            )
+            .await?;
+    }
+    let mut blocks = vec![];
+    if !output.text.is_empty() {
+        blocks.push(ContentBlock::text(&output.text));
+    }
+    for event in &output.events {
+        match event {
+            LifecycleEvent::ToolCallStarted {
+                identity,
+                name,
+                arguments,
+            } => blocks.push(ContentBlock::ToolUse {
+                call_id: identity.internal_call_id.clone().unwrap_or_default(),
+                name: name.clone(),
+                args_json: arguments.to_string(),
+            }),
+            LifecycleEvent::ToolCallFinished { identity, result } => {
+                blocks.push(ContentBlock::ToolResult {
+                    call_id: identity.internal_call_id.clone().unwrap_or_default(),
+                    result_json: result.to_string(),
+                    is_error: false,
+                })
+            }
+            LifecycleEvent::ToolCallFailed { identity, error } => {
+                blocks.push(ContentBlock::ToolResult {
+                    call_id: identity.internal_call_id.clone().unwrap_or_default(),
+                    result_json: error.clone(),
+                    is_error: true,
+                })
+            }
+            _ => {}
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(ContentBlock::text(""));
+    }
+    // Cancellation is also a mutation gate: never commit a completed
+    // assistant turn after the client has cancelled it.
+    if job.cancellation.is_cancelled() {
+        bail!("turn cancelled")
+    }
+    let assistant = db(state, {
+        let id = job.session_id.clone();
+        move |db| db.append_message(&id, "assistant", blocks)
+    })
+    .await?;
+    Ok(Some(assistant.id))
+}
 
-    let result = CompletionStreamResult {
-        session_id: session.0.id,
-        message_id: assistant.id,
-        text,
-        usage: usage_summary(usage),
-    };
-    send(socket, &Response::ok(id, result)).await;
+async fn db<T, F>(state: &AppState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&tau_core::db::Db) -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking({
+        let db = state.db().clone();
+        move || operation(&db)
+    })
+    .await?
 }
 
 fn split_model(model: &str) -> Result<(&str, &str)> {
-    let (provider, model_id) = model
+    let (provider, model) = model
         .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("model must use the provider/model form"))?;
-    if provider.is_empty() || model_id.is_empty() {
-        bail!("model must use the provider/model form");
+        .context("model must use provider/model")?;
+    if provider.is_empty() || model.is_empty() {
+        bail!("model must use provider/model");
     }
-    Ok((provider, model_id))
+    Ok((provider, model))
 }
 
-fn resolve_session(state: &AppState, params: &CompletionStreamParams) -> Result<Session> {
-    if let Some(id) = params.session_id.as_deref() {
-        return state
-            .db()
-            .get_session(id)?
-            .ok_or_else(|| anyhow::anyhow!("session not found: {id}"));
-    }
-    let cwd = params
-        .cwd
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("cwd is required when session_id is omitted"))?;
-    state.db().create_session(cwd)
+fn context_limit() -> usize {
+    std::env::var("TAU_CONTEXT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(128_000)
 }
 
-fn chat_history(messages: &[DbMessage], prompt: &str) -> OneOrMany<RigMessage> {
-    let mut history = messages
-        .iter()
-        .filter_map(to_rig_message)
-        .collect::<Vec<_>>();
-    history.push(RigMessage::user(prompt));
-    OneOrMany::many(history).expect("chat history always contains the prompt")
-}
-
-fn to_rig_message(message: &DbMessage) -> Option<RigMessage> {
+fn to_context_message(message: &DbMessage) -> Option<(String, String)> {
     let text = message
         .blocks
         .iter()
-        .filter_map(|block| match block {
+        .filter_map(|b| match b {
             ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<String>();
-    if text.is_empty() {
-        return None;
-    }
-    match message.role.as_str() {
-        "system" => Some(RigMessage::system(text)),
-        "user" => Some(RigMessage::user(text)),
-        "assistant" => Some(RigMessage::assistant(text)),
-        _ => None,
-    }
+    (!text.is_empty() && matches!(message.role.as_str(), "system" | "user" | "assistant"))
+        .then(|| (message.role.clone(), text))
 }
 
-fn usage_summary(usage: Usage) -> UsageSummary {
-    UsageSummary {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
-    }
+fn context_history(context: &ContextAssembler) -> OneOrMany<RigMessage> {
+    OneOrMany::many(
+        context
+            .messages()
+            .iter()
+            .map(|m| match m.role.as_str() {
+                "system" => RigMessage::system(&m.content),
+                "assistant" => RigMessage::assistant(&m.content),
+                _ => RigMessage::user(&m.content),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("context has a user message")
 }
 
-async fn send_error(socket: &mut WebSocket, id: Id, code: i32, message: String) {
-    send(socket, &Response::<Value>::err(id, code, message)).await;
+fn compact_context(context: &mut ContextAssembler) -> ContextEpoch {
+    let summary = context
+        .messages()
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    context.compact_with_summary(summary)
 }
 
-async fn send<T: Serialize>(socket: &mut WebSocket, value: &T) -> bool {
-    let Ok(text) = serde_json::to_string(value) else {
-        return false;
-    };
-    socket.send(WsMessage::Text(text.into())).await.is_ok()
+async fn persist_epoch(
+    state: &AppState,
+    session_id: &str,
+    epoch: &ContextEpoch,
+    trigger: &str,
+) -> Result<()> {
+    let mut record = tau_core::db::ContextEpochRecord::new(
+        session_id,
+        epoch.number as i64,
+        epoch
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        trigger,
+    );
+    record.provider = epoch.provider.clone();
+    record.model = epoch.compaction_model.clone();
+    record.retry_marker = epoch.retry_marker;
+    db(state, move |db| db.append_context_epoch(&record))
+        .await
+        .map(|_| ())
 }
