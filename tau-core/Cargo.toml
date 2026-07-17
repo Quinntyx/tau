@@ -20,6 +20,7 @@ rusqlite_migration.workspace = true
 uuid.workspace = true
 strum.workspace = true
 rig-core.workspace = true
+rmcp.workspace = true
 futures.workspace = true
 globset.workspace = true
 kdl.workspace = true

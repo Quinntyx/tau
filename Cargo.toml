@@ -62,6 +62,7 @@ rusqlite_migration = "2.6"
 uuid = { version = "1", features = ["v4"] }
 strum = { version = "0.28", features = ["derive"] }
 rig-core = { version = "0.40", features = ["test-utils"] }
+rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process"] }
 
 # internal
 tau-proto = { path = "tau-proto", version = "0.1.0" }
