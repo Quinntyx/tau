@@ -198,7 +198,7 @@ pub fn render_file(
     Ok(RenderedFile {
         rev,
         content: format!(
-            "<path>\n{}\n</path>\n<type>file</type>\n<content>\n{}\n</content>",
+            "<path>{}</path>\n<type>file</type>\n<content>\n{}\n</content>",
             path.display(),
             body.join("\n")
         ),
@@ -267,7 +267,7 @@ pub fn render_directory(
     RenderedDirectory {
         rev: rev.clone(),
         content: format!(
-            "<path>\n{}\n</path>\n<type>directory</type>\n<entries>\n#HL REV:{rev}\n{}\n{}\n</entries>",
+            "<path>{}</path>\n<type>directory</type>\n<entries>\n#HL REV:{rev}\n{}\n{}\n</entries>",
             path.display(),
             lines.join("\n"),
             note
