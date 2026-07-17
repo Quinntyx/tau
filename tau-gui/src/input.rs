@@ -7,6 +7,129 @@ use gpui::{
     relative, rgb,
 };
 
+/// Pure editing core kept independent of GPUI, so scripted fixtures can test
+/// Unicode, multiline movement and selection without opening a window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditorBuffer {
+    text: String,
+    cursor: usize,
+    anchor: Option<usize>,
+}
+
+impl EditorBuffer {
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.len();
+        Self {
+            text,
+            cursor,
+            anchor: None,
+        }
+    }
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+    pub fn selection(&self) -> Option<Range<usize>> {
+        self.anchor.map(|a| a.min(self.cursor)..a.max(self.cursor))
+    }
+    pub fn insert(&mut self, value: &str) {
+        self.delete_selection();
+        self.text.insert_str(self.cursor, value);
+        self.cursor += value.len();
+    }
+    pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if let Some(start) = self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+        {
+            self.text.replace_range(start..self.cursor, "");
+            self.cursor = start;
+        }
+    }
+    pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor < self.text.len() {
+            let end = self.cursor + self.text[self.cursor..].chars().next().unwrap().len_utf8();
+            self.text.replace_range(self.cursor..end, "");
+        }
+    }
+    pub fn move_left(&mut self, selecting: bool) {
+        self.move_to(
+            self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i),
+            selecting,
+        );
+    }
+    pub fn move_right(&mut self, selecting: bool) {
+        self.move_to(
+            self.cursor
+                + self.text[self.cursor..]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8),
+            selecting,
+        );
+    }
+    pub fn move_home(&mut self, selecting: bool) {
+        let start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
+        self.move_to(start, selecting);
+    }
+    pub fn move_end(&mut self, selecting: bool) {
+        let end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |i| self.cursor + i);
+        self.move_to(end, selecting);
+    }
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection().map(|r| &self.text[r])
+    }
+    fn move_to(&mut self, position: usize, selecting: bool) {
+        if selecting {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = position;
+    }
+    fn delete_selection(&mut self) -> bool {
+        if let Some(range) = self.selection() {
+            self.text.replace_range(range.clone(), "");
+            self.cursor = range.start;
+            self.anchor = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    #[test]
+    fn unicode_and_multiline_selection() {
+        let mut e = EditorBuffer::new("a😀");
+        e.move_home(false);
+        assert_eq!(e.cursor(), 0);
+        e.move_right(true);
+        e.move_right(true);
+        assert_eq!(e.selected_text(), Some("a😀"));
+        e.insert("ok");
+        assert_eq!(e.text(), "ok");
+    }
+}
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: String,

@@ -6,6 +6,7 @@
 //! browser client.
 
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -114,8 +115,24 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Tui => tau_tui::run(socket).await,
-        Command::Gui => tau_gui::run(socket),
+        Command::Gui => launch_gui(socket),
         Command::Config => bail!("`tau config` is not implemented yet"),
         Command::Resume => bail!("`tau resume` is not implemented yet"),
+    }
+}
+
+fn launch_gui(socket: PathBuf) -> Result<()> {
+    let mut command = ProcessCommand::new(std::env::current_exe()?.with_file_name("tau-gui"));
+    command.arg("--socket").arg(socket);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        Err(error).context("exec tau-gui")
+    }
+    #[cfg(not(unix))]
+    {
+        command.spawn().context("launch tau-gui")?;
+        Ok(())
     }
 }

@@ -19,6 +19,45 @@ pub struct Backend {
     auto_started: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    Okay,
+    Quit,
+    Disown,
+    AlwaysDisown,
+    NeverShowAgain,
+}
+
+/// Ownership is explicit: a daemon found before connection is never stopped;
+/// only a child returned by `ensure_daemon` is owned by the GUI.
+fn stop_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status();
+    }
+    for _ in 0..10 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        if let Ok(mut daemon) = self._daemon.lock() {
+            if let Some(mut child) = daemon.take() {
+                stop_child(&mut child);
+            }
+        }
+    }
+}
+
 impl Backend {
     pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, String, String)> {
         let daemon = ensure_daemon(socket).await?;
@@ -105,7 +144,7 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
         return Ok(None);
     }
     let executable = std::env::current_exe().context("locating tau executable")?;
-    let child = Command::new(executable)
+    let mut child = Command::new(executable)
         .arg("--socket")
         .arg(socket)
         .arg("serve")
@@ -117,5 +156,6 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    stop_child(&mut child);
     anyhow::bail!("daemon did not become ready at {}", socket.display())
 }

@@ -3,9 +3,9 @@ use gpui::{
     div, prelude::*, px, rgb,
 };
 use tau_client::CompletionEvent;
-use tau_proto::prelude::CompletionStreamResult;
 
 use crate::backend::Backend;
+use crate::chat::{Card, ChatAction, ChatState, ChatStatus, Role};
 use crate::input::TextInput;
 
 gpui::actions!(tau_view, [Submit, SwitchAgent]);
@@ -15,13 +15,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Submit, None),
         KeyBinding::new("tab", SwitchAgent, None),
     ]);
-}
-
-#[derive(Clone, Copy)]
-enum Role {
-    User,
-    Assistant,
-    Tool,
 }
 
 #[derive(Clone, Copy)]
@@ -46,19 +39,10 @@ impl AgentMode {
     }
 }
 
-struct Message {
-    role: Role,
-    text: String,
-}
-
 pub struct TauView {
     input: Entity<TextInput>,
     backend: Backend,
-    messages: Vec<Message>,
-    session_id: Option<String>,
-    assistant_index: Option<usize>,
-    usage: Option<String>,
-    status: String,
+    chat: ChatState,
     task: Option<Task<()>>,
     agent: AgentMode,
     toast_visible: bool,
@@ -71,11 +55,7 @@ impl TauView {
         Self {
             input,
             backend,
-            messages: Vec::new(),
-            session_id: None,
-            assistant_index: None,
-            usage: None,
-            status: "Ready".into(),
+            chat: ChatState::default(),
             task: None,
             agent: AgentMode::Code,
             toast_visible,
@@ -92,7 +72,7 @@ impl TauView {
 
     fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
         self.agent = self.agent.next();
-        self.status = format!("{} agent", self.agent.label());
+        self.chat.status = ChatStatus::Ready;
         cx.notify();
     }
 
@@ -106,7 +86,7 @@ impl TauView {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.assistant_index.is_some() {
+        if self.chat.active_assistant.is_some() {
             return;
         }
         let prompt = self.input.read(cx).content();
@@ -114,21 +94,13 @@ impl TauView {
             return;
         }
         self.input.update(cx, |input, _| input.reset());
-        self.messages.push(Message {
-            role: Role::User,
-            text: prompt.clone(),
-        });
-        self.messages.push(Message {
-            role: Role::Assistant,
-            text: String::new(),
-        });
-        self.assistant_index = Some(self.messages.len() - 1);
-        self.status = "Thinking...".into();
-        self.usage = None;
+        self.chat.reduce(ChatAction::Submit(prompt.clone()));
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
-        let receiver = self.backend.completion(prompt, self.session_id.clone());
+        let receiver = self
+            .backend
+            .completion(prompt, self.chat.session_id.clone());
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;
             while let Some(event) = receiver.recv().await {
@@ -144,42 +116,16 @@ impl TauView {
     }
 
     fn apply_event(&mut self, event: Result<CompletionEvent, String>, cx: &mut Context<Self>) {
-        let Some(index) = self.assistant_index else {
-            return;
-        };
         match event {
-            Ok(CompletionEvent::Delta(delta)) => {
-                if delta.text.starts_with("\n[tool ") {
-                    self.messages[index].role = Role::Tool;
-                    self.messages[index].text = delta.text.trim().to_string();
-                    self.messages.push(Message {
-                        role: Role::Assistant,
-                        text: String::new(),
-                    });
-                    self.assistant_index = Some(self.messages.len() - 1);
-                } else {
-                    self.messages[index].text.push_str(&delta.text);
-                }
+            Ok(event) => {
+                self.chat.reduce(ChatAction::Completion(event));
                 cx.notify();
             }
-            Ok(CompletionEvent::Complete(result)) => self.finish(result, cx),
             Err(error) => {
-                self.messages[index].text = format!("Error: {error}");
-                self.status = "Request failed".into();
-                self.assistant_index = None;
+                self.chat.reduce(ChatAction::Error(error));
                 cx.notify();
             }
         }
-    }
-
-    fn finish(&mut self, result: CompletionStreamResult, cx: &mut Context<Self>) {
-        if let Some(index) = self.assistant_index.take() {
-            self.messages[index].text = result.text;
-        }
-        self.session_id = Some(result.session_id);
-        self.usage = Some(format!("{} tokens", result.usage.total_tokens));
-        self.status = "Ready".into();
-        cx.notify();
     }
 }
 
@@ -207,7 +153,11 @@ impl Render for TauView {
             .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
                 "{}  ·  {}",
                 self.backend.model(),
-                self.status
+                match &self.chat.status {
+                    ChatStatus::Ready => "Ready",
+                    ChatStatus::Streaming => "Thinking...",
+                    ChatStatus::Failed(_) => "Request failed",
+                }
             )));
         let toast = div()
             .flex()
@@ -242,11 +192,46 @@ impl Render for TauView {
             .flex_col()
             .gap_3()
             .p_5()
-            .children(self.messages.iter().map(|message| {
-                let (background, label, align_end) = match message.role {
-                    Role::User => (0x274d72, "You", true),
-                    Role::Assistant => (0x202630, "tau", false),
-                    Role::Tool => (0x3b3425, "tool", false),
+            .children(self.chat.cards.iter().map(|card| {
+                let (background, label, align_end, text) = match card {
+                    Card::Message {
+                        role: Role::User,
+                        text,
+                    } => (0x274d72, "You", true, text.clone()),
+                    Card::Message {
+                        role: Role::Assistant,
+                        text,
+                    } => (0x202630, "tau", false, text.clone()),
+                    Card::Message {
+                        role: Role::System,
+                        text,
+                    } => (0x202630, "system", false, text.clone()),
+                    Card::Message {
+                        role: Role::Tool,
+                        text,
+                    } => (0x3b3425, "tool", false, text.clone()),
+                    Card::Tool { name, output, .. } => {
+                        (0x3b3425, "tool", false, format!("{name}\n{output}"))
+                    }
+                    Card::Diff {
+                        path,
+                        patch,
+                        approved,
+                    } => (
+                        0x293b32,
+                        "diff",
+                        false,
+                        format!(
+                            "{path} ({})\n{patch}",
+                            if *approved { "approved" } else { "pending" }
+                        ),
+                    ),
+                    Card::Permission { tool, description } => (
+                        0x463b24,
+                        "permission",
+                        false,
+                        format!("{tool}: {description}"),
+                    ),
                 };
                 div()
                     .flex()
@@ -260,7 +245,7 @@ impl Render for TauView {
                             .p_3()
                             .rounded_lg()
                             .bg(rgb(background))
-                            .child(message.text.clone()),
+                            .child(text),
                     )
             }));
         let sidebar = div()
@@ -276,11 +261,15 @@ impl Render for TauView {
             .child(sidebar_card("LSP", "No diagnostics"))
             .child(sidebar_card(
                 "TOKENS",
-                self.usage.as_deref().unwrap_or("No usage yet"),
+                &self
+                    .chat
+                    .usage
+                    .map(|v| format!("{v} tokens"))
+                    .unwrap_or_else(|| "No usage yet".into()),
             ))
             .child(sidebar_card(
                 "SESSION",
-                self.session_id.as_deref().unwrap_or("Not started"),
+                self.chat.session_id.as_deref().unwrap_or("Not started"),
             ))
             .child(sidebar_card("DIRECTORY", self.backend.cwd()));
         let footer = div().p_4().border_t_1().border_color(rgb(0x2c3340)).child(
