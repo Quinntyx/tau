@@ -6328,6 +6328,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "gpui",
+ "kdl",
  "tau-client",
  "tau-core",
  "tau-proto",

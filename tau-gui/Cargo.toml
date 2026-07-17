@@ -16,3 +16,4 @@ tau-client.workspace = true
 tau-core.workspace = true
 tau-proto.workspace = true
 tokio.workspace = true
+kdl.workspace = true

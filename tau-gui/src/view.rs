@@ -2,9 +2,9 @@ use gpui::{
     App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, Task, Window,
     div, prelude::*, px, rgb,
 };
-use tau_client::CompletionEvent;
+use tau_client::TurnStreamEvent;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, DaemonAction};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, Role};
 use crate::input::TextInput;
 
@@ -81,8 +81,28 @@ impl TauView {
         cx.notify();
     }
 
+    fn disown_daemon(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::Disown);
+        self.toast_visible = false;
+        cx.notify();
+    }
+
+    fn always_disown_daemon(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::AlwaysDisown);
+        self.toast_visible = false;
+        cx.notify();
+    }
+
     fn quit_gui(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.quit();
+    }
+
+    fn cancel_turn(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.cancel();
+        self.chat.active_assistant = None;
+        self.chat.status = ChatStatus::Ready;
+        self.task = None;
+        cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -98,13 +118,11 @@ impl TauView {
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
-        let receiver = self
-            .backend
-            .completion(prompt, self.chat.session_id.clone());
+        let receiver = self.backend.turn(prompt, self.chat.session_id.clone());
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;
             while let Some(event) = receiver.recv().await {
-                let done = matches!(event, Ok(CompletionEvent::Complete(_)) | Err(_));
+                let done = matches!(event, Ok(TurnStreamEvent::Complete(_)) | Err(_));
                 let _ = this.update(cx, |view, cx| {
                     view.apply_event(event, cx);
                 });
@@ -115,10 +133,15 @@ impl TauView {
         }));
     }
 
-    fn apply_event(&mut self, event: Result<CompletionEvent, String>, cx: &mut Context<Self>) {
+    fn apply_event(&mut self, event: Result<TurnStreamEvent, String>, cx: &mut Context<Self>) {
         match event {
-            Ok(event) => {
-                self.chat.reduce(ChatAction::Completion(event));
+            Ok(TurnStreamEvent::Event(event)) => {
+                self.chat.reduce(ChatAction::SessionEvent(event));
+                cx.notify();
+            }
+            Ok(TurnStreamEvent::Complete(_)) => {
+                self.chat.active_assistant = None;
+                self.chat.status = ChatStatus::Ready;
                 cx.notify();
             }
             Err(error) => {
@@ -181,6 +204,16 @@ impl Render for TauView {
                         "Don't show again",
                         0x6a5834,
                         cx.listener(Self::hide_toast),
+                    ))
+                    .child(toast_button(
+                        "Disown",
+                        0x6a5834,
+                        cx.listener(Self::disown_daemon),
+                    ))
+                    .child(toast_button(
+                        "Always disown",
+                        0x6a5834,
+                        cx.listener(Self::always_disown_daemon),
                     ))
                     .child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui))),
             );
@@ -272,24 +305,40 @@ impl Render for TauView {
                 self.chat.session_id.as_deref().unwrap_or("Not started"),
             ))
             .child(sidebar_card("DIRECTORY", self.backend.cwd()));
-        let footer = div().p_4().border_t_1().border_color(rgb(0x2c3340)).child(
-            div()
-                .flex()
-                .gap_3()
-                .items_end()
-                .child(self.input.clone())
-                .child(
+        let footer = div()
+            .p_4()
+            .border_t_1()
+            .border_color(rgb(0x2c3340))
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .items_end()
+                    .child(self.input.clone())
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .bg(rgb(0x85b8ff))
+                            .text_color(rgb(0x10151e))
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
+                            .child("Send"),
+                    ),
+            )
+            .when(self.chat.active_assistant.is_some(), |footer| {
+                footer.child(
                     div()
-                        .px_4()
-                        .py_3()
-                        .bg(rgb(0x85b8ff))
-                        .text_color(rgb(0x10151e))
+                        .px_3()
+                        .py_2()
+                        .bg(rgb(0x7d3b3b))
                         .rounded_lg()
                         .cursor_pointer()
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
-                        .child("Send"),
-                ),
-        );
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_turn))
+                        .child("Cancel"),
+                )
+            });
         let mut root = div()
             .size_full()
             .bg(rgb(0x11151b))

@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use tau_client::CompletionEvent;
-use tau_proto::prelude::CompletionStreamParams;
+use tau_client::TurnStreamEvent;
+use tau_proto::prelude::{IdempotencyKey, TurnStartParams};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -15,6 +15,8 @@ pub struct Backend {
     cwd: String,
     model: String,
     runtime: tokio::runtime::Handle,
+    session: Arc<tokio::sync::Mutex<Option<tau_client::Client>>>,
+    active: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _daemon: Arc<Mutex<Option<Child>>>,
     auto_started: bool,
 }
@@ -82,6 +84,8 @@ impl Backend {
             cwd,
             model,
             runtime: handle,
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+            active: Arc::new(Mutex::new(None)),
             _daemon: Arc::new(Mutex::new(daemon)),
             auto_started,
         }
@@ -99,31 +103,52 @@ impl Backend {
         self.auto_started
     }
 
-    pub fn completion(
+    /// Apply one of the five ownership decisions. Existing daemons are never
+    /// present in `_daemon`, so disowning can only affect a child we spawned.
+    pub fn daemon_action(&self, action: DaemonAction) {
+        if matches!(action, DaemonAction::Disown | DaemonAction::AlwaysDisown) {
+            if let Ok(mut daemon) = self._daemon.lock() {
+                daemon.take();
+            }
+        }
+    }
+
+    /// Start a turn on the long-lived typed client session. The returned
+    /// channel contains protocol events, never parsed completion text.
+    pub fn turn(
         &self,
         prompt: String,
         session_id: Option<String>,
-    ) -> mpsc::UnboundedReceiver<Result<CompletionEvent, String>> {
+    ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let socket = self.socket.clone();
         let cwd = self.cwd.clone();
         let model = self.model.clone();
-        self.runtime.spawn(async move {
+        let session = self.session.clone();
+        self.cancel();
+        let task = self.runtime.spawn(async move {
             let result = async {
-                let client = tau_client::Client::connect(&socket).await?;
-                let params = CompletionStreamParams {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    *guard = Some(tau_client::Client::connect(&socket).await?);
+                }
+                let client = guard.as_mut().expect("session initialized");
+                let params = TurnStartParams {
                     model,
                     prompt,
                     session_id,
                     cwd: Some(cwd),
-                    agent: None,
-                    task_tier: None,
-                    autonomous: None,
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "gui-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_nanos())
+                    )),
                 };
-                let mut stream = client.completion_stream(params).await?;
+                let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
-                    let complete = matches!(event, CompletionEvent::Complete(_));
+                    let complete = matches!(event, TurnStreamEvent::Complete(_));
                     sender
                         .send(Ok(event))
                         .map_err(|_| anyhow::anyhow!("GUI closed"))?;
@@ -138,7 +163,20 @@ impl Backend {
                 let _ = sender.send(Err(error.to_string()));
             }
         });
+        if let Ok(mut active) = self.active.lock() {
+            *active = Some(task);
+        }
         receiver
+    }
+
+    /// Stop delivery for the active turn. The daemon owns cancellation; the
+    /// next replay/turn remains available on the persistent session.
+    pub fn cancel(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            if let Some(task) = active.take() {
+                task.abort();
+            }
+        }
     }
 }
 

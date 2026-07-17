@@ -1,6 +1,6 @@
 //! Pure, typed chat model used by the GPUI view and scripted fixtures.
 use tau_client::CompletionEvent;
-use tau_proto::prelude::CompletionStreamResult;
+use tau_proto::prelude::{CompletionStreamResult, SequencedEvent, TurnEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -65,6 +65,8 @@ impl Default for ChatState {
 pub enum ChatAction {
     Submit(String),
     Completion(CompletionEvent),
+    /// Durable event from the typed session backend.
+    SessionEvent(SequencedEvent),
     Error(String),
     ToggleTool(usize),
     ApproveDiff(usize, bool),
@@ -73,6 +75,7 @@ pub enum ChatAction {
 impl ChatState {
     pub fn reduce(&mut self, action: ChatAction) -> bool {
         match action {
+            ChatAction::SessionEvent(event) => self.apply_session_event(event),
             ChatAction::Submit(text)
                 if !text.trim().is_empty() && self.active_assistant.is_none() =>
             {
@@ -138,6 +141,46 @@ impl ChatState {
                 _ => false,
             },
             ChatAction::Submit(_) => false,
+        }
+    }
+
+    fn apply_session_event(&mut self, event: SequencedEvent) -> bool {
+        match event.event {
+            TurnEvent::TextDelta { text, .. } => {
+                let Some(index) = self.active_assistant else {
+                    return false;
+                };
+                if let Card::Message { text: output, .. } = &mut self.cards[index] {
+                    output.push_str(&text);
+                    return true;
+                }
+                false
+            }
+            TurnEvent::ToolOutput { output, .. } => {
+                self.cards.push(Card::Tool {
+                    name: "tool".into(),
+                    input: String::new(),
+                    output: output.inline,
+                    expanded: false,
+                });
+                true
+            }
+            TurnEvent::TurnCompleted { .. } => {
+                self.active_assistant = None;
+                self.status = ChatStatus::Ready;
+                true
+            }
+            TurnEvent::TurnCancelled { .. } => {
+                self.active_assistant = None;
+                self.status = ChatStatus::Ready;
+                true
+            }
+            TurnEvent::TurnFailed { message, .. } => {
+                self.active_assistant = None;
+                self.status = ChatStatus::Failed(message);
+                true
+            }
+            TurnEvent::TurnStarted { .. } | TurnEvent::ArtifactCreated { .. } => false,
         }
     }
 

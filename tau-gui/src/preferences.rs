@@ -24,17 +24,37 @@ impl GuiPreferences {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e.into()),
         };
+        let document: kdl::KdlDocument = text.parse().context("invalid GUI preferences KDL")?;
         let mut result = Self::default();
-        for line in text.lines() {
-            let mut p = line.splitn(2, ' ');
-            let key = p.next().unwrap_or("");
-            let value = p.next().unwrap_or("").trim().trim_matches('"').to_owned();
-            match key {
-                "favorite" => result.favorites.push(value),
-                "recent" => result.recent_models.push(value),
-                "sidebar" => result.sidebar = value == "true",
-                "autonomy" => result.autonomy = value == "true",
-                _ => {}
+        for node in document.nodes() {
+            let value = || {
+                node.entries()
+                    .first()
+                    .and_then(|e| e.value().as_string())
+                    .map(str::to_owned)
+            };
+            match node.name().value() {
+                "favorite" => result
+                    .favorites
+                    .push(value().context("favorite requires a string")?),
+                "recent" => result
+                    .recent_models
+                    .push(value().context("recent requires a string")?),
+                "sidebar" => {
+                    result.sidebar = node
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .context("sidebar requires bool")?
+                }
+                "autonomy" => {
+                    result.autonomy = node
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .context("autonomy requires bool")?
+                }
+                other => anyhow::bail!("unknown GUI preference node `{other}`"),
             }
         }
         Ok(result)
@@ -43,7 +63,7 @@ impl GuiPreferences {
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut out = String::from("// tau GUI preferences\n");
+        let mut out = String::new();
         for value in &self.favorites {
             out.push_str(&format!("favorite \"{value}\"\n"));
         }
@@ -51,10 +71,12 @@ impl GuiPreferences {
             out.push_str(&format!("recent \"{value}\"\n"));
         }
         out.push_str(&format!(
-            "sidebar {}\nautonomy {}\n",
+            "sidebar #{}\nautonomy #{}\n",
             self.sidebar, self.autonomy
         ));
-        std::fs::write(file, out).context("writing gui.kdl")
+        let temporary = file.with_extension("kdl.tmp");
+        std::fs::write(&temporary, out).context("writing temporary gui.kdl")?;
+        std::fs::rename(&temporary, file).context("committing gui.kdl atomically")
     }
 }
 
