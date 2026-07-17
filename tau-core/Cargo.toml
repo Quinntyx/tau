@@ -22,6 +22,7 @@ strum.workspace = true
 rig-core.workspace = true
 futures.workspace = true
 globset.workspace = true
+kdl.workspace = true
 ignore.workspace = true
 mime_guess.workspace = true
 regex.workspace = true

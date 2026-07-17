@@ -3,6 +3,7 @@
 pub mod domain;
 mod journal;
 mod messages;
+mod policy;
 mod qa_records;
 mod sessions;
 mod usage;
@@ -14,7 +15,10 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
 
-pub use domain::{ContentBlock, Message, QaRecord, Session, Usage, default_db_path};
+pub use domain::{
+    ContentBlock, Message, PlanRevision, QaRecord, Session, SteeringMode, SteeringRun, Usage,
+    default_db_path,
+};
 pub use journal::StoredArtifact;
 
 /// Wrapper around a single SQLite connection (behind `Arc<Mutex>`).

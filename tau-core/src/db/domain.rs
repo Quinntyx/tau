@@ -84,3 +84,44 @@ pub struct QaRecord {
     pub answer: String,
     pub created_at: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanRevision {
+    pub plan_id: String,
+    pub revision: i64,
+    pub parent_revision: Option<i64>,
+    pub payload: String,
+    pub airtight: bool,
+    pub revoked: bool,
+    pub actor: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SteeringMode {
+    Normal,
+    Super,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SteeringRun {
+    pub id: String,
+    pub session_id: String,
+    pub mode: SteeringMode,
+    pub model: String,
+    pub vision: String,
+    pub authority: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl SteeringRun {
+    /// Normal runs steer planning only; super runs may answer every soft prompt.
+    pub fn may_answer(&self, prompt: &str) -> bool {
+        self.status == "running" && (self.mode == SteeringMode::Super || prompt == "plan")
+    }
+    pub fn is_indefinite(&self) -> bool {
+        self.status == "running"
+    }
+}

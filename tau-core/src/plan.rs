@@ -1,5 +1,6 @@
 //! Structured conversation plan and mutation gate.
 
+use crate::db::QaRecord;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,8 @@ pub struct Plan {
     pub contract: String,
     pub steps: Vec<PlanStep>,
     pub current_step: Option<usize>,
+    #[serde(default)]
+    pub airtight_revoked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +34,7 @@ impl Plan {
             contract: contract.into(),
             steps: Vec::new(),
             current_step: None,
+            airtight_revoked: false,
         }
     }
 
@@ -79,6 +83,9 @@ impl Plan {
     }
 
     pub fn airtight_step(&mut self, step: usize) -> bool {
+        if self.airtight_revoked {
+            return false;
+        }
         let Some(step) = self.steps.get_mut(step) else {
             return false;
         };
@@ -86,10 +93,19 @@ impl Plan {
         true
     }
 
+    /// Revocation is material: it cannot be bypassed by autonomous mode.
+    pub fn revoke_airtight(&mut self) {
+        self.airtight_revoked = true;
+        for step in &mut self.steps {
+            step.airtight = false;
+        }
+    }
+
     pub fn current_is_airtight(&self) -> bool {
         self.current_step
             .and_then(|index| self.steps.get(index))
             .is_some_and(|step| step.airtight)
+            && !self.airtight_revoked
     }
 
     pub fn render_markdown(&self) -> String {
@@ -118,6 +134,22 @@ impl Plan {
         }
         output
     }
+
+    /// Render a revision with resolved, auditable Q&A citations.
+    pub fn render_markdown_with_qa(&self, records: &[QaRecord]) -> String {
+        let mut output = self.render_markdown();
+        for step in &self.steps {
+            for id in &step.qa_ids {
+                if let Some(qa) = records.iter().find(|record| &record.id == id) {
+                    output.push_str(&format!(
+                        "\n> Q&A {} — {}\n> {}\n",
+                        qa.id, qa.question, qa.answer
+                    ));
+                }
+            }
+        }
+        output
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,9 +165,12 @@ impl std::fmt::Display for GateError {
 
 impl std::error::Error for GateError {}
 
-pub fn allows_tool(plan: &Plan, autonomous: bool, tool: &str) -> Result<(), GateError> {
-    let mutating = matches!(tool, "edit" | "write" | "bash");
-    if mutating && !autonomous && !plan.current_is_airtight() {
+pub fn allows_tool(plan: &Plan, _autonomous: bool, tool: &str) -> Result<(), GateError> {
+    let mutating = matches!(
+        tool,
+        "edit" | "write" | "bash" | "delete" | "rename" | "patch" | "apply_patch" | "mkdir" | "rm"
+    );
+    if mutating && !plan.current_is_airtight() {
         return Err(GateError::NoAirtightStep);
     }
     Ok(())
@@ -153,7 +188,10 @@ mod tests {
             allows_tool(&plan, false, "write"),
             Err(GateError::NoAirtightStep)
         );
-        assert!(allows_tool(&plan, true, "write").is_ok());
+        assert_eq!(
+            allows_tool(&plan, true, "write"),
+            Err(GateError::NoAirtightStep)
+        );
         plan.airtight_step(0);
         assert!(allows_tool(&plan, false, "write").is_ok());
     }

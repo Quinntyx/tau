@@ -8,7 +8,12 @@ use serde::{Deserialize, Serialize};
 pub enum Decision {
     Allow,
     Ask,
-    Deny,
+    #[serde(rename = "reject")]
+    Reject,
+    #[serde(rename = "allow-always")]
+    AllowAlways,
+    #[serde(rename = "reject-always")]
+    RejectAlways,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +51,8 @@ impl Rule {
 pub struct PermissionEngine {
     rules: Vec<Rule>,
     default: Decision,
+    #[serde(default)]
+    hard_denials: Vec<String>,
 }
 
 impl Default for PermissionEngine {
@@ -53,6 +60,13 @@ impl Default for PermissionEngine {
         Self {
             rules: Vec::new(),
             default: Decision::Ask,
+            hard_denials: vec![
+                "credential:*".into(),
+                "system:*".into(),
+                "delete:*".into(),
+                "chmod:*".into(),
+                "git:push*".into(),
+            ],
         }
     }
 }
@@ -67,12 +81,35 @@ impl PermissionEngine {
         self.rules.push(rule);
     }
 
+    /// The risk-based default is overridden for network operations.
+    pub fn with_network_default(mut self) -> Self {
+        self.default = Decision::Allow;
+        self
+    }
+
+    pub fn add_hard_denial(&mut self, pattern: impl Into<String>) -> Result<(), globset::Error> {
+        let pattern = pattern.into();
+        Glob::new(&pattern)?;
+        self.hard_denials.push(pattern);
+        Ok(())
+    }
+
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }
 
     pub fn evaluate(&mut self, tool: &str, args: &serde_json::Value) -> Decision {
+        if tool == "network" || tool.starts_with("network:") {
+            return Decision::Allow;
+        }
         let subject = format!("{tool}:{args}");
+        if self.hard_denials.iter().any(|pattern| {
+            Glob::new(pattern)
+                .map(|g| g.compile_matcher().is_match(&subject))
+                .unwrap_or(true)
+        }) {
+            return Decision::RejectAlways;
+        }
         self.rules
             .iter_mut()
             .find_map(|rule| rule.matches(&subject).then_some(rule.decision))
@@ -83,14 +120,14 @@ impl PermissionEngine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionError {
     Ask { tool: String },
-    Denied { tool: String },
+    Rejected { tool: String },
 }
 
 impl std::fmt::Display for PermissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ask { tool } => write!(f, "approval required for tool `{tool}`"),
-            Self::Denied { tool } => write!(f, "permission denied for tool `{tool}`"),
+            Self::Rejected { tool } => write!(f, "permission rejected for tool `{tool}`"),
         }
     }
 }
@@ -103,11 +140,11 @@ pub fn authorize(
     args: &serde_json::Value,
 ) -> Result<(), PermissionError> {
     match engine.evaluate(tool, args) {
-        Decision::Allow => Ok(()),
+        Decision::Allow | Decision::AllowAlways => Ok(()),
         Decision::Ask => Err(PermissionError::Ask {
             tool: tool.to_string(),
         }),
-        Decision::Deny => Err(PermissionError::Denied {
+        Decision::Reject | Decision::RejectAlways => Err(PermissionError::Rejected {
             tool: tool.to_string(),
         }),
     }
@@ -121,14 +158,14 @@ mod tests {
     fn first_matching_rule_wins() {
         let mut permissions = PermissionEngine::default();
         permissions.add_rule(Rule::new("read:*", Decision::Allow).unwrap());
-        permissions.add_rule(Rule::new("*", Decision::Deny).unwrap());
+        permissions.add_rule(Rule::new("*", Decision::Reject).unwrap());
         assert_eq!(
             permissions.evaluate("read", &serde_json::json!({"path":"a.rs"})),
             Decision::Allow
         );
         assert_eq!(
             permissions.evaluate("write", &serde_json::json!({"path":"a.rs"})),
-            Decision::Deny
+            Decision::Reject
         );
     }
 
