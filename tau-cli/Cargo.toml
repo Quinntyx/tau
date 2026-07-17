@@ -15,6 +15,7 @@ path = "src/main.rs"
 tau-core.workspace = true
 tau-server.workspace = true
 tau-gui.workspace = true
+tau-tui.workspace = true
 tau-client.workspace = true
 clap.workspace = true
 tokio.workspace = true

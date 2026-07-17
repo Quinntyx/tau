@@ -17,6 +17,7 @@ pub struct Backend {
     model: String,
     runtime: tokio::runtime::Handle,
     _daemon: Arc<Mutex<Option<Child>>>,
+    auto_started: bool,
 }
 
 impl Backend {
@@ -27,12 +28,14 @@ impl Backend {
             .ok()
             .and_then(|config| config.model)
             .unwrap_or_else(|| "openai/gpt-4o".into());
+        let auto_started = daemon.is_some();
         Ok(Self {
             socket,
             cwd: cwd.to_string_lossy().into_owned(),
             model,
             runtime: runtime.handle().clone(),
             _daemon: Arc::new(Mutex::new(daemon)),
+            auto_started,
         })
     }
 
@@ -42,6 +45,10 @@ impl Backend {
 
     pub fn cwd(&self) -> &str {
         &self.cwd
+    }
+
+    pub fn auto_started(&self) -> bool {
+        self.auto_started
     }
 
     pub fn completion(

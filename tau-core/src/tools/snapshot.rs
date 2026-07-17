@@ -14,16 +14,16 @@ pub struct SnapshotCapture {
     pub entries: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotManifest {
     id: String,
     entries: Vec<SnapshotEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotEntry {
     path: String,
-    kind: &'static str,
+    kind: String,
     existed: bool,
     bytes: u64,
     digest: Option<String>,
@@ -82,6 +82,72 @@ impl SnapshotStore {
         })
     }
 
+    pub fn list(&self) -> Result<Vec<SnapshotCapture>, ToolError> {
+        let mut captures = Vec::new();
+        if !self.root.exists() {
+            return Ok(captures);
+        }
+        for entry in
+            std::fs::read_dir(&self.root).map_err(|e| ToolError::Snapshot(e.to_string()))?
+        {
+            let path = entry
+                .map_err(|e| ToolError::Snapshot(e.to_string()))?
+                .path();
+            let manifest_path = path.join("manifest.json");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let bytes =
+                std::fs::read(&manifest_path).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+            let manifest: SnapshotManifest =
+                serde_json::from_slice(&bytes).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+            captures.push(SnapshotCapture {
+                id: manifest.id,
+                manifest: manifest_path,
+                entries: manifest.entries.len(),
+            });
+        }
+        captures.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(captures)
+    }
+
+    pub fn restore(&self, id: &str) -> Result<usize, ToolError> {
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ToolError::Snapshot("invalid snapshot id".into()));
+        }
+        let snapshot_dir = self.root.join(id);
+        let manifest_path = snapshot_dir.join("manifest.json");
+        let bytes =
+            std::fs::read(&manifest_path).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+        let manifest: SnapshotManifest =
+            serde_json::from_slice(&bytes).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+        let mut restored = 0;
+        for entry in manifest.entries {
+            let target = self.base.join(&entry.path);
+            if entry.kind == "directory" {
+                std::fs::create_dir_all(&target).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+                continue;
+            }
+            if !entry.existed {
+                if target.is_file() {
+                    std::fs::remove_file(&target)
+                        .map_err(|e| ToolError::Snapshot(e.to_string()))?;
+                }
+                continue;
+            }
+            let Some(digest) = entry.digest else {
+                continue;
+            };
+            let source = snapshot_dir.join("blobs").join(digest);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+            }
+            std::fs::copy(source, target).map_err(|e| ToolError::Snapshot(e.to_string()))?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
     fn collect(&self, path: &Path, entries: &mut Vec<SnapshotEntry>) -> Result<(), ToolError> {
         let relative = path
             .strip_prefix(&self.base)
@@ -93,7 +159,7 @@ impl SnapshotStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 entries.push(SnapshotEntry {
                     path: relative,
-                    kind: "missing",
+                    kind: "missing".into(),
                     existed: false,
                     bytes: 0,
                     digest: None,
@@ -106,7 +172,7 @@ impl SnapshotStore {
         if metadata.is_dir() {
             entries.push(SnapshotEntry {
                 path: relative,
-                kind: "directory",
+                kind: "directory".into(),
                 existed: true,
                 bytes: 0,
                 digest: None,
@@ -124,7 +190,7 @@ impl SnapshotStore {
         if !metadata.is_file() {
             entries.push(SnapshotEntry {
                 path: relative,
-                kind: "other",
+                kind: "other".into(),
                 existed: true,
                 bytes: metadata.len(),
                 digest: None,
@@ -135,7 +201,7 @@ impl SnapshotStore {
         if metadata.len() > MAX_FILE_BYTES {
             entries.push(SnapshotEntry {
                 path: relative,
-                kind: "file",
+                kind: "file".into(),
                 existed: true,
                 bytes: metadata.len(),
                 digest: None,
@@ -146,7 +212,7 @@ impl SnapshotStore {
         let bytes = std::fs::read(path).map_err(|e| ToolError::Snapshot(e.to_string()))?;
         entries.push(SnapshotEntry {
             path: relative,
-            kind: "file",
+            kind: "file".into(),
             existed: true,
             bytes: bytes.len() as u64,
             digest: Some(digest(&bytes)),
@@ -158,4 +224,22 @@ impl SnapshotStore {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha1::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_replays_captured_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        std::fs::write(&path, "before").unwrap();
+        let store = SnapshotStore::for_cwd(root.path());
+        let capture = store.capture_paths(std::slice::from_ref(&path)).unwrap();
+        std::fs::write(&path, "after").unwrap();
+        assert_eq!(store.restore(&capture.id).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
 }

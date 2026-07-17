@@ -60,11 +60,13 @@ pub struct TauView {
     status: String,
     task: Option<Task<()>>,
     agent: AgentMode,
+    toast_visible: bool,
 }
 
 impl TauView {
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
+        let toast_visible = backend.auto_started();
         Self {
             input,
             backend,
@@ -75,6 +77,7 @@ impl TauView {
             status: "Ready".into(),
             task: None,
             agent: AgentMode::Code,
+            toast_visible,
         }
     }
 
@@ -90,6 +93,15 @@ impl TauView {
         self.agent = self.agent.next();
         self.status = format!("{} agent", self.agent.label());
         cx.notify();
+    }
+
+    fn hide_toast(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.toast_visible = false;
+        cx.notify();
+    }
+
+    fn quit_gui(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.quit();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -186,6 +198,31 @@ impl Render for TauView {
                 self.backend.model(),
                 self.status
             )));
+        let toast = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .p_3()
+            .bg(rgb(0x463b24))
+            .text_color(rgb(0xf3d28a))
+            .child("tau started the daemon automatically for this GUI session")
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(toast_button(
+                        "Okay",
+                        0xd8aa4e,
+                        cx.listener(Self::hide_toast),
+                    ))
+                    .child(toast_button(
+                        "Don't show again",
+                        0x6a5834,
+                        cx.listener(Self::hide_toast),
+                    ))
+                    .child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui))),
+            );
         let transcript = div()
             .id("transcript")
             .flex_1()
@@ -252,7 +289,7 @@ impl Render for TauView {
                         .child("Send"),
                 ),
         );
-        div()
+        let mut root = div()
             .size_full()
             .bg(rgb(0x11151b))
             .text_color(rgb(0xe8edf5))
@@ -260,8 +297,11 @@ impl Render for TauView {
             .flex_col()
             .key_context("TauView")
             .on_action(cx.listener(Self::submit))
-            .on_action(cx.listener(Self::switch_agent))
-            .child(header)
+            .on_action(cx.listener(Self::switch_agent));
+        if self.toast_visible {
+            root = root.child(toast);
+        }
+        root.child(header)
             .child(div().flex().flex_1().child(transcript).child(sidebar))
             .child(footer)
     }
@@ -282,4 +322,19 @@ fn sidebar_card(title: &str, value: &str) -> impl IntoElement {
                 .child(title.to_string()),
         )
         .child(div().text_sm().child(value.to_string()))
+}
+
+fn toast_button(
+    label: &str,
+    color: u32,
+    callback: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(rgb(color))
+        .cursor_pointer()
+        .on_mouse_up(MouseButton::Left, callback)
+        .child(label.to_string())
 }

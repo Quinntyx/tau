@@ -26,6 +26,7 @@ ignore.workspace = true
 mime_guess.workspace = true
 regex.workspace = true
 sha1.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }
 
 [dev-dependencies]
 tempfile.workspace = true

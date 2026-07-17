@@ -5,9 +5,12 @@
 //! sessions, tools, and the agent runtime built on `rig`.
 
 pub mod agent;
+pub mod agents;
 pub mod config;
+pub mod context;
 pub mod credentials;
 pub mod db;
+pub mod integrations;
 pub mod permissions;
 pub mod plan;
 pub mod provider;

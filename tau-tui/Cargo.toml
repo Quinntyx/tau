@@ -1,0 +1,16 @@
+[package]
+name = "tau-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+tau-client.workspace = true
+tau-proto.workspace = true
+tokio.workspace = true

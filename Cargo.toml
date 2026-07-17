@@ -7,6 +7,7 @@ members = [
     "tau-client",
     "tau-cli",
     "tau-gui",
+    "tau-tui",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "fs",
+    "process",
 ] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
@@ -41,6 +43,8 @@ anyhow = "1"
 futures-util = "0.3"
 futures = "0.3"
 gpui = "0.2"
+crossterm = "0.28"
+ratatui = "0.29"
 globset = "0.4"
 ignore = "0.4"
 mime_guess = "2"
@@ -64,3 +68,4 @@ tau-core = { path = "tau-core", version = "0.1.0" }
 tau-client = { path = "tau-client", version = "0.1.0" }
 tau-server = { path = "tau-server", version = "0.1.0" }
 tau-gui = { path = "tau-gui", version = "0.1.0" }
+tau-tui = { path = "tau-tui", version = "0.1.0" }
