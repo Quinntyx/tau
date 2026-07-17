@@ -56,6 +56,27 @@ pub struct TurnStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub idempotency_key: IdempotencyKey,
+    /// The selected OpenCode-style workflow context. These fields are kept on
+    /// the request (rather than only in the view) so reconnect/replay clients
+    /// can reproduce the exact turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_tier: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomous: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<RequestAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RequestAction {
+    Submit,
+    Command { command: String },
+    Permission { choice: String },
+    Cancel,
+    Replay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +192,10 @@ mod tests {
                 session_id: None,
                 cwd: None,
                 idempotency_key: IdempotencyKey::new("k"),
+                agent: Some("default".into()),
+                task_tier: Some(1),
+                autonomous: Some(false),
+                action: Some(RequestAction::Submit),
             })
             .unwrap(),
             serde_json::to_value(TurnCancelParams {

@@ -45,6 +45,12 @@ pub fn render(frame: &mut Frame, s: &AppState) {
         ),
         root[1],
     );
+    // Keep the terminal cursor at the UTF-8 byte cursor's visual column so
+    // multiline editing remains usable instead of merely storing text.
+    let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
+    let line = s.input[..s.cursor].matches('\n').count() as u16;
+    let column = s.input[line_start..s.cursor].chars().count() as u16;
+    frame.set_cursor_position((root[1].x + 1 + column, root[1].y + 2 + line));
     if s.picker != Picker::None {
         picker(frame, s);
     }
@@ -66,6 +72,12 @@ fn picker(frame: &mut Frame, s: &AppState) {
             .into_iter()
             .map(|m| ListItem::new(format!("{} {}", if m.favorite { "★" } else { " " }, m.id)))
             .collect()
+    } else if s.picker == Picker::Commands {
+        ["/agent <name>", "/agents", "/model <id>", "/help", "/replay"]
+            .iter()
+            .filter(|command| s.picker_query.is_empty() || command.contains(&s.picker_query))
+            .map(|command| ListItem::new(*command))
+            .collect()
     } else {
         s.agents
             .iter()
@@ -73,12 +85,10 @@ fn picker(frame: &mut Frame, s: &AppState) {
             .map(|a| ListItem::new(a.as_str()))
             .collect()
     };
-    frame.render_widget(
-        List::new(items)
+    let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-        area,
-    );
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_widget(list, area);
 }
 fn permission(frame: &mut Frame, p: &Permission) {
     let area = center(frame.area(), 64, 10);

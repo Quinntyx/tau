@@ -57,16 +57,17 @@ async fn session(
             tokio::task::yield_now().await;
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let input = event::read()?;
+        let action = match input {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if matches!(key.code, KeyCode::Esc) { break; }
+                reducer::key_action(&state, key)
+            }
+            Event::Mouse(mouse) => reducer::mouse_action(&state, mouse),
+            Event::Resize(_, _) => Some(reducer::Action::Reconnect),
+            _ => None,
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if matches!(key.code, KeyCode::Esc) {
-            break;
-        }
-        if let Some(action) = reducer::key_action(&state, key) {
+        if let Some(action) = action {
             let is_cancel = matches!(action, reducer::Action::Cancel);
             let is_replay = matches!(action, reducer::Action::Replay);
             if let Some(prompt) = reducer::apply(&mut state, action) {

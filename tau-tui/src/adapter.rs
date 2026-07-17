@@ -11,6 +11,7 @@ pub enum ClientEvent {
     Turn(SequencedEvent),
     Complete { session_id: String, turn_id: String },
     Tool { name: String, output: BoundedOutput },
+    Permission { tool: String, summary: String },
     Disconnected,
     Reconnected,
 }
@@ -36,6 +37,12 @@ impl ScriptedClient {
                     input: serde_json::Value::Null,
                     status: crate::state::ToolStatus::Complete,
                     expanded: false,
+                }),
+                ClientEvent::Permission { tool, summary } => s.permission = Some(crate::state::Permission {
+                    tool: tool.clone(),
+                    summary: summary.clone(),
+                    choice: crate::state::PermissionChoice::AllowOnce,
+                    stage: crate::state::PermissionStage::Choose,
                 }),
                 ClientEvent::Disconnected => s.connection = Connection::Disconnected,
                 ClientEvent::Reconnected => s.connection = Connection::Connected,

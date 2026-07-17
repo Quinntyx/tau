@@ -116,6 +116,9 @@ impl Backend {
                     prompt,
                     session_id,
                     cwd: Some(cwd),
+                    agent: None,
+                    task_tier: None,
+                    autonomous: None,
                 };
                 let mut stream = client.completion_stream(params).await?;
                 while let Some(event) = stream.next().await {

@@ -1,6 +1,6 @@
 use crate::state::*;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tau_proto::prelude::{IdempotencyKey, TurnStartParams};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use tau_proto::prelude::{IdempotencyKey, RequestAction, TurnStartParams};
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -19,7 +19,10 @@ pub enum Action {
     Open(Picker),
     ClosePicker,
     Query(char),
+    QueryBackspace,
+    MovePicker(i8),
     Pick,
+    ToggleFavorite,
     Permission(PermissionChoice),
     ExpandTool(usize),
     NextHunk,
@@ -64,9 +67,9 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
         return match k.code {
             KeyCode::Esc => Some(Action::ClosePicker),
             KeyCode::Enter => Some(Action::Pick),
-            KeyCode::Backspace => Some(Action::Backspace),
-            KeyCode::Up => Some(Action::PrevHunk),
-            KeyCode::Down => Some(Action::NextHunk),
+            KeyCode::Backspace => Some(Action::QueryBackspace),
+            KeyCode::Up => Some(Action::MovePicker(-1)),
+            KeyCode::Down => Some(Action::MovePicker(1)),
             KeyCode::Char(c) => Some(Action::Query(c)),
             _ => None,
         };
@@ -111,6 +114,23 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
         KeyCode::F(3) => Some(Action::Tier(1)),
         KeyCode::F(4) => Some(Action::Tier(-1)),
         _ => None,
+    }
+}
+
+/// Translate terminal mouse input into the same typed actions as keyboard
+/// input. Coordinates are deliberately coarse: cards are line-oriented and
+/// the renderer keeps them in transcript order.
+pub fn mouse_action(s: &AppState, mouse: MouseEvent) -> Option<Action> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return None;
+    }
+    let row = mouse.row.saturating_sub(1) as usize;
+    if row < s.tools.len() {
+        Some(Action::ExpandTool(row))
+    } else if !s.hunks.is_empty() {
+        Some(Action::Hunk(true))
+    } else {
+        None
     }
 }
 
@@ -182,20 +202,45 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         }
         Action::ClosePicker => s.picker = Picker::None,
         Action::Query(c) => s.picker_query.push(c),
+        Action::QueryBackspace => { s.picker_query.pop(); s.picker_index = 0; }
+        Action::MovePicker(delta) => {
+            let count = if s.picker == Picker::Models { filtered_models(s).len() } else { s.agents.len() };
+            if count > 0 {
+                s.picker_index = if delta < 0 { s.picker_index.saturating_sub(1) } else { (s.picker_index + 1).min(count - 1) };
+            }
+        }
         Action::Pick => {
             if s.picker == Picker::Models {
                 if let Some(m) = filtered_models(s).get(s.picker_index) {
                     s.model = m.id.clone();
+                    s.recent_models.retain(|id| id != &s.model);
+                    s.recent_models.insert(0, s.model.clone());
+                    s.recent_models.truncate(8);
                 }
             } else if s.picker == Picker::Agents {
-                if let Some(a) = s.agents.iter().find(|a| a.contains(&s.picker_query)) {
+                if let Some(a) = s.agents.iter().find(|a| a.to_lowercase().contains(&s.picker_query.to_lowercase())) {
                     s.agent = a.clone();
                 }
+            } else if s.picker == Picker::Commands && !s.picker_query.trim().is_empty() {
+                s.input = s.picker_query.clone();
+                s.cursor = s.input.len();
             }
             s.picker = Picker::None;
         }
+        Action::ToggleFavorite => {
+            if let Some(m) = filtered_models(s).get(s.picker_index) {
+                let id = m.id.clone();
+                if let Some(model) = s.models.iter_mut().find(|model| model.id == id) {
+                    model.favorite = !model.favorite;
+                }
+            }
+        }
         Action::Permission(c) => {
             if let Some(p) = s.permission.as_mut() {
+                if p.stage == PermissionStage::AlwaysConfirm && c == PermissionChoice::AllowOnce {
+                    s.permission = None;
+                    return None;
+                }
                 p.choice = c;
                 if c == PermissionChoice::AllowAlways || c == PermissionChoice::AllowSession {
                     p.stage = PermissionStage::AlwaysConfirm;
@@ -270,7 +315,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
     None
 }
 pub fn filtered_models(s: &AppState) -> Vec<&Model> {
-    s.models
+    let mut models: Vec<&Model> = s.models
         .iter()
         .filter(|m| {
             s.picker_query.is_empty()
@@ -279,25 +324,25 @@ pub fn filtered_models(s: &AppState) -> Vec<&Model> {
                     .to_lowercase()
                     .contains(&s.picker_query.to_lowercase())
         })
-        .filter(|m| {
-            s.picker_query.is_empty()
-                || m.favorite
-                || s.recent_models.contains(&m.id)
-                || m.id.to_lowercase().contains(&s.picker_query.to_lowercase())
-                || m.provider
-                    .to_lowercase()
-                    .contains(&s.picker_query.to_lowercase())
-        })
-        .collect()
+        .collect();
+    models.sort_by_key(|m| (!m.favorite, !s.recent_models.contains(&m.id)));
+    models
 }
 pub fn params(s: &AppState, prompt: String, cwd: Option<String>) -> TurnStartParams {
     let idempotency_key = IdempotencyKey::new(format!("tau-tui-{}", uuid_like(prompt.as_bytes())));
+    let action = if prompt.starts_with('/') {
+        RequestAction::Command { command: prompt.clone() }
+    } else { RequestAction::Submit };
     TurnStartParams {
         model: s.model.clone(),
         prompt,
         session_id: s.session_id.clone(),
         cwd,
         idempotency_key,
+        agent: Some(s.agent.clone()),
+        task_tier: Some(s.task_tier),
+        autonomous: Some(s.autonomous),
+        action: Some(action),
     }
 }
 

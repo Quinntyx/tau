@@ -7,7 +7,6 @@ use rig_core::OneOrMany;
 use rig_core::completion::{AssistantContent, CompletionRequest, Message as RigMessage, Usage};
 use serde::Serialize;
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tau_core::agent::AgentRunner;
 use tau_core::context::{ContextAssembler, ContextEpoch};
 use tau_core::credentials::CredentialStore;
@@ -65,6 +64,9 @@ pub(crate) async fn handle_turn(
         prompt: typed.prompt,
         session_id: typed.session_id,
         cwd: typed.cwd,
+        agent: typed.agent,
+        task_tier: typed.task_tier,
+        autonomous: typed.autonomous,
     };
     handle_inner(socket, state, id, serde_json::to_value(params).ok(), true).await;
 }
@@ -182,6 +184,7 @@ async fn handle_inner(
     if typed {
         emit_turn(
             socket,
+            state,
             &session.0.id,
             &typed_turn_id,
             &mut sequence,
@@ -233,6 +236,7 @@ async fn handle_inner(
                     if typed {
                         if !emit_turn(
                             socket,
+                            state,
                             &session.0.id,
                             &typed_turn_id,
                             &mut sequence,
@@ -318,6 +322,7 @@ async fn handle_inner(
             if typed
                 && !emit_turn(
                     socket,
+                    state,
                     &session.0.id,
                     &typed_turn_id,
                     &mut sequence,
@@ -395,6 +400,7 @@ async fn handle_inner(
     if typed {
         if !emit_turn(
             socket,
+            state,
             &session.0.id,
             &typed_turn_id,
             &mut sequence,
@@ -557,27 +563,30 @@ async fn send<T: Serialize>(socket: &mut WebSocket, value: &T) -> bool {
 
 async fn emit_turn(
     socket: &mut WebSocket,
+    state: &AppState,
     session_id: &str,
-    turn_id: &str,
+    _turn_id: &str,
     sequence: &mut u64,
     event: TurnEvent,
 ) -> bool {
     *sequence += 1;
+    let Ok(persisted) = db_blocking(state.db().clone(), {
+        let session_id = session_id.to_string();
+        let event = event.clone();
+        move |db| db.append_event(&session_id, &event, None)
+    }).await else { return false; };
     send(
         socket,
         &Notification {
             jsonrpc: JsonRpc::default(),
             method: METHOD_TURN_EVENT.to_string(),
             params: Some(SequencedEvent {
-                event_id: format!("{turn_id}-{}", *sequence),
+                event_id: persisted.event_id,
                 session_id: session_id.to_string(),
-                sequence: *sequence,
-                occurred_at: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or_default(),
-                request_id: None,
-                event,
+                sequence: persisted.sequence,
+                occurred_at: persisted.occurred_at,
+                request_id: persisted.request_id,
+                event: persisted.event,
             }),
         },
     )
