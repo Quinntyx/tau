@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -48,7 +48,19 @@ impl SnapshotStore {
     pub fn capture_paths(&self, paths: &[PathBuf]) -> Result<SnapshotCapture, ToolError> {
         let mut entries = Vec::new();
         for path in paths {
-            self.collect(path, &mut entries)?;
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                self.base.join(path)
+            };
+            if path
+                .components()
+                .any(|component| component == Component::ParentDir)
+                || !path.starts_with(&self.base)
+            {
+                return Err(ToolError::Snapshot("path is outside snapshot root".into()));
+            }
+            self.collect(&path, &mut entries)?;
         }
         let manifest_seed =
             serde_json::to_vec(&entries).map_err(|e| ToolError::Snapshot(e.to_string()))?;
@@ -292,5 +304,20 @@ mod tests {
             serde_json::json!({"id": id, "entries": [{"path":"../escape","kind":"file","existed":true,"bytes":0,"digest":null,"skipped":true}]}).to_string(),
         ).unwrap();
         assert!(store.restore(id).is_err());
+    }
+
+    #[test]
+    fn capture_rejects_paths_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("outside.txt");
+        std::fs::write(&path, "secret").unwrap();
+        let store = SnapshotStore::for_cwd(root.path());
+        assert!(store.capture_paths(&[path]).is_err());
+        assert!(
+            store
+                .capture_paths(&[PathBuf::from("../outside.txt")])
+                .is_err()
+        );
     }
 }

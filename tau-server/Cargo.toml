@@ -24,6 +24,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 tau-client.workspace = true
+tau-tui.workspace = true
+tau-gui.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
