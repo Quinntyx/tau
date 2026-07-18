@@ -37,6 +37,9 @@ impl Db {
         project_id: &ProjectId,
         cwd: &str,
     ) -> Result<SessionRecord> {
+        if project_id.as_str().trim().is_empty() {
+            anyhow::bail!("project_id is required for a managed session");
+        }
         let now = now_ms();
         let record = SessionRecord {
             id: Uuid::new_v4().to_string(),

@@ -280,6 +280,15 @@ fn project_sessions_are_filtered_flat_newest_first_and_recoverable() {
 }
 
 #[test]
+fn managed_session_creation_requires_a_project_id() {
+    let db = test_db();
+    assert!(
+        db.create_session_for_project(&ProjectId::new(""), "/tmp/no-project")
+            .is_err()
+    );
+}
+
+#[test]
 fn event_journal_sequences_replay_and_idempotency() {
     let db = test_db();
     let session = db.create_session("/tmp/proj").unwrap();
