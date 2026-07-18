@@ -344,7 +344,7 @@ async fn handle_request(
                 ))
                 .unwrap_or_default();
             }
-            let server_capabilities = vec![
+            let server_capabilities = [
                 Capability::TurnStreaming,
                 Capability::TurnCancellation,
                 Capability::EventReplay,

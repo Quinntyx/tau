@@ -355,10 +355,12 @@ mod tests {
     fn save_normalizes_legacy_duplicates_and_preserves_selection() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("gui.kdl");
-        let mut preferences = GuiPreferences::default();
-        preferences.favorites = vec!["a".into(), "a".into(), "b".into()];
-        preferences.recent_models = vec!["x".into(), "x".into()];
-        preferences.selected_model = Some("catalog-only-model".into());
+        let preferences = GuiPreferences {
+            favorites: vec!["a".into(), "a".into(), "b".into()],
+            recent_models: vec!["x".into(), "x".into()],
+            selected_model: Some("catalog-only-model".into()),
+            ..GuiPreferences::default()
+        };
         preferences.save_to(&p).unwrap();
         let loaded = GuiPreferences::load_from(&p).unwrap();
         assert_eq!(loaded.favorites, vec!["a", "b"]);

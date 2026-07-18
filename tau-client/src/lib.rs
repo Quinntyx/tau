@@ -21,7 +21,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 const METHOD_DIFF_REPLY: &str = METHOD_DIFF_DECISION;
 
 #[cfg(test)]
-mod tests {
+mod compatibility_tests {
     use super::*;
 
     #[test]
@@ -358,67 +358,6 @@ impl Client {
     }
     pub async fn diff_reply(&self, params: DiffReply) -> Result<serde_json::Value> {
         self.call(METHOD_DIFF_REPLY, Some(params)).await
-    }
-    /// Reply to an interactive turn event without exposing the JSON-RPC
-    /// envelope to callers.  The request id is part of the typed response so
-    /// retries can be correlated by the daemon.
-    pub async fn permission_response(
-        &self,
-        session_id: String,
-        turn_id: String,
-        request_id: String,
-        choice: TurnPermissionChoice,
-        idempotency_key: IdempotencyKey,
-    ) -> Result<TurnResponseResult> {
-        self.turn_response(TurnResponseParams {
-            session_id,
-            turn_id,
-            idempotency_key,
-            response: ClientResponse::Permission { request_id, choice },
-        })
-        .await
-    }
-    pub async fn question_response(
-        &self,
-        session_id: String,
-        turn_id: String,
-        question_id: String,
-        answer: String,
-        idempotency_key: IdempotencyKey,
-    ) -> Result<TurnResponseResult> {
-        self.turn_response(TurnResponseParams {
-            session_id,
-            turn_id,
-            idempotency_key,
-            response: ClientResponse::Question {
-                question_id,
-                answer: answer.into(),
-            },
-        })
-        .await
-    }
-    pub async fn diff_response(
-        &self,
-        session_id: String,
-        turn_id: String,
-        request_id: String,
-        path: String,
-        index: u32,
-        approved: bool,
-        idempotency_key: IdempotencyKey,
-    ) -> Result<TurnResponseResult> {
-        self.turn_response(TurnResponseParams {
-            session_id,
-            turn_id,
-            idempotency_key,
-            response: ClientResponse::DiffHunk {
-                request_id,
-                path,
-                index,
-                approved,
-            },
-        })
-        .await
     }
     pub async fn plan_reply(&self, params: PlanReply) -> Result<serde_json::Value> {
         self.call(METHOD_PLAN_REPLY, Some(params)).await
