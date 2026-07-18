@@ -53,4 +53,35 @@ fn operations_key_listener_reduces_typed_actions() {
         Action::OperationsTab(tau_tui::state::OperationsTab::Git),
     );
     assert_eq!(state.operations_tab, tau_tui::state::OperationsTab::Git);
+    assert!(matches!(
+        tau_tui::reducer::key_action(
+            &state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        ),
+        Some(Action::OperationsAcknowledge)
+    ));
+}
+
+#[test]
+fn operations_acknowledgement_is_reduced_as_typed_state() {
+    let mut state = AppState {
+        operations_focused: true,
+        ..AppState::default()
+    };
+
+    let action = tau_tui::reducer::key_action(
+        &state,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .expect("operations acknowledgement key should produce an action");
+    assert!(matches!(action, Action::OperationsAcknowledge));
+
+    reduce(&mut state, action);
+    assert!(state.operations_loading);
+
+    tau_tui::operations::reduce(
+        &mut state.operations,
+        tau_tui::operations::Action::Acknowledge("operations".into(), true),
+    );
+    assert_eq!(state.operations.acknowledged.get("operations"), Some(&true));
 }

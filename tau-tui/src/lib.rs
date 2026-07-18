@@ -226,6 +226,7 @@ async fn session(
 
 async fn handle_operations(state: &mut AppState, client: &Client, action: reducer::Action) {
     use reducer::Action;
+    let is_acknowledgement = matches!(&action, Action::OperationsAcknowledge);
     let result = match action {
         Action::OperationsRefresh => {
             match operations::status(client, &mut state.operations).await {
@@ -261,6 +262,20 @@ async fn handle_operations(state: &mut AppState, client: &Client, action: reduce
                 Ok(())
             }
         }
+        Action::OperationsAcknowledge => {
+            operations::acknowledge(client, &state.operations, "operations".into(), true)
+                .await
+                .map(|value| {
+                    state.operations_ack = Some(
+                        if value {
+                            "acknowledged"
+                        } else {
+                            "not acknowledged"
+                        }
+                        .into(),
+                    );
+                })
+        }
         Action::OperationsCreateBranch(name) => {
             operations::create_branch(client, &state.operations, name).await
         }
@@ -271,8 +286,9 @@ async fn handle_operations(state: &mut AppState, client: &Client, action: reduce
     };
     state.operations_loading = false;
     match result {
-        Ok(()) => state.operations_ack = Some("operation complete".into()),
+        Ok(()) if !is_acknowledgement => state.operations_ack = Some("operation complete".into()),
         Err(e) => state.operations_error = Some(e.to_string()),
+        Ok(()) => {}
     }
 }
 

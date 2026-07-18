@@ -63,6 +63,7 @@ pub enum Action {
     OperationsUnstage,
     OperationsRevertConfirmed,
     OperationsKeep,
+    OperationsAcknowledge,
     OperationsCreateBranch(String),
     OperationsSwitchBranch(String),
 }
@@ -126,6 +127,13 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
         KeyCode::Char('s') if s.operations_focused => Some(Action::OperationsStage),
         KeyCode::Char('u') if s.operations_focused => Some(Action::OperationsUnstage),
         KeyCode::Char('K') if s.operations_focused => Some(Action::OperationsKeep),
+        // Keep Ctrl-A's existing accept-file binding; plain `a` is the
+        // operations-only acknowledgement shortcut.
+        KeyCode::Char('a')
+            if s.operations_focused && !k.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::OperationsAcknowledge)
+        }
         KeyCode::Char('v') if s.operations_focused => Some(Action::OperationsRevertConfirmed),
         KeyCode::Char('c') if s.operations_focused => {
             Some(Action::OperationsCreateBranch("tau/tui-review".into()))
@@ -477,6 +485,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         Action::OperationsStage
         | Action::OperationsUnstage
         | Action::OperationsRevertConfirmed
+        | Action::OperationsAcknowledge
         | Action::OperationsCreateBranch(_)
         | Action::OperationsSwitchBranch(_) => s.operations_loading = true,
     }

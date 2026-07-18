@@ -34,6 +34,7 @@ gpui::actions!(
         OperationsUnstage,
         OperationsRevert,
         OperationsKeep,
+        OperationsAcknowledge,
         OperationsCreateBranch,
         OperationsSwitchBranch
     ]
@@ -617,6 +618,36 @@ impl TauView {
         }
     }
 
+    fn acknowledge_operation(&mut self, cx: &mut Context<Self>) {
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = self.backend.operations_ack("operations".into(), true);
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(result)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations.acknowledge(result.acknowledged);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error);
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn create_operation_branch(&mut self, cx: &mut Context<Self>) {
         let receiver = self
             .backend
@@ -727,6 +758,15 @@ impl TauView {
         cx: &mut Context<Self>,
     ) {
         self.keep_operation(cx);
+    }
+
+    fn operations_acknowledge_action(
+        &mut self,
+        _: &OperationsAcknowledge,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.acknowledge_operation(cx);
     }
 
     fn operations_create_action(
@@ -918,6 +958,11 @@ impl TauView {
                 "Create tau/gui-review",
                 0x33445f,
                 cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
+            ));
+            details = details.child(toast_button(
+                "Acknowledge",
+                0x52627a,
+                cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
             ));
             panel = panel.child(details);
         }
@@ -2006,6 +2051,7 @@ impl Render for TauView {
         root = root.on_action(cx.listener(Self::operations_unstage_action));
         root = root.on_action(cx.listener(Self::operations_revert_action));
         root = root.on_action(cx.listener(Self::operations_keep_action));
+        root = root.on_action(cx.listener(Self::operations_acknowledge_action));
         root = root.on_action(cx.listener(Self::operations_create_action));
         root = root.on_action(cx.listener(Self::operations_switch_action));
         root.child(header)

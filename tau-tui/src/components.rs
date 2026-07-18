@@ -125,14 +125,19 @@ pub fn render_operations_panel(
             .title(format!("Operations [{}]", state.branch)),
     );
     frame.render_widget(list, columns[0]);
-    let state_line = if loading {
-        " loading: yes ".to_owned()
-    } else if let Some(error) = error {
-        format!(" error: {error} ")
+    let mut body = vec![tabs];
+    body.push(Line::from(if loading {
+        " Loading: yes"
     } else {
-        format!(" loading: no   error: —{}", acknowledgement.unwrap_or(""))
-    };
-    let mut body = vec![tabs, Line::from(state_line)];
+        " Loading: no"
+    }));
+    body.push(Line::from(match error {
+        Some(error) => format!(" Error: {error}"),
+        None => " Error: —".to_owned(),
+    }));
+    if let Some(acknowledgement) = acknowledgement {
+        body.push(Line::from(format!(" Acknowledgement: {acknowledgement}")));
+    }
     if let Some(content) = &state.content {
         body.push(Line::from(content.path.to_string()));
         if tab == OperationsTab::Status {
@@ -147,8 +152,10 @@ pub fn render_operations_panel(
                     .map(|line| Line::from(format!("  {line}"))),
             );
         }
-        body.push(Line::from("[s] stage  [u] unstage  [r] revert  [k] Keep"));
-        body.push(Line::from("[b] branch  [Enter] acknowledge"));
+        body.push(Line::from(" Actions: [Enter/o] open  [R] refresh"));
+        body.push(Line::from(" [s] stage  [u] unstage  [v] revert"));
+        body.push(Line::from(" [K] keep  [a] acknowledge"));
+        body.push(Line::from(" [b] switch branch  [c] create branch"));
         if tab != OperationsTab::Status {
             body.extend(content.diff.lines().map(Line::from));
         }
@@ -162,7 +169,10 @@ pub fn render_operations_panel(
         }
     } else {
         body.push(Line::from("Select a file to inspect full content/diff."));
-        body.push(Line::from("[s] stage  [u] unstage  [r] revert  [b] branch"));
+        body.push(Line::from(
+            "Actions: [R] refresh  [↑/↓] select  [Enter/o] open",
+        ));
+        body.push(Line::from("[b] switch branch  [c] create branch"));
     }
     frame.render_widget(
         Paragraph::new(body).wrap(Wrap { trim: false }).block(
