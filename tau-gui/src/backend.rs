@@ -23,6 +23,7 @@ pub struct Backend {
     session: Arc<tokio::sync::Mutex<Option<tau_client::Client>>>,
     active: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     active_turn: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
+    response_context: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
     _daemon: Arc<Mutex<Option<Child>>>,
     auto_started: bool,
     status: Arc<Mutex<DaemonStatus>>,
@@ -87,7 +88,7 @@ impl TurnRequest {
         }
     }
 
-    fn into_params(self, cwd: String, default_model: String) -> TurnStartParams {
+    pub fn into_params(self, cwd: String, default_model: String) -> TurnStartParams {
         TurnStartParams {
             model: self.model.unwrap_or(default_model),
             prompt: self.prompt,
@@ -281,6 +282,7 @@ impl Backend {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             active: Arc::new(Mutex::new(None)),
             active_turn: Arc::new(Mutex::new(None)),
+            response_context: Arc::new(Mutex::new(None)),
             _daemon: Arc::new(Mutex::new(daemon)),
             auto_started,
             status: Arc::new(Mutex::new(initial_status)),
@@ -459,6 +461,7 @@ impl Backend {
         let model = model.unwrap_or_else(|| self.model.clone());
         let session = self.session.clone();
         let active_turn = self.active_turn.clone();
+        let response_context = self.response_context.clone();
         let status = self.status.clone();
         let failed_session = session.clone();
         let daemon = self._daemon.clone();
@@ -476,19 +479,23 @@ impl Backend {
                         .lock()
                         .map(|mut s| *s = DaemonStatus::Negotiating)
                         .ok();
-                    let report = match guard
-                        .as_ref()
-                        .expect("session initialized")
-                        .negotiate_checked(ProtocolNegotiateParams {
-                            version: ProtocolVersion { major: 1, minor: 0 },
-                            capabilities: vec![
-                                Capability::TurnStreaming,
-                                Capability::TurnCancellation,
-                                Capability::Idempotency,
-                                Capability::EventReplay,
-                            ],
-                        })
-                        .await
+                    let report = match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        guard
+                            .as_ref()
+                            .expect("session initialized")
+                            .negotiate_checked(ProtocolNegotiateParams {
+                                version: ProtocolVersion { major: 1, minor: 0 },
+                                capabilities: vec![
+                                    Capability::TurnStreaming,
+                                    Capability::TurnCancellation,
+                                    Capability::Idempotency,
+                                    Capability::EventReplay,
+                                ],
+                            }),
+                    )
+                    .await
+                    .context("protocol negotiation timed out")?
                     {
                         Ok(report) => report,
                         Err(error) => {
@@ -540,11 +547,15 @@ impl Backend {
                             &sequenced.event
                         {
                             if let Ok(mut active) = active_turn.lock() {
-                                *active = Some((
+                                let context = (
                                     client.clone(),
                                     sequenced.session_id.clone(),
                                     turn_id.clone(),
-                                ));
+                                );
+                                *active = Some(context.clone());
+                                if let Ok(mut response) = response_context.lock() {
+                                    *response = Some(context);
+                                }
                             }
                         }
                     }
@@ -616,7 +627,7 @@ impl Backend {
         response: ClientResponse,
     ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let active_turn = self.active_turn.clone();
+        let response_context = self.response_context.clone();
         self.runtime.spawn(async move {
             let (kind, request_id) = match &response {
                 ClientResponse::Permission { request_id, .. } => {
@@ -625,7 +636,7 @@ impl Backend {
                 ClientResponse::Question { question_id, .. } => ("question", question_id.as_str()),
                 ClientResponse::DiffHunk { request_id, .. } => ("diff", request_id.as_str()),
             };
-            let active = active_turn.lock().ok().and_then(|value| value.clone());
+            let active = response_context.lock().ok().and_then(|value| value.clone());
             let result = if let Some((client, session_id, turn_id)) = active {
                 client
                     .turn_response(TurnResponseParams {

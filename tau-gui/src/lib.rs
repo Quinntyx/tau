@@ -5,7 +5,7 @@ pub mod chat;
 pub mod input;
 pub mod picker;
 pub mod preferences;
-mod view;
+pub mod view;
 
 use std::path::PathBuf;
 

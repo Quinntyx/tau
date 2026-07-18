@@ -21,4 +21,5 @@ kdl.workspace = true
 unicode-segmentation.workspace = true
 
 [dev-dependencies]
+serde.workspace = true
 tokio-tungstenite.workspace = true
