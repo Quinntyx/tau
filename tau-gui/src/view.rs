@@ -8,6 +8,7 @@ use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
 
 use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
+use crate::feed;
 use crate::input::{TextInput, command_mode};
 use crate::picker::{
     AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
@@ -48,6 +49,35 @@ pub fn next_sidebar_visibility(visible: bool) -> bool {
 
 pub fn next_follow_state(following: bool) -> bool {
     !following
+}
+
+fn feed_policy_request_id(item: &feed::FeedItem) -> Option<&str> {
+    match item.category {
+        feed::FeedCategory::Permission => item.actions.permission_id.as_deref(),
+        feed::FeedCategory::Question => item.actions.question_id.as_deref(),
+        feed::FeedCategory::Diff => item.actions.diff_request_id.as_deref(),
+        _ => None,
+    }
+}
+
+fn feed_item_is_pending(chat: &ChatState, item: &feed::FeedItem) -> bool {
+    feed_policy_request_id(item)
+        .and_then(|id| chat.policy_states.get(id))
+        .is_none_or(|state| !matches!(state, crate::chat::PolicyState::Ack))
+}
+
+/// Render one projected feed body with a typography-first hierarchy.  The
+/// reducer remains the source of truth; this seam deliberately accepts the
+/// already projected label/text pair so protocol actions stay on `TauView`.
+fn feed_body(label: &str, text: String) -> gpui::Div {
+    let primary = matches!(label, "You" | "tau");
+    div()
+        .max_w(px(820.))
+        .p_3()
+        .rounded_lg()
+        .when(primary, |element| element.text_base())
+        .when(!primary, |element| element.text_sm())
+        .child(text)
 }
 
 /// Build presentation data without requiring a GPUI window.  Typed protocol
@@ -969,6 +999,27 @@ impl TauView {
         cx.notify();
     }
 
+    fn card_index_for_request(
+        &self,
+        request_id: &str,
+        category: feed::FeedCategory,
+    ) -> Option<usize> {
+        self.chat
+            .cards
+            .iter()
+            .position(|card| match (category, card) {
+                (feed::FeedCategory::Permission, Card::Permission { request_id: id, .. })
+                | (feed::FeedCategory::Diff, Card::Diff { request_id: id, .. }) => id == request_id,
+                (
+                    feed::FeedCategory::Question,
+                    Card::Question {
+                        question_id: id, ..
+                    },
+                ) => id == request_id,
+                _ => false,
+            })
+    }
+
     fn choose_diff(
         &mut self,
         index: usize,
@@ -1404,6 +1455,7 @@ impl Render for TauView {
             .map(String::as_str)
             .unwrap_or(self.backend.model());
         let description = describe_chat(&self.chat, &self.agent, current_model, self.backend.cwd());
+        let typed_feed = feed::FeedProjection::from_events(&self.chat.events);
         if self.follow_output {
             self.transcript_scroll.scroll_to_bottom();
         }
@@ -1682,18 +1734,7 @@ impl Render for TauView {
                     .flex_col()
                     .when(align_end, |element| element.items_end())
                     .child(div().text_xs().text_color(rgb(0x8994a8)).child(label))
-                    .child(
-                        div()
-                            .id(("card-content", index))
-                            .flex()
-                            .max_w(px(820.))
-                            .max_h(px(360.))
-                            .overflow_y_scroll()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(background))
-                            .child(text),
-                    );
+                    .child(feed_body(label, text).bg(rgb(background)));
                 if matches!(card, Card::Tool { .. }) {
                     card_view = card_view.on_mouse_up(
                         MouseButton::Left,
@@ -1776,20 +1817,26 @@ impl Render for TauView {
                 card_view
             }))
             .children(
-                description
-                    .transcript
+                typed_feed
+                    .items
                     .iter()
-                    .skip(self.chat.cards.len())
-                    .map(|(label, text)| {
-                        div()
+                    .filter(|item| feed_item_is_pending(&self.chat, item))
+                    .map(|item| {
+                        let category = item.category;
+                        // Policy ids live in the typed EventKind payload.  The
+                        // envelope request id is a different correlation field and
+                        // must never be substituted for it.
+                        let request_id = feed_policy_request_id(item).unwrap_or_default();
+                        let label = format!(
+                            "{} {} · #{} · {}",
+                            item.avatar, item.role_mark, item.sequence, item.timestamp
+                        );
+                        let mut item_view = div()
                             .flex()
                             .flex_col()
                             .gap_1()
                             .p_3()
                             .rounded_md()
-                            // The event kind already selected this projection;
-                            // presentation never reparses the label text to
-                            // recover protocol semantics.
                             .bg(rgb(0x202630))
                             .child(
                                 div()
@@ -1797,7 +1844,85 @@ impl Render for TauView {
                                     .text_color(rgb(0x8994a8))
                                     .child(label.clone()),
                             )
-                            .child(text.clone())
+                            .child(feed_body(item.role_mark, item.visible_detail().to_owned()));
+                        if item.actions.permission {
+                            item_view = item_view.child(
+                                div().flex().gap_2().children(
+                                    [
+                                        (PermissionChoice::AllowOnce, "Allow once", 0x39734a),
+                                        (PermissionChoice::Reject, "Reject", 0x7d3b3b),
+                                    ]
+                                    .into_iter()
+                                    .map(
+                                        |(choice, label, color)| {
+                                            let request_id = request_id.to_owned();
+                                            toast_button(
+                                                label,
+                                                color,
+                                                cx.listener(move |view, event, window, cx| {
+                                                    if let Some(index) = view
+                                                        .card_index_for_request(
+                                                            &request_id,
+                                                            category,
+                                                        )
+                                                    {
+                                                        view.choose_permission(
+                                                            index, choice, event, window, cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                        },
+                                    ),
+                                ),
+                            );
+                        } else if item.actions.question {
+                            item_view = item_view.child(div().flex().gap_2().children(
+                                ["yes", "no"].into_iter().map(|answer| {
+                                    let request_id = request_id.to_owned();
+                                    toast_button(
+                                        answer,
+                                        if answer == "yes" { 0x39734a } else { 0x7d3b3b },
+                                        cx.listener(move |view, event, window, cx| {
+                                            if let Some(index) =
+                                                view.card_index_for_request(&request_id, category)
+                                            {
+                                                view.answer_question(
+                                                    index, answer, event, window, cx,
+                                                );
+                                            }
+                                        }),
+                                    )
+                                }),
+                            ));
+                        } else if item.actions.diff {
+                            item_view = item_view.child(
+                                div().flex().gap_2().children(
+                                    [(true, "Accept", 0x39734a), (false, "Reject", 0x7d3b3b)]
+                                        .into_iter()
+                                        .map(|(approved, label, color)| {
+                                            let request_id = request_id.to_owned();
+                                            toast_button(
+                                                label,
+                                                color,
+                                                cx.listener(move |view, event, window, cx| {
+                                                    if let Some(index) = view
+                                                        .card_index_for_request(
+                                                            &request_id,
+                                                            category,
+                                                        )
+                                                    {
+                                                        view.choose_diff(
+                                                            index, approved, event, window, cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                        }),
+                                ),
+                            );
+                        }
+                        item_view
                     }),
             );
         let sidebar = div()
@@ -2039,5 +2164,60 @@ mod view_model_tests {
                 .iter()
                 .any(|(key, value)| key == "DIRECTORY" && value == "Unavailable")
         );
+    }
+
+    #[test]
+    fn feed_controls_use_policy_ids_not_envelope_request_ids() {
+        let raw = tau_proto::prelude::TurnEvent::PermissionRequested {
+            turn_id: "turn".into(),
+            request_id: "policy-42".into(),
+            tool: "shell".into(),
+            description: "run".into(),
+        };
+        let event = crate::chat::TypedEvent {
+            event_id: "event".into(),
+            session_id: "session".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: Some("envelope-99".into()),
+            turn_id: "turn".into(),
+            kind: EventKind::PermissionRequested {
+                permission_id: "policy-42".into(),
+                tool: "shell".into(),
+                description: "run".into(),
+            },
+            raw,
+        };
+        let item = crate::feed::project(&event, crate::feed::DEFAULT_COLLAPSE_AT);
+        assert_eq!(feed_policy_request_id(&item), Some("policy-42"));
+        assert_ne!(feed_policy_request_id(&item), item.request_id.as_deref());
+    }
+
+    #[test]
+    fn acknowledged_feed_policy_controls_are_removed_from_the_root() {
+        let raw = tau_proto::prelude::TurnEvent::QuestionAsked {
+            turn_id: "turn".into(),
+            question_id: "question-7".into(),
+            question: "continue?".into(),
+        };
+        let event = crate::chat::TypedEvent {
+            event_id: "event".into(),
+            session_id: "session".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: None,
+            turn_id: "turn".into(),
+            kind: EventKind::QuestionAsked {
+                question_id: "question-7".into(),
+                question: "continue?".into(),
+            },
+            raw,
+        };
+        let item = crate::feed::project(&event, crate::feed::DEFAULT_COLLAPSE_AT);
+        let mut chat = ChatState::default();
+        assert!(feed_item_is_pending(&chat, &item));
+        chat.policy_states
+            .insert("question-7".into(), crate::chat::PolicyState::Ack);
+        assert!(!feed_item_is_pending(&chat, &item));
     }
 }

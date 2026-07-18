@@ -1,5 +1,5 @@
 //! Small composable widgets. Keeping these pure makes ratatui snapshots cheap.
-use crate::{projects::ProjectState, reducer::filtered_models, shell, state::*};
+use crate::{feed, projects::ProjectState, reducer::filtered_models, shell, state::*};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -26,49 +26,16 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
         shell::render(frame, s);
     }
     let content = shell::content_area(frame.area());
-    /*
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(5)])
-        .split(frame.area());
-    let mut transcript = s.transcript.join("\n");
-    for tool in &s.tools {
-        transcript.push('\n');
-        transcript.push_str(&format_tool(tool));
+    if !s.raw_events.is_empty() {
+        let mut projection =
+            feed::project_with_humans(&s.raw_events, &s.human_messages, s.connection, s.following);
+        for item in &mut projection.items {
+            if s.expanded_feed.contains(&item.event.sequence) {
+                item.collapsed = false;
+            }
+        }
+        feed::render(frame, content, &projection);
     }
-    if !s.hunks.is_empty() {
-        transcript.push_str("\n\n");
-        transcript.push_str(&format_diff(s));
-    }
-    frame.render_widget(
-        Paragraph::new(transcript)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" tau ")),
-        root[0],
-    );
-    let footer = Line::from(vec![
-        Span::styled(format!(" {} ", s.model), Style::default().fg(Color::Cyan)),
-        Span::raw(format!(
-            "  agent:{} tier:{} {}",
-            s.agent,
-            s.task_tier,
-            if s.autonomous { "AUTO" } else { "ASK" }
-        )),
-    ]);
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![footer, Line::from(s.input.as_str())])).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" prompt (Shift+Enter newline) "),
-        ),
-        root[1],
-    );
-    // Keep the terminal cursor at the UTF-8 byte cursor's visual column so
-    // multiline editing remains usable instead of merely storing text.
-    let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
-    let line = s.input[..s.cursor].matches('\n').count() as u16;
-    let column = s.input[line_start..s.cursor].chars().count() as u16;
-    */
     // Keep the terminal cursor at the UTF-8 byte cursor's visual column.
     let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
     let line = s.input[..s.cursor].matches('\n').count() as u16;
@@ -88,6 +55,9 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
     }
     if let Some(question) = &s.question {
         question_modal(frame, question);
+    }
+    if s.diff_reply.is_some() {
+        diff_modal(frame, s);
     }
 }
 fn session_navigator(frame: &mut Frame, s: &AppState) {
@@ -191,6 +161,29 @@ fn question_modal(frame: &mut Frame, question: &Question) {
     frame.render_widget(
         Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL).title(" Question "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn diff_modal(frame: &mut Frame, s: &AppState) {
+    let area = center(frame.area(), 64, 8);
+    frame.render_widget(Clear, area);
+    let path = s.diff_path.as_deref().unwrap_or("requested changes");
+    let body = vec![
+        Line::from(Span::styled(
+            " Diff review required ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(" {path}")),
+        Line::from(""),
+        Line::from("[Enter/y] accept  [Backspace/n] reject"),
+    ];
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(Block::default().borders(Borders::ALL).title(" Diff "))
             .wrap(Wrap { trim: false }),
         area,
     );

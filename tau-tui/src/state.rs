@@ -1,6 +1,6 @@
 use crate::sessions::Navigator;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use tau_proto::prelude::SequencedEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -92,6 +92,9 @@ pub struct AppState {
     pub selection: Option<usize>,
     pub clipboard: String,
     pub transcript: Vec<String>,
+    /// Typed user entries used by the feed; `transcript` remains a legacy
+    /// display projection for compatibility with the existing reducer tests.
+    pub human_messages: Vec<String>,
     /// The display transcript is a projection; retain every typed event so
     /// replay and inspection never need to recover semantics from strings.
     pub raw_events: Vec<SequencedEvent>,
@@ -129,6 +132,8 @@ pub struct AppState {
     pub redo: VecDeque<Vec<Option<bool>>>,
     pub cancelling: bool,
     pub replaying: bool,
+    pub following: bool,
+    pub expanded_feed: BTreeSet<u64>,
     pub server_index: usize,
     pub servers: Vec<String>,
     pub sessions: Navigator,
@@ -167,6 +172,7 @@ impl Default for AppState {
             selection: None,
             clipboard: String::new(),
             transcript: vec!["Welcome to tau. Select a model and type a prompt.".into()],
+            human_messages: vec![],
             raw_events: vec![],
             assistant_index: None,
             session_id: None,
@@ -209,6 +215,8 @@ impl Default for AppState {
             redo: VecDeque::new(),
             cancelling: false,
             replaying: false,
+            following: true,
+            expanded_feed: BTreeSet::new(),
             server_index: 0,
             servers: vec!["local".into()],
             sessions: Navigator::default(),
