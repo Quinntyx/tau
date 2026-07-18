@@ -250,6 +250,68 @@ fn session_updated_on_message_append() {
 }
 
 #[test]
+fn project_sessions_are_filtered_flat_newest_first_and_recoverable() {
+    let db = test_db();
+    let roots = tempfile::tempdir().unwrap();
+    let alpha = ProjectId::new(
+        db.create_project("alpha", roots.path().join("alpha"))
+            .unwrap()
+            .id,
+    );
+    let beta = ProjectId::new(
+        db.create_project("beta", roots.path().join("beta"))
+            .unwrap()
+            .id,
+    );
+    let first = db.create_session_for_project(&alpha, "/alpha/one").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let second = db.create_session_for_project(&alpha, "/alpha/two").unwrap();
+    let foreign = db.create_session_for_project(&beta, "/beta").unwrap();
+
+    let visible = db.list_sessions_for_project(&alpha, false).unwrap();
+    assert_eq!(
+        visible.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec![second.id.as_str(), first.id.as_str()]
+    );
+    assert!(!visible.iter().any(|s| s.id == foreign.id));
+
+    let archived = db
+        .archive_session_for_project(&alpha, &first.id)
+        .unwrap()
+        .unwrap();
+    assert!(archived.archived_at.is_some());
+    assert_eq!(
+        db.list_sessions_for_project(&alpha, false).unwrap().len(),
+        1
+    );
+    assert_eq!(db.list_sessions_for_project(&alpha, true).unwrap().len(), 2);
+    let restored = db
+        .restore_session_for_project(&alpha, &first.id)
+        .unwrap()
+        .unwrap();
+    assert!(restored.archived_at.is_none());
+    assert!(
+        db.get_session_record_for_project(&alpha, &first.id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.get_session_record_for_project(&beta, &first.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn managed_session_creation_requires_a_project_id() {
+    let db = test_db();
+    assert!(
+        db.create_session_for_project(&ProjectId::new(""), "/tmp/no-project")
+            .is_err()
+    );
+}
+
+#[test]
 fn event_journal_sequences_replay_and_idempotency() {
     let db = test_db();
     let project = db.create_project("proj", "/tmp/proj").unwrap();

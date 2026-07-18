@@ -23,6 +23,7 @@ pub use domain::{
     default_db_path,
 };
 pub use journal::StoredArtifact;
+pub use sessions::{ProjectId, SessionRecord};
 
 /// Wrapper around a single SQLite connection (behind `Arc<Mutex>`).
 /// Cloning is cheap — it clones the `Arc`, not the connection.

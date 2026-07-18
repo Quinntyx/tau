@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, Stream, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tau_proto::prelude::*;
 use tokio::{
     net::UnixStream,
@@ -19,6 +19,79 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 // Keep that detail here rather than making callers of the typed API know about
 // the compatibility name.
 const METHOD_DIFF_REPLY: &str = METHOD_DIFF_DECISION;
+
+/// Opaque project identifier supplied by the application.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(String);
+
+impl ProjectId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Opaque durable session identifier returned by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    #[serde(rename = "id")]
+    pub session_id: SessionId,
+    pub project_id: ProjectId,
+    pub cwd: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistory {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub entries: Vec<SequencedEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSession {
+    pub project_id: ProjectId,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRename {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRef {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+}
+
+pub const METHOD_SESSION_CREATE: &str = "session.create";
+pub const METHOD_SESSION_LIST: &str = "session.list";
+pub const METHOD_SESSION_HISTORY: &str = "session.get_history";
+pub const METHOD_SESSION_RENAME: &str = "session.rename";
+pub const METHOD_SESSION_ARCHIVE: &str = "session.archive";
+pub const METHOD_SESSION_RESTORE: &str = "session.restore";
 
 #[cfg(test)]
 mod compatibility_tests {
@@ -375,6 +448,77 @@ impl Client {
         self.call(METHOD_PROMPT_TAKEOVER, Some(params)).await
     }
 
+    pub async fn session_create(&self, params: CreateSession) -> Result<SessionSummary> {
+        let wire = tau_proto::session::CreateParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            cwd: params.cwd,
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_CREATE, Some(wire)).await?)
+            .context("decoding created session")
+    }
+    pub async fn session_list(&self, project_id: ProjectId) -> Result<Vec<SessionSummary>> {
+        self.session_list_with_archived(project_id, false).await
+    }
+    pub async fn session_list_with_archived(
+        &self,
+        project_id: ProjectId,
+        include_archived: bool,
+    ) -> Result<Vec<SessionSummary>> {
+        let params = tau_proto::session::ListParams {
+            project_id: tau_proto::session::ProjectId::new(project_id.as_str()),
+            include_archived,
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_LIST, Some(params)).await?)
+            .context("decoding session list")
+    }
+    pub async fn session_history(&self, params: SessionRef) -> Result<SessionHistory> {
+        self.session_history_page(params, 0, None).await
+    }
+    pub async fn session_history_page(
+        &self,
+        params: SessionRef,
+        after_sequence: u64,
+        limit: Option<u32>,
+    ) -> Result<SessionHistory> {
+        let wire = tau_proto::session::HistoryParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+            after_sequence,
+            limit,
+        };
+        let entries = serde_json::from_value(self.call(METHOD_SESSION_HISTORY, Some(wire)).await?)
+            .context("decoding session history")?;
+        Ok(SessionHistory {
+            session_id: params.session_id,
+            entries,
+        })
+    }
+    pub async fn session_rename(&self, params: SessionRename) -> Result<SessionSummary> {
+        let wire = tau_proto::session::RenameParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+            title: params.title,
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_RENAME, Some(wire)).await?)
+            .context("decoding renamed session")
+    }
+    pub async fn session_archive(&self, params: SessionRef) -> Result<SessionSummary> {
+        let wire = tau_proto::session::SessionIdParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_ARCHIVE, Some(wire)).await?)
+            .context("decoding archived session")
+    }
+    pub async fn session_restore(&self, params: SessionRef) -> Result<SessionSummary> {
+        let wire = tau_proto::session::SessionIdParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_RESTORE, Some(wire)).await?)
+            .context("decoding restored session")
+    }
+
     pub async fn negotiate(
         &self,
         params: ProtocolNegotiateParams,
@@ -539,6 +683,69 @@ impl Client {
         });
         PolicyEventStream::from_receiver(rx)
     }
+}
+
+/// Small client-side persistence for the active session. The daemon remains
+/// stateless with respect to which session a UI had selected.
+#[derive(Debug, Clone)]
+pub struct ActiveSessionStore {
+    path: std::path::PathBuf,
+}
+
+impl ActiveSessionStore {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+    pub fn load(&self) -> Result<Option<SessionRef>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&std::fs::read(&self.path)?)?))
+    }
+    pub fn save(&self, session: &SessionRef) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&self.path, serde_json::to_vec_pretty(session)?)?;
+        Ok(())
+    }
+    pub fn clear(&self) -> Result<()> {
+        if self.path.exists() {
+            std::fs::remove_file(&self.path)?;
+        }
+        Ok(())
+    }
+    /// Restore the locally selected session after reconnecting, if one exists.
+    pub async fn restore(&self, client: &Client) -> Result<Option<SessionSummary>> {
+        let Some(reference) = self.load()? else {
+            return Ok(None);
+        };
+        let sessions = client.session_list(reference.project_id.clone()).await?;
+        Ok(sessions
+            .into_iter()
+            .find(|session| session.session_id == reference.session_id))
+    }
+}
+
+/// Create and persist the session selected by a new chat, without touching
+/// GUI/TUI state or introducing server-side active-session state.
+pub async fn create_session_for_new_chat(
+    client: &Client,
+    store: &ActiveSessionStore,
+    project_id: ProjectId,
+    cwd: impl Into<String>,
+) -> Result<SessionSummary> {
+    let session = client
+        .session_create(CreateSession {
+            project_id: project_id.clone(),
+            cwd: cwd.into(),
+        })
+        .await?;
+    store.save(&SessionRef {
+        project_id,
+        session_id: session.session_id.clone(),
+    })?;
+    Ok(session)
 }
 
 impl Drop for CompletionStream {
@@ -738,5 +945,19 @@ mod tests {
         );
         assert_eq!(result.compatibility, ProtocolCompatibility::Degraded);
         assert!(result.is_usable());
+    }
+
+    #[test]
+    fn active_session_store_round_trips_typed_reference() {
+        let path = std::env::temp_dir().join(format!("tau-client-session-{}", std::process::id()));
+        let store = ActiveSessionStore::new(&path);
+        let reference = SessionRef {
+            project_id: super::ProjectId::new("project"),
+            session_id: super::SessionId::new("session"),
+        };
+        store.save(&reference).unwrap();
+        assert_eq!(store.load().unwrap(), Some(reference));
+        store.clear().unwrap();
+        assert_eq!(store.load().unwrap(), None);
     }
 }

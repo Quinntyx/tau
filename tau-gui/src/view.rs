@@ -2,6 +2,7 @@ use gpui::{
     App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, ScrollHandle,
     StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb,
 };
+use tau_client::ProjectId;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
 
@@ -11,6 +12,9 @@ use crate::input::{TextInput, command_mode};
 use crate::picker::{
     AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
     next_agent, parse_command,
+};
+use crate::sessions::{
+    Navigator, ProjectId as NavigatorProjectId, SessionSummary as NavigatorSession,
 };
 
 gpui::actions!(
@@ -24,7 +28,8 @@ gpui::actions!(
         PickerDown,
         PickItem,
         ToggleSidebar,
-        ToggleFollow
+        ToggleFollow,
+        ToggleSessions
     ]
 );
 
@@ -386,6 +391,9 @@ pub struct TauView {
     transcript_scroll: ScrollHandle,
     follow_output: bool,
     selected_project_id: Option<String>,
+    sessions: Navigator,
+    session_query: Entity<TextInput>,
+    sessions_open: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -399,6 +407,7 @@ impl TauView {
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
         let picker_input = cx.new(TextInput::new);
+        let session_query = cx.new(TextInput::new);
         let toast_visible = backend.auto_started();
         let preferences = crate::preferences::path()
             .ok()
@@ -434,7 +443,7 @@ impl TauView {
                 in_tab_cycle: true,
             });
         }
-        Self {
+        let view = Self {
             input,
             picker_input,
             backend,
@@ -458,7 +467,12 @@ impl TauView {
             transcript_scroll: ScrollHandle::new(),
             follow_output: true,
             selected_project_id: None,
-        }
+            sessions: Navigator::default(),
+            session_query,
+            sessions_open: false,
+        };
+        // Session loading begins only after an explicit project selection.
+        view
     }
 
     /// Set the active project selected by the project navigator.  Turns are
@@ -473,6 +487,330 @@ impl TauView {
 
     fn click_send(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.send(window, cx);
+    }
+
+    /// Create through the daemon before changing the active chat.  This is
+    /// deliberately asynchronous so a failed create cannot leave a phantom
+    /// local session selected.
+    fn new_chat(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        let Some(project_id) = self.selected_project_id.clone() else {
+            self.runtime = RuntimeState::Failed("select a project before creating a chat".into());
+            cx.notify();
+            return;
+        };
+        let project = ProjectId::new(project_id);
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let result = match backend.session_create(project).await {
+                Ok(task) => task.ok(),
+                Err(_) => None,
+            };
+            if let Some(summary) = result.as_ref() {
+                let _ = backend
+                    .save_active_session(
+                        summary.project_id.clone(),
+                        summary.session_id.as_str().to_owned(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|task| task.ok());
+            }
+            let _ = this.update(cx, |view, cx| {
+                if let Some(summary) = result {
+                    view.chat.session_id = Some(summary.session_id.as_str().to_owned());
+                    view.chat.cards.clear();
+                    view.chat.events.clear();
+                    view.chat.status = ChatStatus::Ready;
+                    view.load_sessions(cx);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn session_project(&self) -> Option<ProjectId> {
+        self.selected_project_id.clone().map(ProjectId::new)
+    }
+
+    fn load_sessions(&mut self, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        let Some(project) = self.session_project() else {
+            self.sessions.set_project(None);
+            return;
+        };
+        let navigator_project = NavigatorProjectId::new(project.as_str());
+        self.sessions.set_project(Some(navigator_project));
+        let include_archived = self.sessions.show_archived();
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let listed = backend
+                .session_list(project.clone(), include_archived)
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let restored = backend
+                .restore_active_session(project)
+                .await
+                .ok()
+                .and_then(|task| task.ok())
+                .flatten();
+            let _ = this.update(cx, |view, cx| {
+                if let Some(records) = listed {
+                    view.sessions
+                        .ingest(records.into_iter().map(to_navigator_session));
+                }
+                if let Some(active) = restored {
+                    view.sessions
+                        .restore_selection(Some(active.session_id.as_str()));
+                    view.chat.session_id = Some(active.session_id.as_str().to_owned());
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn toggle_sessions(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.sessions_open = !self.sessions_open;
+        if self.sessions_open {
+            self.load_sessions(cx);
+        }
+        cx.notify();
+    }
+
+    fn select_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let backend = self.backend.clone();
+        let project = ProjectId::new(project_id);
+        let reference = tau_client::SessionRef {
+            project_id: project.clone(),
+            session_id: tau_client::SessionId::new(session_id.clone()),
+        };
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let history = backend
+                .session_history(reference)
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let _ = backend
+                .save_active_session(project, session_id.clone())
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let _ = this.update(cx, |view, cx| {
+                if let Some(history) = history {
+                    view.chat.cards.clear();
+                    view.chat.events.clear();
+                    view.chat.session_id = Some(session_id);
+                    for event in history.entries {
+                        view.chat.reduce(ChatAction::SessionEvent(event));
+                    }
+                }
+                view.sessions
+                    .restore_selection(view.chat.session_id.as_deref());
+                view.sessions_open = false;
+                cx.notify();
+            });
+        }));
+    }
+
+    fn rename_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = self.session_query.read(cx).content();
+        let title = if title.trim().is_empty() {
+            "Untitled".into()
+        } else {
+            title
+        };
+        let backend = self.backend.clone();
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let _ = backend
+                .session_rename(tau_client::SessionRename {
+                    project_id: ProjectId::new(project_id),
+                    session_id: tau_client::SessionId::new(session_id),
+                    title,
+                })
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let _ = this.update(cx, |view, cx| {
+                view.load_sessions(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn archive_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_lifecycle(project_id, session_id, false, cx);
+    }
+
+    fn restore_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_lifecycle(project_id, session_id, true, cx);
+    }
+
+    fn session_lifecycle(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        restore: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let backend = self.backend.clone();
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let reference = tau_client::SessionRef {
+                project_id: ProjectId::new(project_id),
+                session_id: tau_client::SessionId::new(session_id),
+            };
+            let result = if restore {
+                backend.session_restore(reference).await
+            } else {
+                backend.session_archive(reference).await
+            };
+            let _ = result.ok().and_then(|task| task.ok());
+            let _ = this.update(cx, |view, cx| {
+                view.load_sessions(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn session_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sessions
+            .set_query(self.session_query.read(cx).content());
+        let rows = self
+            .sessions
+            .visible()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let show_archived = self.sessions.show_archived();
+        div()
+            .id("session-navigator")
+            .p_3()
+            .bg(rgb(0x1b1f27))
+            .border_b_1()
+            .border_color(rgb(0x2c3340))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_sm().child("Sessions · newest first"))
+            .child(self.session_query.clone())
+            .child(toast_button(
+                if show_archived {
+                    "Hide archived"
+                } else {
+                    "Show archived"
+                },
+                0x33445f,
+                cx.listener(|view, _, _, cx| {
+                    view.sessions
+                        .set_show_archived(!view.sessions.show_archived());
+                    view.load_sessions(cx);
+                    cx.notify();
+                }),
+            ))
+            .children(rows.into_iter().enumerate().map(|(index, record)| {
+                let project_id = record.project_id.as_str().to_owned();
+                let session_id = record.id.clone();
+                let title = record.title.clone().unwrap_or_else(|| "Untitled".into());
+                let archived = record.archived;
+                let select_project = project_id.clone();
+                let select_id = session_id.clone();
+                let rename_project = project_id.clone();
+                let rename_id = session_id.clone();
+                let archive_project = project_id.clone();
+                let archive_id = session_id.clone();
+                let lifecycle_button = toast_button(
+                    if archived { "Restore" } else { "Archive" },
+                    if archived { 0x39734a } else { 0x7d3b3b },
+                    cx.listener(move |view, event, window, cx| {
+                        if archived {
+                            view.restore_session(
+                                archive_project.clone(),
+                                archive_id.clone(),
+                                event,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            view.archive_session(
+                                archive_project.clone(),
+                                archive_id.clone(),
+                                event,
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+                );
+                let mut row = div()
+                    .id(("session", index))
+                    .p_2()
+                    .bg(rgb(
+                        if self.sessions.selected() == Some(session_id.as_str()) {
+                            0x293b52
+                        } else {
+                            0x202630
+                        },
+                    ))
+                    .child(format!("{}  {}", title, session_id))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |view, event, window, cx| {
+                            view.select_session(
+                                select_project.clone(),
+                                select_id.clone(),
+                                event,
+                                window,
+                                cx,
+                            )
+                        }),
+                    );
+                row = row.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(toast_button(
+                            "Rename",
+                            0x52627a,
+                            cx.listener(move |view, event, window, cx| {
+                                view.rename_session(
+                                    rename_project.clone(),
+                                    rename_id.clone(),
+                                    event,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        ))
+                        .child(lifecycle_button),
+                );
+                row
+            }))
     }
 
     fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1088,6 +1426,20 @@ impl Render for TauView {
                     .items_center()
                     .gap_2()
                     .child(toast_button(
+                        "New Chat",
+                        0x39734a,
+                        cx.listener(Self::new_chat),
+                    ))
+                    .child(toast_button(
+                        if self.sessions_open {
+                            "Hide sessions"
+                        } else {
+                            "Sessions"
+                        },
+                        0x52627a,
+                        cx.listener(Self::toggle_sessions),
+                    ))
+                    .child(toast_button(
                         if self.sidebar_visible {
                             "Hide sidebar"
                         } else {
@@ -1543,6 +1895,9 @@ impl Render for TauView {
         root = root.on_action(cx.listener(Self::toggle_sidebar));
         root = root.on_action(cx.listener(Self::toggle_follow));
         root.child(header)
+            .when(self.sessions_open, |root| {
+                root.child(self.session_panel(cx))
+            })
             .children(runtime_banner_view)
             .child(
                 div()
@@ -1556,6 +1911,16 @@ impl Render for TauView {
             .when(self.toast_visible, |root| {
                 root.child(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
             })
+    }
+}
+
+fn to_navigator_session(session: tau_client::SessionSummary) -> NavigatorSession {
+    NavigatorSession {
+        id: session.session_id.as_str().to_owned(),
+        project_id: NavigatorProjectId::new(session.project_id.as_str()),
+        title: session.title,
+        updated_at: session.updated_at,
+        archived: session.archived_at.is_some(),
     }
 }
 

@@ -6,6 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
+use tau_client::{
+    ActiveSessionStore, CreateSession, ProjectId, SessionHistory, SessionRef, SessionRename,
+    SessionSummary,
+};
 use tau_proto::prelude::{
     Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
     RequestAction, TurnCancelParams, TurnReplayParams, TurnResponseParams, TurnStartParams,
@@ -209,6 +213,128 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    async fn typed_client(&self) -> Result<tau_client::Client> {
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            *guard = Some(connect_or_start(&self.socket, &self._daemon).await?);
+            guard
+                .as_ref()
+                .unwrap()
+                .negotiate_checked(ProtocolNegotiateParams {
+                    version: ProtocolVersion { major: 1, minor: 0 },
+                    capabilities: vec![],
+                })
+                .await?;
+        }
+        Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Typed session-navigation operations used by the GPUI view.  Keeping
+    /// these behind Backend ensures buttons never mutate the local navigator
+    /// without first asking the daemon.
+    pub fn session_create(
+        &self,
+        project_id: ProjectId,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        let cwd = self.cwd.clone();
+        self.runtime.spawn(async move {
+            let client = backend.typed_client().await?;
+            let summary = client
+                .session_create(CreateSession {
+                    project_id: project_id.clone(),
+                    cwd,
+                })
+                .await?;
+            Ok(summary)
+        })
+    }
+
+    pub fn session_list(
+        &self,
+        project_id: ProjectId,
+        include_archived: bool,
+    ) -> tokio::task::JoinHandle<Result<Vec<SessionSummary>>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            let client = backend.typed_client().await?;
+            client
+                .session_list_with_archived(project_id, include_archived)
+                .await
+        })
+    }
+
+    pub fn session_rename(
+        &self,
+        params: SessionRename,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.session_rename(params).await })
+    }
+
+    pub fn session_archive(
+        &self,
+        params: SessionRef,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.session_archive(params).await })
+    }
+
+    pub fn session_restore(
+        &self,
+        params: SessionRef,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.session_restore(params).await })
+    }
+
+    pub fn session_history(
+        &self,
+        params: SessionRef,
+    ) -> tokio::task::JoinHandle<Result<SessionHistory>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.session_history(params).await })
+    }
+
+    /// The active session is a GUI-local preference; the daemon only owns the
+    /// durable session and its event history.
+    fn active_session_store() -> Result<ActiveSessionStore> {
+        Ok(ActiveSessionStore::new(
+            crate::preferences::path()?.with_file_name("active-session.json"),
+        ))
+    }
+
+    pub fn restore_active_session(
+        &self,
+        project_id: ProjectId,
+    ) -> tokio::task::JoinHandle<Result<Option<SessionSummary>>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            let store = Self::active_session_store()?;
+            let restored = store.restore(&backend.typed_client().await?).await?;
+            Ok(restored.filter(|session| session.project_id.as_str() == project_id.as_str()))
+        })
+    }
+
+    pub fn save_active_session(
+        &self,
+        project_id: ProjectId,
+        session_id: impl Into<String>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let session_id = session_id.into();
+        self.runtime.spawn(async move {
+            let store = Self::active_session_store()?;
+            store.save(&SessionRef {
+                project_id,
+                session_id: tau_client::SessionId::new(session_id),
+            })?;
+            Ok(())
+        })
+    }
     /// Return configured agent identifiers from the daemon's shared config
     /// schema. The current protocol has no catalog/list RPC, so this explicit
     /// typed boundary avoids inferring agents from rendered labels while

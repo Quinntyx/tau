@@ -55,9 +55,33 @@ pub enum Action {
     SwitchServer,
     Reconnect,
     Connected,
+    ToggleSessions,
+    SessionMove(i8),
+    SessionSearch(char),
+    SessionSearchBackspace,
+    SessionSelect,
+    SessionRename(String),
+    SessionArchive,
+    SessionRestore,
+    SessionToggleArchived,
+    NewChat,
 }
 
 pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
+    if s.sessions.open {
+        if k.code == KeyCode::Char('a') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(Action::SessionToggleArchived);
+        }
+        return match k.code {
+            KeyCode::Esc => Some(Action::ToggleSessions),
+            KeyCode::Up => Some(Action::SessionMove(-1)),
+            KeyCode::Down => Some(Action::SessionMove(1)),
+            KeyCode::Enter => Some(Action::SessionSelect),
+            KeyCode::Backspace => Some(Action::SessionSearchBackspace),
+            KeyCode::Char(c) => Some(Action::SessionSearch(c)),
+            _ => None,
+        };
+    }
     if s.permission.is_some() {
         return match k.code {
             KeyCode::Left | KeyCode::Char('h') => {
@@ -101,6 +125,10 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
         };
     }
     match k.code {
+        KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ToggleSessions)
+        }
+        KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::NewChat),
         KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' => {
             Some(Action::Cancel)
         }
@@ -407,6 +435,52 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             s.connection = Connection::Connected;
             s.replaying = false;
         }
+        Action::ToggleSessions => {
+            s.sessions.open = !s.sessions.open;
+            s.sessions.selected = 0;
+        }
+        Action::SessionMove(delta) => s.sessions.select_delta(delta),
+        Action::SessionSearch(c) => {
+            s.sessions.query.push(c);
+            s.sessions.selected = 0;
+        }
+        Action::SessionSearchBackspace => {
+            s.sessions.query.pop();
+            s.sessions.selected = 0;
+        }
+        Action::SessionSelect => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.session_id = Some(id.as_str().to_owned());
+                s.sessions.open = false;
+                s.replaying = true;
+                s.connection = Connection::Reconnecting;
+                return Some("/replay".into());
+            }
+        }
+        Action::SessionRename(title) => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.sessions.rename(&id, title);
+            }
+        }
+        Action::SessionArchive => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.sessions.archive(&id);
+            }
+        }
+        Action::SessionRestore => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.sessions.restore(&id);
+            }
+        }
+        Action::SessionToggleArchived => s.sessions.toggle_archived(),
+        Action::NewChat => {
+            s.session_id = None;
+            s.turn_id = None;
+            s.sequence = 0;
+            s.raw_events.clear();
+            s.transcript = vec!["New chat".into()];
+            s.sessions.open = false;
+        }
     }
     None
 }
@@ -615,5 +689,43 @@ mod tests {
         assert!(!state.replaying);
         apply(&mut state, Action::Connected);
         assert_eq!(state.connection, Connection::Connected);
+    }
+
+    #[test]
+    fn navigator_keyboard_actions_drive_search_selection_and_archive_flow() {
+        use crate::sessions::{ProjectId, SessionEntry, SessionId};
+        use crossterm::event::KeyEvent;
+
+        let mut state = AppState::default();
+        state.sessions.project = Some(ProjectId::new("p"));
+        state.sessions.sessions = vec![
+            SessionEntry {
+                id: SessionId::new("old"),
+                project_id: ProjectId::new("p"),
+                title: "Old".into(),
+                updated_at: 1,
+                archived: false,
+            },
+            SessionEntry {
+                id: SessionId::new("new"),
+                project_id: ProjectId::new("p"),
+                title: "Newest".into(),
+                updated_at: 2,
+                archived: false,
+            },
+        ];
+        apply(&mut state, Action::ToggleSessions);
+        let down = key_action(&state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        apply(&mut state, down);
+        assert_eq!(state.sessions.selected_id().unwrap().as_str(), "old");
+        apply(&mut state, Action::SessionSearch('o'));
+        assert_eq!(state.sessions.selected_id().unwrap().as_str(), "old");
+        apply(&mut state, Action::SessionArchive);
+        assert!(state.sessions.visible().is_empty());
+        apply(&mut state, Action::SessionToggleArchived);
+        apply(&mut state, Action::SessionRestore);
+        assert!(!state.sessions.sessions[0].archived);
+        let esc = key_action(&state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(matches!(esc, Action::ToggleSessions));
     }
 }
