@@ -30,6 +30,37 @@ pub struct OperationsModel {
     pub acknowledgement: Option<bool>,
 }
 
+/// Stable presentation data for the GPUI operations panel. Keeping this
+/// projection window-free makes action/view behavior directly testable while
+/// leaving rendering to the host `TauView`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationsDescription {
+    pub branch: String,
+    pub changes: Vec<(String, bool, bool, bool)>,
+    pub selected_path: Option<String>,
+    pub acknowledgement: Option<bool>,
+}
+
+pub fn describe(model: &OperationsModel) -> OperationsDescription {
+    OperationsDescription {
+        branch: model.branch.clone(),
+        changes: model
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    file.staged,
+                    file.modified,
+                    file.untracked,
+                )
+            })
+            .collect(),
+        selected_path: model.selected.as_ref().map(|file| file.path.clone()),
+        acknowledgement: model.acknowledgement,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationsAction {
     Refresh,
@@ -265,5 +296,28 @@ mod tests {
         assert!(model.is_kept("a.txt", "one"));
         model.invalidate_revision("a.txt", "two");
         assert!(!model.is_kept("a.txt", "one"));
+    }
+
+    #[test]
+    fn description_projects_changes_and_selected_file() {
+        let mut model = OperationsModel::new();
+        model.apply_status(
+            "main".into(),
+            vec![GitFileStatus {
+                path: "tracked.txt".into(),
+                staged: true,
+                modified: true,
+                untracked: false,
+            }],
+        );
+        model.select_file(GitFileResult {
+            path: "tracked.txt".into(),
+            content: "changed".into(),
+            diff: String::new(),
+        });
+        let description = describe(&model);
+        assert_eq!(description.branch, "main");
+        assert_eq!(description.changes[0].0, "tracked.txt");
+        assert_eq!(description.selected_path.as_deref(), Some("tracked.txt"));
     }
 }
