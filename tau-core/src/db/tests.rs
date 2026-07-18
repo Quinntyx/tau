@@ -15,7 +15,8 @@ fn migration_idempotent() {
 #[test]
 fn policy_decisions_round_trip_by_scope_and_replace_idempotently() {
     let db = test_db();
-    let session = db.create_session("/tmp/policy").unwrap();
+    let project = db.create_project("policy", "/tmp/policy").unwrap();
+    let session = db.create_session(&project.id).unwrap();
     let first = db
         .save_policy_decision(Some(&session.id), "session", "human", "read:*", "allow")
         .unwrap();
@@ -45,14 +46,16 @@ fn v1_database_upgrades_forward_to_event_storage() {
         conn.pragma_update(None, "user_version", 1).unwrap();
     }
     let db = Db::open(file.path()).unwrap();
-    let session = db.create_session("/tmp/upgrade").unwrap();
+    let project = db.create_project("upgrade", "/tmp/upgrade").unwrap();
+    let session = db.create_session(&project.id).unwrap();
     assert_eq!(db.replay_events(&session.id, 0, None).unwrap().len(), 0);
 }
 
 #[test]
 fn context_epochs_are_append_only_and_reloaded() {
     let db = test_db();
-    let session = db.create_session("/tmp/project").unwrap();
+    let project = db.create_project("project", "/tmp/project").unwrap();
+    let session = db.create_session(&project.id).unwrap();
     let first = db
         .append_context_epoch(&ContextEpochRecord::new(&session.id, 0, "first", "manual"))
         .unwrap();
@@ -78,7 +81,8 @@ fn context_epochs_are_append_only_and_reloaded() {
 #[test]
 fn epoch_schema_has_restart_metadata_and_duplicate_append_is_atomic() {
     let db = test_db();
-    let session = db.create_session("/tmp/project").unwrap();
+    let project = db.create_project("project", "/tmp/project").unwrap();
+    let session = db.create_session(&project.id).unwrap();
     let columns: Vec<String> = {
         let conn = db.conn.lock().unwrap();
         let mut stmt = conn.prepare("PRAGMA table_info(context_epochs)").unwrap();
@@ -108,8 +112,10 @@ fn epoch_schema_has_restart_metadata_and_duplicate_append_is_atomic() {
 #[test]
 fn session_create_and_get() {
     let db = test_db();
-    let s = db.create_session("/tmp/project").unwrap();
-    assert_eq!(s.cwd, "/tmp/project");
+    let project = db.create_project("project", "/tmp/project").unwrap();
+    let s = db.create_session(&project.id).unwrap();
+    assert_eq!(s.cwd, project.root);
+    assert_eq!(s.project_id, project.id);
     assert!(s.title.is_none());
     assert!(!s.id.is_empty());
 
@@ -121,8 +127,11 @@ fn session_create_and_get() {
 #[test]
 fn session_list() {
     let db = test_db();
-    db.create_session("/a").unwrap();
-    db.create_session("/b").unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let a = db.create_project("a", parent.path().join("a")).unwrap();
+    let b = db.create_project("b", parent.path().join("b")).unwrap();
+    db.create_session(&a.id).unwrap();
+    db.create_session(&b.id).unwrap();
     let sessions = db.list_sessions().unwrap();
     assert_eq!(sessions.len(), 2);
 }
@@ -130,7 +139,8 @@ fn session_list() {
 #[test]
 fn message_append_and_get() {
     let db = test_db();
-    let s = db.create_session("/tmp/proj").unwrap();
+    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let s = db.create_session(&project.id).unwrap();
     let msg = db
         .append_message(&s.id, "user", vec![ContentBlock::text("hello world")])
         .unwrap();
@@ -152,7 +162,8 @@ fn message_append_and_get() {
 #[test]
 fn tool_use_tool_result_round_trip() {
     let db = test_db();
-    let s = db.create_session("/tmp/proj").unwrap();
+    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let s = db.create_session(&project.id).unwrap();
     db.append_message(
         &s.id,
         "assistant",
@@ -200,7 +211,8 @@ fn tool_use_tool_result_round_trip() {
 #[test]
 fn usage_round_trip() {
     let db = test_db();
-    let s = db.create_session("/tmp/proj").unwrap();
+    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let s = db.create_session(&project.id).unwrap();
     let u = db
         .record_usage(&s.id, None, "gpt-4o", 100, 50, Some(20))
         .unwrap();
@@ -213,7 +225,8 @@ fn usage_round_trip() {
 #[test]
 fn qa_record_round_trip() {
     let db = test_db();
-    let s = db.create_session("/tmp/proj").unwrap();
+    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let s = db.create_session(&project.id).unwrap();
     let qa = db.record_qa(&s.id, "which database?", "rusqlite").unwrap();
     assert_eq!(qa.question, "which database?");
     assert_eq!(qa.answer, "rusqlite");
@@ -226,7 +239,8 @@ fn qa_record_round_trip() {
 #[test]
 fn session_updated_on_message_append() {
     let db = test_db();
-    let s = db.create_session("/tmp/proj").unwrap();
+    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let s = db.create_session(&project.id).unwrap();
     let original_updated = s.updated_at;
     std::thread::sleep(std::time::Duration::from_millis(10));
     db.append_message(&s.id, "user", vec![ContentBlock::text("hi")])
@@ -238,7 +252,8 @@ fn session_updated_on_message_append() {
 #[test]
 fn event_journal_sequences_replay_and_idempotency() {
     let db = test_db();
-    let session = db.create_session("/tmp/proj").unwrap();
+    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let session = db.create_session(&project.id).unwrap();
     let event = tau_proto::turn::TurnEvent::TextDelta {
         turn_id: "t".into(),
         text: "hello".into(),
@@ -274,7 +289,8 @@ fn event_journal_sequences_replay_and_idempotency() {
 #[test]
 fn artifact_reference_round_trip() {
     let db = test_db();
-    let session = db.create_session("/tmp/proj").unwrap();
+    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let session = db.create_session(&project.id).unwrap();
     let reference = tau_proto::turn::ArtifactReference {
         artifact_id: "a".into(),
         media_type: "text/plain".into(),
@@ -289,4 +305,84 @@ fn artifact_reference_round_trip() {
             .artifact_id,
         "a"
     );
+}
+
+#[test]
+fn project_registry_enforces_canonical_active_roots_and_lifecycle() {
+    let db = test_db();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("created-once");
+    let first = db.create_project("First", &root).unwrap();
+    assert!(root.is_dir());
+    assert_eq!(
+        first.root,
+        std::fs::canonicalize(&root).unwrap().to_string_lossy()
+    );
+    assert!(db.create_project("duplicate", &root).is_err());
+
+    let session = db.create_session(&first.id).unwrap();
+    db.unregister_project(&first.id).unwrap();
+    assert!(db.create_session(&first.id).is_err());
+    let second = db.new_project_id(&first.id).unwrap();
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.root, second.root);
+    assert!(db.reactivate_project(&first.id).is_err());
+    assert_eq!(
+        db.get_session(&session.id).unwrap().unwrap().project_id,
+        first.id
+    );
+    assert_eq!(db.list_projects(true).unwrap().len(), 2);
+}
+
+#[test]
+fn project_paths_only_create_one_missing_final_directory() {
+    let db = test_db();
+    let parent = tempfile::tempdir().unwrap();
+    let too_deep = parent.path().join("missing").join("child");
+    assert!(db.create_project("deep", too_deep).is_err());
+
+    let existing_file = parent.path().join("file");
+    std::fs::write(&existing_file, "not a directory").unwrap();
+    assert!(db.create_project("file", existing_file).is_err());
+}
+
+#[test]
+fn v6_session_data_is_rebuilt_with_mandatory_active_project_fk() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    {
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        for migration in [
+            include_str!("sql/v1.sql"),
+            include_str!("sql/v2.sql"),
+            include_str!("sql/v3.sql"),
+            include_str!("sql/v4.sql"),
+            include_str!("sql/v5.sql"),
+            include_str!("sql/v6.sql"),
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO projects (id,name,root,active,created_at,updated_at) VALUES ('p','p','/tmp',1,1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id,project_id,cwd,created_at,updated_at) VALUES ('valid','p','/tmp',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id,project_id,cwd,created_at,updated_at) VALUES ('orphan',NULL,'/tmp',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+    }
+
+    let db = Db::open(file.path()).unwrap();
+    let sessions = db.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "valid");
+    assert_eq!(sessions[0].project_id, "p");
+    assert!(db.create_session("missing").is_err());
 }

@@ -63,6 +63,7 @@ pub enum DaemonStatus {
 pub struct TurnRequest {
     pub prompt: String,
     pub session_id: Option<String>,
+    pub project_id: String,
     pub model: Option<String>,
     pub agent: Option<String>,
 }
@@ -88,8 +89,12 @@ impl TurnRequest {
         }
     }
 
-    pub fn into_params(self, cwd: String, default_model: String) -> TurnStartParams {
-        TurnStartParams {
+    pub fn into_params(self, cwd: String, default_model: String) -> Result<TurnStartParams> {
+        if self.project_id.trim().is_empty() {
+            anyhow::bail!("cannot start turn: select an active project first")
+        }
+        Ok(TurnStartParams {
+            project_id: self.project_id,
             model: self.model.unwrap_or(default_model),
             prompt: self.prompt,
             session_id: self.session_id,
@@ -104,7 +109,7 @@ impl TurnRequest {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_nanos())
             )),
-        }
+        })
     }
 }
 
@@ -448,6 +453,15 @@ impl Backend {
         self.turn_with_options(prompt, session_id, agent, None)
     }
 
+    pub fn turn_with_project(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        project_id: String,
+    ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
+        self.turn_with_project_options(prompt, session_id, None, None, Some(project_id))
+    }
+
     pub fn turn_with_options(
         &self,
         prompt: String,
@@ -455,7 +469,30 @@ impl Backend {
         agent: Option<String>,
         model: Option<String>,
     ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
+        self.turn_with_project_options(prompt, session_id, agent, model, None)
+    }
+
+    /// Start a turn for an explicitly selected active project.
+    pub fn turn_with_project_options(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        agent: Option<String>,
+        model: Option<String>,
+        project_id: Option<String>,
+    ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
         let (sender, receiver) = mpsc::unbounded_channel();
+        if project_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            let _ = sender.send(Err(
+                "cannot start turn: select an active project first".to_string()
+            ));
+            return receiver;
+        }
         let socket = self.socket.clone();
         let cwd = self.cwd.clone();
         let model = model.unwrap_or_else(|| self.model.clone());
@@ -535,10 +572,11 @@ impl Backend {
                 let params = TurnRequest {
                     prompt,
                     session_id,
+                    project_id: project_id.expect("validated project selection"),
                     model: Some(model),
                     agent,
                 }
-                .into_params(cwd, String::new());
+                .into_params(cwd, String::new())?;
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
@@ -883,10 +921,13 @@ mod tests {
     #[test]
     fn picker_actions_build_typed_turn_values() {
         let mut request = TurnRequest::new("hello".into(), Some("session-1".into()));
+        request.project_id = "project-1".into();
         request.apply(PickerAction::SelectModel("provider/model".into()));
         request.apply(PickerAction::SelectAgent("build".into()));
 
-        let params = request.into_params("/tmp/project".into(), "fallback/model".into());
+        let params = request
+            .into_params("/tmp/project".into(), "fallback/model".into())
+            .unwrap();
         assert_eq!(params.model, "provider/model");
         assert_eq!(params.agent.as_deref(), Some("build"));
         assert_eq!(params.prompt, "hello");
@@ -897,10 +938,22 @@ mod tests {
 
     #[test]
     fn turn_request_uses_default_model_without_label_parsing() {
-        let params = TurnRequest::new("hello".into(), None)
-            .into_params("/tmp".into(), "default/model".into());
+        let mut request = TurnRequest::new("hello".into(), None);
+        request.project_id = "project-1".into();
+        let params = request
+            .into_params("/tmp".into(), "default/model".into())
+            .unwrap();
         assert_eq!(params.model, "default/model");
         assert_eq!(params.agent, None);
+        assert_eq!(params.project_id, "project-1");
+    }
+
+    #[test]
+    fn turn_request_rejects_missing_project_selection() {
+        let error = TurnRequest::new("hello".into(), None)
+            .into_params("/tmp".into(), "default/model".into())
+            .unwrap_err();
+        assert!(error.to_string().contains("select an active project"));
     }
 
     #[test]

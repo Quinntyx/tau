@@ -19,6 +19,7 @@ fn typed_turn_start_is_distinct_from_legacy_completion_stream() {
     assert_ne!(METHOD_TURN_START, METHOD_COMPLETION_STREAM);
 
     let params = TurnStartParams {
+        project_id: "project-test".into(),
         model: "mock/model".into(),
         prompt: "deterministic prompt".into(),
         session_id: None,

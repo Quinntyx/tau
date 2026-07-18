@@ -98,13 +98,13 @@ pub async fn complete(
     prompt: String,
     tx: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<()> {
+    let Some(_) = s.project_id.as_deref() else {
+        anyhow::bail!("cannot start turn: select an active project first");
+    };
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let params = reducer::params(s, prompt, Some(cwd))?;
     s.transcript.push("tau: ".into());
     s.assistant_index = Some(s.transcript.len() - 1);
-    let params = reducer::params(
-        s,
-        prompt,
-        Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-    );
     tokio::spawn(turn_task(client.clone(), params, tx));
     Ok(())
 }

@@ -348,11 +348,12 @@ fn stale_or_missing_daemon_is_reported_through_typed_turn_stream() {
             .expect("clock")
             .as_nanos()
     )));
-    let mut stream = backend.turn_with_options(
+    let mut stream = backend.turn_with_project_options(
         "negotiate stale daemon".into(),
         None,
         Some("Code".into()),
         Some("acceptance/model".into()),
+        Some("project-acceptance".into()),
     );
     let result = runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(2), stream.recv())
@@ -383,11 +384,12 @@ fn scripted_daemon_covers_submit_stream_interaction_and_completion() {
         "/tmp/gui-functional-acceptance".into(),
         "acceptance/model".into(),
     );
-    let mut stream = backend.turn_with_options(
+    let mut stream = backend.turn_with_project_options(
         "hello".into(),
         None,
         Some("Code".into()),
         Some("acceptance/model".into()),
+        Some("project-acceptance".into()),
     );
     let events = runtime.block_on(async {
         let mut events = Vec::new();
@@ -435,7 +437,7 @@ fn scripted_daemon_replies_and_replay_use_typed_rpc_requests() {
         "/tmp/gui-functional-acceptance".into(),
         "acceptance/model".into(),
     );
-    let mut stream = backend.turn("hello".into(), None);
+    let mut stream = backend.turn_with_project("hello".into(), None, "project-acceptance".into());
     runtime.block_on(async {
         while let Some(item) = stream.recv().await {
             if matches!(item, Ok(TurnStreamEvent::Complete(_)) | Err(_)) {
@@ -603,7 +605,10 @@ fn model_and_agent_pickers_are_wired_to_typed_options() {
     let mut request = TurnRequest::new("hello".into(), Some("session-1".into()));
     request.apply(PickerAction::SelectAgent("Code".into()));
     request.apply(PickerAction::SelectModel("claude".into()));
-    let request = request.into_params("/tmp".into(), "fallback".into());
+    request.project_id = "project-acceptance".into();
+    let request = request
+        .into_params("/tmp".into(), "fallback".into())
+        .unwrap();
     assert_eq!(request.agent.as_deref(), Some("Code"));
     assert_eq!(request.model, "claude");
 }
@@ -619,7 +624,7 @@ fn scripted_daemon_cancel_is_a_real_typed_state_transition() {
         "/tmp/gui-functional-acceptance".into(),
         "acceptance/model".into(),
     );
-    let mut stream = backend.turn("hold".into(), None);
+    let mut stream = backend.turn_with_project("hold".into(), None, "project-acceptance".into());
     let started = runtime
         .block_on(async { tokio::time::timeout(Duration::from_secs(2), stream.recv()).await })
         .expect("started timeout")
@@ -648,7 +653,8 @@ fn scripted_daemon_negotiation_rejects_incompatible_and_stale_servers() {
             "/tmp/gui-functional-acceptance".into(),
             "acceptance/model".into(),
         );
-        let mut stream = backend.turn("negotiate".into(), None);
+        let mut stream =
+            backend.turn_with_project("negotiate".into(), None, "project-acceptance".into());
         let result = runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), stream.recv()).await });
         assert!(result.is_ok(), "stale/incompatible server must answer");
