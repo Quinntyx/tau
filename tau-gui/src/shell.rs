@@ -46,6 +46,35 @@ pub enum ShellAction {
     SelectProject(String),
 }
 
+/// The typed boundary used by the shell's production controls.  Keeping this
+/// separate from GPUI events means the service can be replaced by a daemon,
+/// an in-process registry, or a test double without changing the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectServiceAction {
+    Create {
+        name: String,
+        root: PathBuf,
+    },
+    Select(String),
+    Update {
+        id: String,
+        name: String,
+        root: PathBuf,
+    },
+    Unregister(String),
+    Reactivate(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InactiveProjectChoice {
+    Reactivate,
+    CreateNew,
+}
+
+pub trait ProjectServiceAdapter {
+    fn dispatch(&mut self, action: ProjectServiceAction);
+}
+
 pub fn layout_for_width(width: f32) -> ShellLayout {
     if width < 640.0 {
         ShellLayout::ContentOnly
@@ -70,6 +99,7 @@ pub struct ProjectShell {
     pub selected: Option<String>,
     pub projects_visible: bool,
     pub last_action: Option<ShellAction>,
+    pub last_service_action: Option<ProjectServiceAction>,
 }
 
 impl ProjectShell {
@@ -79,6 +109,7 @@ impl ProjectShell {
             selected: None,
             projects_visible: true,
             last_action: None,
+            last_service_action: None,
         }
     }
 
@@ -86,6 +117,62 @@ impl ProjectShell {
         let id = id.into();
         self.selected = Some(id.clone());
         self.last_action = Some(ShellAction::SelectProject(id));
+        self.last_service_action = self.selected.clone().map(ProjectServiceAction::Select);
+    }
+
+    pub fn dispatch_project_action(&mut self, action: ProjectServiceAction) {
+        if let ProjectServiceAction::Select(id) = &action {
+            self.select(id.clone());
+        }
+        self.last_service_action = Some(action);
+    }
+
+    pub fn dispatch_to<A: ProjectServiceAdapter>(
+        &mut self,
+        adapter: &mut A,
+        action: ProjectServiceAction,
+    ) {
+        adapter.dispatch(action.clone());
+        self.dispatch_project_action(action);
+    }
+
+    pub fn create_project(&mut self, name: impl Into<String>, root: PathBuf) {
+        self.dispatch_project_action(ProjectServiceAction::Create {
+            name: name.into(),
+            root,
+        });
+    }
+
+    pub fn update_project(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        root: PathBuf,
+    ) {
+        self.dispatch_project_action(ProjectServiceAction::Update {
+            id: id.into(),
+            name: name.into(),
+            root,
+        });
+    }
+
+    pub fn unregister_project(&mut self, id: impl Into<String>) {
+        self.dispatch_project_action(ProjectServiceAction::Unregister(id.into()));
+    }
+
+    pub fn register_inactive(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        root: PathBuf,
+        choice: InactiveProjectChoice,
+    ) {
+        match choice {
+            InactiveProjectChoice::Reactivate => {
+                self.dispatch_project_action(ProjectServiceAction::Reactivate(id.into()))
+            }
+            InactiveProjectChoice::CreateNew => self.create_project(name, root),
+        }
     }
 
     pub fn apply_project_action(&mut self, action: ProjectAction) {
@@ -93,11 +180,27 @@ impl ProjectShell {
             self.selected = Some(id.clone());
         }
         self.last_action = Some(match action {
-            ProjectAction::Select(id) => ShellAction::SelectProject(id),
+            ProjectAction::Select(id) => {
+                self.last_service_action = Some(ProjectServiceAction::Select(id.clone()));
+                ShellAction::SelectProject(id)
+            }
             ProjectAction::Create { .. }
             | ProjectAction::Update { .. }
             | ProjectAction::Unregister(_)
-            | ProjectAction::Reactivate(_) => ShellAction::ToggleProjects,
+            | ProjectAction::Reactivate(_) => {
+                self.last_service_action = Some(match action {
+                    ProjectAction::Create { name, root } => {
+                        ProjectServiceAction::Create { name, root }
+                    }
+                    ProjectAction::Update { id, name, root } => {
+                        ProjectServiceAction::Update { id, name, root }
+                    }
+                    ProjectAction::Unregister(id) => ProjectServiceAction::Unregister(id),
+                    ProjectAction::Reactivate(id) => ProjectServiceAction::Reactivate(id),
+                    ProjectAction::Select(_) => unreachable!(),
+                });
+                ShellAction::ToggleProjects
+            }
         });
     }
 
@@ -224,5 +327,48 @@ mod tests {
             shell.last_action,
             Some(ShellAction::SelectProject("demo".into()))
         );
+    }
+
+    #[test]
+    fn service_controls_reach_typed_actions() {
+        let mut shell = ProjectShell::new(ProjectState::Ready(Vec::new()));
+        shell.create_project("demo", PathBuf::from("/tmp/demo"));
+        assert_eq!(
+            shell.last_service_action,
+            Some(ProjectServiceAction::Create {
+                name: "demo".into(),
+                root: PathBuf::from("/tmp/demo")
+            })
+        );
+        shell.update_project("demo", "renamed", PathBuf::from("/tmp/new"));
+        assert!(matches!(
+            shell.last_service_action,
+            Some(ProjectServiceAction::Update { .. })
+        ));
+        shell.unregister_project("demo");
+        assert_eq!(
+            shell.last_service_action,
+            Some(ProjectServiceAction::Unregister("demo".into()))
+        );
+        shell.register_inactive(
+            "old",
+            "old",
+            PathBuf::from("/tmp/old"),
+            InactiveProjectChoice::Reactivate,
+        );
+        assert_eq!(
+            shell.last_service_action,
+            Some(ProjectServiceAction::Reactivate("old".into()))
+        );
+        shell.register_inactive(
+            "old",
+            "new",
+            PathBuf::from("/tmp/new"),
+            InactiveProjectChoice::CreateNew,
+        );
+        assert!(matches!(
+            shell.last_service_action,
+            Some(ProjectServiceAction::Create { .. })
+        ));
     }
 }

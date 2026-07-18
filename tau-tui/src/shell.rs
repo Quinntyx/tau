@@ -2,7 +2,7 @@
 //! reducer remains the source of truth and this widget only projects it.
 use crate::{
     projects::{ProjectState, ProjectStatus},
-    state::{AppState, Connection},
+    state::{AppState, Connection, ToolStatus},
 };
 use ratatui::{
     Frame,
@@ -164,6 +164,35 @@ fn content_panel<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) ->
                 .iter()
                 .map(|line| Line::from(line.as_str())),
         );
+    }
+    for tool in &state.tools {
+        let status = match tool.status {
+            ToolStatus::Running => "…",
+            ToolStatus::Complete => "✓",
+            ToolStatus::Failed => "!",
+            ToolStatus::Denied => "×",
+            ToolStatus::Cancelled => "−",
+        };
+        lines.push(Line::from(format!(
+            "{status} {} — {}",
+            tool.name,
+            tool.result.lines().next().unwrap_or("")
+        )));
+        if tool.expanded {
+            lines.push(Line::from(format!("  input: {}", tool.input)));
+            lines.push(Line::from(format!("  output: {}", tool.result)));
+        }
+    }
+    if !state.hunks.is_empty() {
+        lines.push(Line::from(format!(
+            "DIFF REVIEW hunk {}/{}",
+            state.hunk_index + 1,
+            state.hunks.len()
+        )));
+        if let Some(hunk) = state.hunks.get(state.hunk_index) {
+            lines.push(Line::from(hunk.header.as_str()));
+            lines.extend(hunk.lines.iter().map(|line| Line::from(line.as_str())));
+        }
     }
     if let Some(projects) = projects {
         let project_line = projects

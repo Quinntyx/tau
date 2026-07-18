@@ -1,14 +1,32 @@
 //! Small composable widgets. Keeping these pure makes ratatui snapshots cheap.
-use crate::{reducer::filtered_models, state::*};
+use crate::{projects::ProjectState, reducer::filtered_models, shell, state::*};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
 pub fn render(frame: &mut Frame, s: &AppState) {
+    render_inner(frame, s, None);
+}
+
+/// Production render path with the client-local typed project projection.
+/// The legacy `render` wrapper remains useful for callers that only have chat
+/// state and intentionally displays the shell's loading projection.
+pub fn render_with_projects(frame: &mut Frame, s: &AppState, projects: &ProjectState) {
+    render_inner(frame, s, Some(projects));
+}
+
+fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>) {
+    if let Some(projects) = projects {
+        shell::render_with_projects(frame, s, projects);
+    } else {
+        shell::render(frame, s);
+    }
+    let content = shell::content_area(frame.area());
+    /*
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(5)])
@@ -50,7 +68,15 @@ pub fn render(frame: &mut Frame, s: &AppState) {
     let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
     let line = s.input[..s.cursor].matches('\n').count() as u16;
     let column = s.input[line_start..s.cursor].chars().count() as u16;
-    frame.set_cursor_position((root[1].x + 1 + column, root[1].y + 2 + line));
+    */
+    // Keep the terminal cursor at the UTF-8 byte cursor's visual column.
+    let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
+    let line = s.input[..s.cursor].matches('\n').count() as u16;
+    let column = s.input[line_start..s.cursor].chars().count() as u16;
+    frame.set_cursor_position((
+        content.x + 3 + column,
+        content.y + content.height.saturating_sub(2) + line,
+    ));
     if s.picker != Picker::None {
         picker(frame, s);
     }
@@ -144,50 +170,6 @@ fn question_modal(frame: &mut Frame, question: &Question) {
     );
 }
 
-fn format_tool(t: &ToolCard) -> String {
-    let status = match t.status {
-        ToolStatus::Running => "…",
-        ToolStatus::Complete => "✓",
-        ToolStatus::Failed => "!",
-        ToolStatus::Denied => "×",
-        ToolStatus::Cancelled => "−",
-    };
-    if t.expanded {
-        format!(
-            "{status} {}\n  input: {}\n  output: {}",
-            t.name, t.input, t.result
-        )
-    } else {
-        format!(
-            "{status} {} — {}",
-            t.name,
-            t.result.lines().next().unwrap_or("")
-        )
-    }
-}
-
-fn format_diff(s: &AppState) -> String {
-    let mut out = format!(
-        "DIFF REVIEW  hunk {}/{}  [Enter] accept [Backspace] reject [u/U] undo/redo [Ctrl-A] file\n",
-        s.hunk_index + 1,
-        s.hunks.len()
-    );
-    if let Some(h) = s.hunks.get(s.hunk_index) {
-        out.push_str(&format!("{}\n", h.header));
-        for line in &h.lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str("--- split ---\n");
-        for line in &h.before {
-            out.push_str(&format!("< {line}\n"));
-        }
-        for line in &h.after {
-            out.push_str(&format!("> {line}\n"));
-        }
-    }
-    out
-}
 pub fn tool_card(frame: &mut Frame, area: Rect, t: &ToolCard) {
     let status = match t.status {
         ToolStatus::Running => "…",
@@ -224,6 +206,7 @@ fn center(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projects::ProjectAction;
     use ratatui::{Terminal, backend::TestBackend};
     #[test]
     fn model_picker_snapshot_contains_favorite() {
@@ -231,7 +214,7 @@ mod tests {
             picker: Picker::Models,
             ..AppState::default()
         };
-        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
         t.draw(|f| render(f, &s)).unwrap();
         let x = t
             .backend()
@@ -240,6 +223,56 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
+        assert!(x.contains("Projects") && x.contains("Conversation"));
         assert!(x.contains("Select model") && x.contains("gpt-4o"));
+    }
+
+    #[test]
+    fn production_render_keeps_prompt_overlay_and_cursor() {
+        let s = AppState {
+            input: "hello".into(),
+            cursor: 5,
+            permission: Some(Permission {
+                tool: "shell".into(),
+                summary: "run command".into(),
+                choice: PermissionChoice::AllowOnce,
+                stage: PermissionStage::Choose,
+            }),
+            ..AppState::default()
+        };
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| render(f, &s)).unwrap();
+        let x = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(x.contains("Projects") && x.contains("Conversation"));
+        assert!(x.contains("Permission required") && x.contains("run command"));
+        assert_eq!(t.get_cursor_position().unwrap(), (37, 28).into());
+    }
+
+    #[test]
+    fn production_project_render_uses_typed_selection() {
+        let mut projects = ProjectState::default();
+        projects
+            .apply(ProjectAction::Register {
+                name: "demo".into(),
+                root: "/tmp/demo".into(),
+            })
+            .unwrap();
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        t.draw(|f| render_with_projects(f, &AppState::default(), &projects))
+            .unwrap();
+        let x = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(x.contains("demo") && x.contains("Selected project"));
     }
 }

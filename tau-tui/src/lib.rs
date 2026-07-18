@@ -7,6 +7,7 @@ pub mod reducer;
 pub mod shell;
 pub mod state;
 
+use crate::projects::{ProjectAction, ProjectState};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -79,6 +80,11 @@ async fn session(
     socket: PathBuf,
 ) -> Result<()> {
     let mut state = AppState::default();
+    // Projects are a client-local projection.  Keep their lifecycle entirely
+    // on this side of the daemon adapter: turns continue to use AppState and
+    // no project wire protocol is implied by the shell.
+    let mut projects = ProjectState::default();
+    initialize_projects(&mut projects);
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut event_task = tokio::spawn(adapter::persistent_events(
         client.clone(),
@@ -102,7 +108,7 @@ async fn session(
         }
     });
     loop {
-        terminal.draw(|frame| components::render(frame, &state))?;
+        terminal.draw(|frame| components::render_with_projects(frame, &state, &projects))?;
         tokio::select! {
             Some(input) = input_rx.recv() => {
                 let action = match input {
@@ -218,6 +224,35 @@ async fn session(
     Ok(())
 }
 
+/// Seed and restore the local project projection for a new client session.
+/// The working directory is deliberately only a UI-local registration; it is
+/// not sent to the daemon as a protocol request.
+fn initialize_projects(projects: &mut ProjectState) {
+    if let Ok(root) = std::env::current_dir() {
+        let root = root.to_string_lossy().into_owned();
+        let name = root
+            .rsplit(std::path::MAIN_SEPARATOR)
+            .find(|part| !part.is_empty())
+            .unwrap_or("project")
+            .to_owned();
+        let _ = apply_project_action(projects, ProjectAction::Register { name, root });
+    }
+    let saved = projects.selected.clone();
+    projects.restore_active(saved.as_ref());
+}
+
+/// Narrow adapter seam for project intents.  Project actions remain typed and
+/// client-local until a future adapter explicitly gains server support.
+/// Dispatch a typed project intent through the client-local adapter seam.
+/// S1 can replace this function's implementation with acknowledged service
+/// calls without changing the Ratatui shell or reducer.
+pub fn apply_project_action(
+    projects: &mut ProjectState,
+    action: ProjectAction,
+) -> Result<(), projects::ProjectError> {
+    projects.apply(action)
+}
+
 fn permission_choice(choice: state::PermissionChoice) -> TurnPermissionChoice {
     match choice {
         state::PermissionChoice::AllowOnce => TurnPermissionChoice::AllowOnce,
@@ -235,7 +270,9 @@ mod tests {
     #[test]
     fn initial_buffer_has_client_chrome() {
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| components::render(f, &AppState::default()))
+        let mut projects = ProjectState::default();
+        initialize_projects(&mut projects);
+        t.draw(|f| shell::render_with_projects(f, &AppState::default(), &projects))
             .unwrap();
         let text: String = t
             .backend()
@@ -244,6 +281,6 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("tau") && text.contains("prompt"));
+        assert!(text.contains("tau") && text.contains("Conversation"));
     }
 }
