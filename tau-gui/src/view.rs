@@ -36,28 +36,13 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-#[derive(Clone, Copy)]
-enum AgentMode {
-    Plan,
-    Code,
-}
-
-impl AgentMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Plan => "Plan",
-            Self::Code => "Code",
-        }
-    }
-}
-
 pub struct TauView {
     input: Entity<TextInput>,
     picker_input: Entity<TextInput>,
     backend: Backend,
     chat: ChatState,
     task: Option<Task<()>>,
-    agent: AgentMode,
+    agent: String,
     toast_visible: bool,
     model_index: usize,
     models: Vec<String>,
@@ -84,47 +69,43 @@ impl TauView {
             .ok()
             .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
             .unwrap_or_default();
-        let models: Vec<String> = preferences
+        // Preferences annotate the catalog; they are not the catalog.  Always
+        // retain the configured backend model and every configured preference
+        // entry so a recent/favorite flag cannot hide otherwise valid models.
+        let mut models = vec![backend.model().to_owned()];
+        for model in preferences
             .favorites
             .iter()
             .chain(preferences.recent_models.iter())
-            .cloned()
-            .collect();
+            .chain(preferences.selected_model.iter())
+        {
+            if !models.iter().any(|candidate| candidate == model) {
+                models.push(model.clone());
+            }
+        }
         let selected_model = preferences.selected_model.clone();
         let selected_agent = preferences.selected_agent.clone();
         let default_model = backend.model().to_owned();
         let models = models;
+        let model_index = selected_model
+            .as_ref()
+            .and_then(|model| models.iter().position(|candidate| candidate == model))
+            .unwrap_or(0);
+        let agent = selected_agent.unwrap_or_default();
         Self {
             input,
             picker_input,
             backend,
             chat: ChatState::default(),
             task: None,
-            agent: if selected_agent.as_deref() == Some("Plan") {
-                AgentMode::Plan
-            } else {
-                AgentMode::Code
-            },
+            agent: agent.clone(),
             toast_visible,
-            model_index: 0,
-            models: if models.is_empty() {
-                vec![selected_model.unwrap_or(default_model)]
-            } else {
-                models
-            },
+            model_index,
+            models: if models.is_empty() { vec![selected_model.unwrap_or(default_model)] } else { models },
             sidebar_visible: preferences.sidebar,
             picker: None,
             picker_index: 0,
-            agents: vec![
-                AgentOption {
-                    name: "Plan".into(),
-                    in_tab_cycle: true,
-                },
-                AgentOption {
-                    name: "Code".into(),
-                    in_tab_cycle: true,
-                },
-            ],
+            agents: if agent.is_empty() { Vec::new() } else { vec![AgentOption { name: agent, in_tab_cycle: true }] },
             preferences,
         }
     }
@@ -138,8 +119,7 @@ impl TauView {
     }
 
     fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
-        let current = self.agent.label();
-        if let Some(next) = next_agent(&self.agents, Some(current), false) {
+        if let Some(next) = next_agent(&self.agents, Some(&self.agent), false) {
             self.select_agent(next);
         }
         self.chat.status = ChatStatus::Ready;
@@ -385,7 +365,7 @@ impl TauView {
         let receiver = self.backend.turn_with_options(
             prompt,
             self.chat.session_id.clone(),
-            Some(self.agent.label().into()),
+                    (!self.agent.is_empty()).then(|| self.agent.clone()),
             selected_model,
         );
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -415,11 +395,7 @@ impl TauView {
     }
 
     fn select_agent(&mut self, agent: String) {
-        self.agent = if agent.eq_ignore_ascii_case("plan") {
-            AgentMode::Plan
-        } else {
-            AgentMode::Code
-        };
+        self.agent = agent.clone();
         self.preferences.selected_agent = Some(agent);
         if let Some(selected) = self.preferences.selected_agent.clone() {
             let _ = self.backend.select_agent(selected);
@@ -830,7 +806,7 @@ impl Render for TauView {
                 div()
                     .cursor_pointer()
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::click_agent))
-                    .child(sidebar_card("AGENT", self.agent.label())),
+                .child(sidebar_card("AGENT", &self.agent)),
             )
             .child(sidebar_card(
                 "PLAN",
