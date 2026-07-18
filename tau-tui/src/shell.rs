@@ -1,6 +1,9 @@
 //! Responsive project shell.  This module is intentionally stateless: the
 //! reducer remains the source of truth and this widget only projects it.
-use crate::state::{AppState, Connection};
+use crate::{
+    projects::{ProjectState, ProjectStatus},
+    state::{AppState, Connection},
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -13,11 +16,22 @@ const ACCENT: Color = Color::Cyan;
 
 /// Draw the shell, collapsing side regions as the terminal gets narrower.
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
+    render_inner(frame, state, None);
+}
+
+/// Draw the shell using the typed project projection.  The optional project
+/// argument keeps the existing chat runtime source-compatible while giving S1
+/// a narrow seam for replacing the local projection with acknowledged data.
+pub fn render_with_projects(frame: &mut Frame<'_>, state: &AppState, projects: &ProjectState) {
+    render_inner(frame, state, Some(projects));
+}
+
+fn render_inner(frame: &mut Frame<'_>, state: &AppState, projects: Option<&ProjectState>) {
     let area = frame.area();
     let top = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
     frame.render_widget(top_bar(state), top[0]);
 
-    let (rail, projects, content) = if area.width < 60 {
+    let (rail, projects_width, content) = if area.width < 60 {
         (
             Constraint::Length(0),
             Constraint::Length(0),
@@ -36,14 +50,14 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             Constraint::Min(1),
         )
     };
-    let columns = Layout::horizontal([rail, projects, content]).split(top[1]);
+    let columns = Layout::horizontal([rail, projects_width, content]).split(top[1]);
     if columns[0].width > 0 {
         frame.render_widget(icon_rail(), columns[0]);
     }
     if columns[1].width > 0 {
-        frame.render_widget(project_list(state), columns[1]);
+        frame.render_widget(project_list(state, projects), columns[1]);
     }
-    frame.render_widget(content_panel(state), columns[2]);
+    frame.render_widget(content_panel(state, projects), columns[2]);
 }
 
 fn top_bar(state: &AppState) -> impl Widget + '_ {
@@ -81,24 +95,44 @@ fn icon_rail() -> impl Widget {
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
 }
 
-fn project_list(state: &AppState) -> impl Widget + '_ {
+fn project_list<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) -> impl Widget + 'a {
     let mut items = vec![ListItem::new(Span::styled(
         "PROJECTS",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
-    if state.servers.is_empty() {
-        items.push(ListItem::new(Span::styled(
+    match projects {
+        Some(projects) if projects.projects.is_empty() => items.push(ListItem::new(Span::styled(
+            "No projects yet",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Some(projects) => {
+            for (id, project) in &projects.projects {
+                let marker = if projects.selected.as_ref() == Some(id) {
+                    "› "
+                } else {
+                    "  "
+                };
+                let inactive = if project.status == ProjectStatus::Inactive {
+                    " (inactive)"
+                } else {
+                    ""
+                };
+                items.push(ListItem::new(format!("{marker}{}{inactive}", project.name)));
+            }
+        }
+        None if state.servers.is_empty() => items.push(ListItem::new(Span::styled(
             "Loading projects…",
             Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for (index, project) in state.servers.iter().enumerate() {
-            let marker = if index == state.server_index {
-                "› "
-            } else {
-                "  "
-            };
-            items.push(ListItem::new(format!("{marker}{project}")));
+        ))),
+        None => {
+            for (index, project) in state.servers.iter().enumerate() {
+                let marker = if index == state.server_index {
+                    "› "
+                } else {
+                    "  "
+                };
+                items.push(ListItem::new(format!("{marker}{project}")));
+            }
         }
     }
     items.push(ListItem::new(""));
@@ -109,7 +143,7 @@ fn project_list(state: &AppState) -> impl Widget + '_ {
     List::new(items).block(Block::default().borders(Borders::RIGHT).title(" Projects "))
 }
 
-fn content_panel(state: &AppState) -> impl Widget + '_ {
+fn content_panel<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) -> impl Widget + 'a {
     let mut lines = Vec::new();
     if state.connection == Connection::Disconnected {
         lines.push(Line::from(Span::styled(
@@ -130,6 +164,15 @@ fn content_panel(state: &AppState) -> impl Widget + '_ {
                 .iter()
                 .map(|line| Line::from(line.as_str())),
         );
+    }
+    if let Some(projects) = projects {
+        let project_line = projects
+            .selected
+            .as_ref()
+            .and_then(|id| projects.projects.get(id))
+            .map(|project| format!("Selected project: {}", project.name))
+            .unwrap_or_else(|| "Select a project to begin".to_owned());
+        lines.push(Line::from(project_line));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -200,5 +243,29 @@ mod tests {
             ..AppState::default()
         };
         assert!(text(80, 20, &s).contains("Unable to connect"));
+    }
+
+    #[test]
+    fn typed_project_projection_renders_selected_project() {
+        let mut projects = ProjectState::default();
+        projects
+            .apply(crate::projects::ProjectAction::Register {
+                name: "demo".into(),
+                root: "/tmp/demo".into(),
+            })
+            .unwrap();
+        let state = AppState::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| render_with_projects(frame, &state, &projects))
+            .unwrap();
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(output.contains("demo") && output.contains("Selected project"));
     }
 }
