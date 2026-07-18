@@ -1,6 +1,6 @@
 use gpui::{
-    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, Task, Window,
-    div, prelude::*, px, rgb,
+    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render,
+    StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb,
 };
 use tau_client::TurnStreamEvent;
 
@@ -181,6 +181,7 @@ impl TauView {
         self.chat.active_assistant = None;
         self.chat.status = ChatStatus::Ready;
         self.task = None;
+        self.input.update(cx, |input, _| input.set_disabled(false));
         cx.notify();
     }
 
@@ -192,7 +193,11 @@ impl TauView {
         if prompt.trim().is_empty() {
             return;
         }
-        self.input.update(cx, |input, _| input.reset());
+        self.input.update(cx, |input, _| {
+            input.record_submission(prompt.clone());
+            input.reset();
+            input.set_disabled(true);
+        });
         self.chat.reduce(ChatAction::Submit(prompt.clone()));
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
@@ -227,10 +232,12 @@ impl TauView {
             Ok(TurnStreamEvent::Complete(_)) => {
                 self.chat.active_assistant = None;
                 self.chat.status = ChatStatus::Ready;
+                self.input.update(cx, |input, _| input.set_disabled(false));
                 cx.notify();
             }
             Err(error) => {
                 self.chat.reduce(ChatAction::Error(error));
+                self.input.update(cx, |input, _| input.set_disabled(false));
                 cx.notify();
             }
         }
@@ -284,6 +291,9 @@ impl Render for TauView {
             .child(
                 div()
                     .flex()
+                    .id("startup-actions")
+                    .max_h(px(420.))
+                    .overflow_y_scroll()
                     .gap_2()
                     .child(toast_button(
                         "Okay",
@@ -310,6 +320,7 @@ impl Render for TauView {
         let transcript = div()
             .id("transcript")
             .flex_1()
+            .min_h(px(0.))
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -382,14 +393,20 @@ impl Render for TauView {
                     ),
                 };
                 let mut card_view = div()
+                    .id(("card", index))
+                    .focusable()
+                    .hover(|style| style.bg(rgb(0x171d26)))
                     .flex()
                     .flex_col()
                     .when(align_end, |element| element.items_end())
                     .child(div().text_xs().text_color(rgb(0x8994a8)).child(label))
                     .child(
                         div()
+                            .id(("card-content", index))
                             .flex()
                             .max_w(px(820.))
+                            .max_h(px(360.))
+                            .overflow_y_scroll()
                             .p_3()
                             .rounded_lg()
                             .bg(rgb(background))
@@ -482,6 +499,7 @@ impl Render for TauView {
             .flex_col()
             .gap_3()
             .p_4()
+            .flex_none()
             .border_l_1()
             .border_color(rgb(0x2c3340))
             .child(sidebar_card("AGENT", self.agent.label()))
@@ -519,9 +537,12 @@ impl Render for TauView {
                     .child(self.input.clone())
                     .child(
                         div()
+                            .id("send-button")
                             .px_4()
                             .py_3()
                             .bg(rgb(0x85b8ff))
+                            .hover(|style| style.bg(rgb(0xa8ccff)))
+                            .focusable()
                             .text_color(rgb(0x10151e))
                             .rounded_lg()
                             .cursor_pointer()
@@ -532,9 +553,12 @@ impl Render for TauView {
             .when(self.chat.active_assistant.is_some(), |footer| {
                 footer.child(
                     div()
+                        .id("cancel-button")
                         .px_3()
                         .py_2()
                         .bg(rgb(0x7d3b3b))
+                        .hover(|style| style.bg(rgb(0xa34c4c)))
+                        .focusable()
                         .rounded_lg()
                         .cursor_pointer()
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_turn))
@@ -547,22 +571,25 @@ impl Render for TauView {
             .text_color(rgb(0xe8edf5))
             .flex()
             .flex_col()
+            .min_h(px(0.))
+            .relative()
             .key_context("TauView")
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::switch_agent));
         root = root.on_action(cx.listener(Self::cycle_model));
-        if self.toast_visible {
-            root = root.child(toast);
-        }
         root.child(header)
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .min_h(px(0.))
                     .child(transcript)
                     .when(self.sidebar_visible, |view| view.child(sidebar)),
             )
             .child(footer)
+            .when(self.toast_visible, |root| {
+                root.child(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
+            })
     }
 }
 

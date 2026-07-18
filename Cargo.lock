@@ -6334,6 +6334,7 @@ dependencies = [
  "tau-proto",
  "tempfile",
  "tokio",
+ "unicode-segmentation",
 ]
 
 [[package]]
