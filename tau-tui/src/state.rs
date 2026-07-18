@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use tau_proto::prelude::SequencedEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -129,6 +129,7 @@ pub struct AppState {
     pub cancelling: bool,
     pub replaying: bool,
     pub following: bool,
+    pub expanded_feed: BTreeSet<u64>,
     pub server_index: usize,
     pub servers: Vec<String>,
 }
@@ -209,6 +210,7 @@ impl Default for AppState {
             cancelling: false,
             replaying: false,
             following: true,
+            expanded_feed: BTreeSet::new(),
             server_index: 0,
             servers: vec!["local".into()],
         }

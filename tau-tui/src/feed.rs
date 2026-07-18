@@ -272,14 +272,9 @@ pub fn render(frame: &mut Frame, area: Rect, feed: &FeedProjection) {
         lines.push(Line::from(format!("  {message}")));
     }
     for item in &feed.items {
-        let action = if item.actions.is_empty() {
-            ""
-        } else {
-            " · action available"
-        };
         lines.push(Line::from(vec![
             Span::styled(item.mark, Style::default().fg(Color::Cyan)),
-            Span::raw(format!(" {}  {}{}", item.title, item.metadata, action)),
+            Span::raw(format!(" {}  {}", item.title, item.metadata)),
         ]));
         let detail = if item.collapsed {
             format!("{}… [details]", item.visible_body())
@@ -394,7 +389,6 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("question"));
-        assert!(text.contains("action available"));
         assert!(text.contains("#1"));
     }
 }

@@ -50,6 +50,7 @@ pub enum Action {
     Redo,
     ToggleAutonomy,
     ToggleFollow,
+    ToggleFeedDetails(u64),
     Tier(i8),
     Cancel,
     Replay,
@@ -81,6 +82,16 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
         if matches!(k.code, KeyCode::Esc) {
             return Some(Action::QuestionReply(String::new()));
         }
+    }
+    // Diff requests are protocol-gated just like permissions and questions.
+    // Keep this modal ahead of hunk navigation so Enter/Backspace always
+    // produces the daemon acknowledgement when no local hunks are present.
+    if s.diff_reply.is_some() {
+        return match k.code {
+            KeyCode::Enter | KeyCode::Char('y') => Some(Action::DiffReply(true)),
+            KeyCode::Backspace | KeyCode::Char('n') => Some(Action::DiffReply(false)),
+            _ => None,
+        };
     }
     if !s.hunks.is_empty() && s.input.is_empty() {
         if k.code == KeyCode::Enter {
@@ -153,6 +164,13 @@ pub fn mouse_action(s: &AppState, mouse: MouseEvent) -> Option<Action> {
         return None;
     }
     let row = mouse.row.saturating_sub(1) as usize;
+    if !s.raw_events.is_empty() {
+        let event_row = row.saturating_sub(s.human_messages.len().saturating_mul(2));
+        let event_index = event_row / 2;
+        if let Some(event) = s.raw_events.get(event_index) {
+            return Some(Action::ToggleFeedDetails(event.sequence));
+        }
+    }
     if row < s.tools.len() {
         Some(Action::ExpandTool(row))
     } else if !s.hunks.is_empty() {
@@ -391,6 +409,11 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         }
         Action::ToggleAutonomy => s.autonomous = !s.autonomous,
         Action::ToggleFollow => s.following = !s.following,
+        Action::ToggleFeedDetails(sequence) => {
+            if !s.expanded_feed.remove(&sequence) {
+                s.expanded_feed.insert(sequence);
+            }
+        }
         Action::Tier(d) => s.task_tier = (s.task_tier as i8 + d).clamp(1, 3) as u8,
         Action::Cancel => {
             s.cancelling = true;
@@ -607,5 +630,30 @@ mod tests {
         assert!(!state.replaying);
         apply(&mut state, Action::Connected);
         assert_eq!(state.connection, Connection::Connected);
+    }
+
+    #[test]
+    fn diff_request_keys_are_explicit_ack_actions() {
+        let state = AppState {
+            diff_reply: Some(DiffReply { accepted: None }),
+            ..AppState::default()
+        };
+        assert!(matches!(
+            key_action(&state, KeyEvent::from(KeyCode::Char('y'))),
+            Some(Action::DiffReply(true))
+        ));
+        assert!(matches!(
+            key_action(&state, KeyEvent::from(KeyCode::Char('n'))),
+            Some(Action::DiffReply(false))
+        ));
+    }
+
+    #[test]
+    fn feed_detail_toggle_is_stateful_and_typed_by_sequence() {
+        let mut state = AppState::default();
+        apply(&mut state, Action::ToggleFeedDetails(7));
+        assert!(state.expanded_feed.contains(&7));
+        apply(&mut state, Action::ToggleFeedDetails(7));
+        assert!(!state.expanded_feed.contains(&7));
     }
 }

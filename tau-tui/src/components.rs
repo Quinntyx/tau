@@ -33,8 +33,13 @@ pub fn render(frame: &mut Frame, s: &AppState) {
         // The feed owns typed event presentation. Legacy transcript strings
         // remain the empty-state/fallback projection; no event semantics are
         // recovered from them here.
-        let projection =
+        let mut projection =
             feed::project_with_humans(&s.raw_events, &s.human_messages, s.connection, s.following);
+        for item in &mut projection.items {
+            if s.expanded_feed.contains(&item.event.sequence) {
+                item.collapsed = false;
+            }
+        }
         feed::render(frame, root[0], &projection);
     }
     let footer = Line::from(vec![
@@ -73,6 +78,9 @@ pub fn render(frame: &mut Frame, s: &AppState) {
     }
     if let Some(question) = &s.question {
         question_modal(frame, question);
+    }
+    if s.diff_reply.is_some() {
+        diff_modal(frame, s);
     }
 }
 fn picker(frame: &mut Frame, s: &AppState) {
@@ -153,6 +161,29 @@ fn question_modal(frame: &mut Frame, question: &Question) {
     frame.render_widget(
         Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL).title(" Question "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn diff_modal(frame: &mut Frame, s: &AppState) {
+    let area = center(frame.area(), 64, 8);
+    frame.render_widget(Clear, area);
+    let path = s.diff_path.as_deref().unwrap_or("requested changes");
+    let body = vec![
+        Line::from(Span::styled(
+            " Diff review required ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(" {path}")),
+        Line::from(""),
+        Line::from("[Enter/y] accept  [Backspace/n] reject"),
+    ];
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(Block::default().borders(Borders::ALL).title(" Diff "))
             .wrap(Wrap { trim: false }),
         area,
     );

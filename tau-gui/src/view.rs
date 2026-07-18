@@ -46,6 +46,21 @@ pub fn next_follow_state(following: bool) -> bool {
     !following
 }
 
+fn feed_policy_request_id(item: &feed::FeedItem) -> Option<&str> {
+    match item.category {
+        feed::FeedCategory::Permission => item.actions.permission_id.as_deref(),
+        feed::FeedCategory::Question => item.actions.question_id.as_deref(),
+        feed::FeedCategory::Diff => item.actions.diff_request_id.as_deref(),
+        _ => None,
+    }
+}
+
+fn feed_item_is_pending(chat: &ChatState, item: &feed::FeedItem) -> bool {
+    feed_policy_request_id(item)
+        .and_then(|id| chat.policy_states.get(id))
+        .is_none_or(|state| !matches!(state, crate::chat::PolicyState::Ack))
+}
+
 /// Render one projected feed body with a typography-first hierarchy.  The
 /// reducer remains the source of truth; this seam deliberately accepts the
 /// already projected label/text pair so protocol actions stay on `TauView`.
@@ -636,6 +651,27 @@ impl TauView {
     ) {
         self.chat.reduce(ChatAction::ToggleTool(index));
         cx.notify();
+    }
+
+    fn card_index_for_request(
+        &self,
+        request_id: &str,
+        category: feed::FeedCategory,
+    ) -> Option<usize> {
+        self.chat
+            .cards
+            .iter()
+            .position(|card| match (category, card) {
+                (feed::FeedCategory::Permission, Card::Permission { request_id: id, .. })
+                | (feed::FeedCategory::Diff, Card::Diff { request_id: id, .. }) => id == request_id,
+                (
+                    feed::FeedCategory::Question,
+                    Card::Question {
+                        question_id: id, ..
+                    },
+                ) => id == request_id,
+                _ => false,
+            })
     }
 
     fn choose_diff(
@@ -1419,31 +1455,115 @@ impl Render for TauView {
                 }
                 card_view
             }))
-            .children(typed_feed.items.iter().map(|item| {
-                let action_hint = if item.actions.actions().next().is_some() {
-                    " · action available"
-                } else {
-                    ""
-                };
-                let label = format!(
-                    "{} {} · #{} · {}{}",
-                    item.avatar, item.role_mark, item.sequence, item.timestamp, action_hint
-                );
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(0x202630))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x8994a8))
-                            .child(label.clone()),
-                    )
-                    .child(feed_body(item.role_mark, item.visible_detail().to_owned()))
-            }));
+            .children(
+                typed_feed
+                    .items
+                    .iter()
+                    .filter(|item| feed_item_is_pending(&self.chat, item))
+                    .map(|item| {
+                        let category = item.category;
+                        // Policy ids live in the typed EventKind payload.  The
+                        // envelope request id is a different correlation field and
+                        // must never be substituted for it.
+                        let request_id = feed_policy_request_id(item).unwrap_or_default();
+                        let label = format!(
+                            "{} {} · #{} · {}",
+                            item.avatar, item.role_mark, item.sequence, item.timestamp
+                        );
+                        let mut item_view = div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x202630))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8994a8))
+                                    .child(label.clone()),
+                            )
+                            .child(feed_body(item.role_mark, item.visible_detail().to_owned()));
+                        if item.actions.permission {
+                            item_view = item_view.child(
+                                div().flex().gap_2().children(
+                                    [
+                                        (PermissionChoice::AllowOnce, "Allow once", 0x39734a),
+                                        (PermissionChoice::Reject, "Reject", 0x7d3b3b),
+                                    ]
+                                    .into_iter()
+                                    .map(
+                                        |(choice, label, color)| {
+                                            let request_id = request_id.to_owned();
+                                            toast_button(
+                                                label,
+                                                color,
+                                                cx.listener(move |view, event, window, cx| {
+                                                    if let Some(index) = view
+                                                        .card_index_for_request(
+                                                            &request_id,
+                                                            category,
+                                                        )
+                                                    {
+                                                        view.choose_permission(
+                                                            index, choice, event, window, cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                        },
+                                    ),
+                                ),
+                            );
+                        } else if item.actions.question {
+                            item_view = item_view.child(div().flex().gap_2().children(
+                                ["yes", "no"].into_iter().map(|answer| {
+                                    let request_id = request_id.to_owned();
+                                    toast_button(
+                                        answer,
+                                        if answer == "yes" { 0x39734a } else { 0x7d3b3b },
+                                        cx.listener(move |view, event, window, cx| {
+                                            if let Some(index) =
+                                                view.card_index_for_request(&request_id, category)
+                                            {
+                                                view.answer_question(
+                                                    index, answer, event, window, cx,
+                                                );
+                                            }
+                                        }),
+                                    )
+                                }),
+                            ));
+                        } else if item.actions.diff {
+                            item_view = item_view.child(
+                                div().flex().gap_2().children(
+                                    [(true, "Accept", 0x39734a), (false, "Reject", 0x7d3b3b)]
+                                        .into_iter()
+                                        .map(|(approved, label, color)| {
+                                            let request_id = request_id.to_owned();
+                                            toast_button(
+                                                label,
+                                                color,
+                                                cx.listener(move |view, event, window, cx| {
+                                                    if let Some(index) = view
+                                                        .card_index_for_request(
+                                                            &request_id,
+                                                            category,
+                                                        )
+                                                    {
+                                                        view.choose_diff(
+                                                            index, approved, event, window, cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                        }),
+                                ),
+                            );
+                        }
+                        item_view
+                    }),
+            );
         let sidebar = div()
             .w(px(260.))
             .flex()
@@ -1670,5 +1790,60 @@ mod view_model_tests {
                 .iter()
                 .any(|(key, value)| key == "DIRECTORY" && value == "Unavailable")
         );
+    }
+
+    #[test]
+    fn feed_controls_use_policy_ids_not_envelope_request_ids() {
+        let raw = tau_proto::prelude::TurnEvent::PermissionRequested {
+            turn_id: "turn".into(),
+            request_id: "policy-42".into(),
+            tool: "shell".into(),
+            description: "run".into(),
+        };
+        let event = crate::chat::TypedEvent {
+            event_id: "event".into(),
+            session_id: "session".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: Some("envelope-99".into()),
+            turn_id: "turn".into(),
+            kind: EventKind::PermissionRequested {
+                permission_id: "policy-42".into(),
+                tool: "shell".into(),
+                description: "run".into(),
+            },
+            raw,
+        };
+        let item = crate::feed::project(&event, crate::feed::DEFAULT_COLLAPSE_AT);
+        assert_eq!(feed_policy_request_id(&item), Some("policy-42"));
+        assert_ne!(feed_policy_request_id(&item), item.request_id.as_deref());
+    }
+
+    #[test]
+    fn acknowledged_feed_policy_controls_are_removed_from_the_root() {
+        let raw = tau_proto::prelude::TurnEvent::QuestionAsked {
+            turn_id: "turn".into(),
+            question_id: "question-7".into(),
+            question: "continue?".into(),
+        };
+        let event = crate::chat::TypedEvent {
+            event_id: "event".into(),
+            session_id: "session".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: None,
+            turn_id: "turn".into(),
+            kind: EventKind::QuestionAsked {
+                question_id: "question-7".into(),
+                question: "continue?".into(),
+            },
+            raw,
+        };
+        let item = crate::feed::project(&event, crate::feed::DEFAULT_COLLAPSE_AT);
+        let mut chat = ChatState::default();
+        assert!(feed_item_is_pending(&chat, &item));
+        chat.policy_states
+            .insert("question-7".into(), crate::chat::PolicyState::Ack);
+        assert!(!feed_item_is_pending(&chat, &item));
     }
 }
