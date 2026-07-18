@@ -1,6 +1,7 @@
 use crate::state::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tau_proto::prelude::{IdempotencyKey, RequestAction, TurnStartParams};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -209,11 +210,17 @@ pub fn mouse_action(s: &AppState, mouse: MouseEvent) -> Option<Action> {
 }
 
 pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
+    // Composer owns all prompt editing.  The fields used by the renderer and
+    // protocol adapter are refreshed only as a typed projection below.
+    if let Some(result) = apply_composer_action(s, &a) {
+        return result;
+    }
     match a {
         Action::Insert(c) => {
             replace_selection(s);
-            s.input.insert(s.cursor, c);
-            s.cursor += c.len_utf8();
+            let value = c.to_string();
+            s.input.insert_str(s.cursor, &value);
+            s.cursor += value.len();
         }
         Action::Paste(text) => {
             replace_selection(s);
@@ -225,8 +232,8 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                 replace_selection(s);
             } else if s.cursor > 0 {
                 let p = s.input[..s.cursor]
-                    .char_indices()
-                    .last()
+                    .grapheme_indices(true)
+                    .next_back()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 s.input.drain(p..s.cursor);
@@ -237,12 +244,12 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             if s.selection.is_some() {
                 replace_selection(s);
             } else if s.cursor < s.input.len() {
-                let n = s.input[s.cursor..]
-                    .char_indices()
+                let end = s.input[s.cursor..]
+                    .grapheme_indices(true)
                     .nth(1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(s.input.len() - s.cursor);
-                s.input.drain(s.cursor..s.cursor + n);
+                    .map(|(i, _)| s.cursor + i)
+                    .unwrap_or(s.input.len());
+                s.input.drain(s.cursor..end);
             }
         }
         Action::MoveLeft { select } => move_horizontal(s, -1, select),
@@ -272,6 +279,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                 } else if p.trim() == "/models" || p.trim() == "/model" {
                     s.picker = Picker::Models;
                 }
+                sync_composer(s);
                 return Some(p);
             }
         }
@@ -365,6 +373,8 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                 s.question_id = None;
                 s.input.clear();
                 s.cursor = 0;
+                let _ = s.composer.apply(crate::composer::ComposerAction::Clear);
+                sync_composer(s);
                 return Some(answer);
             }
         }
@@ -509,7 +519,134 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             s.sessions.open = false;
         }
     }
+    sync_composer(s);
     None
+}
+
+pub fn sync_composer(s: &mut AppState) {
+    s.input = s.composer.text().to_owned();
+    let selection = s.composer.selection();
+    s.cursor = selection.cursor;
+    s.selection = (selection.anchor != selection.cursor).then_some(selection.anchor);
+    s.clipboard = s.composer.clipboard().to_owned();
+    s.model = s.composer.state().model.clone().unwrap_or_default();
+    s.agent = s.composer.state().agent.clone().unwrap_or_default();
+    s.picker = match s.composer.state().picker {
+        Some(crate::composer::PickerKind::Model) => Picker::Models,
+        Some(crate::composer::PickerKind::Agent) => Picker::Agents,
+        Some(crate::composer::PickerKind::Command) => Picker::Commands,
+        None => Picker::None,
+    };
+    s.picker_query = s.composer.state().slash_query.clone().unwrap_or_default();
+    s.picker_index = s.composer.state().picker_index;
+    let _ = s
+        .composer
+        .apply(crate::composer::ComposerAction::SetSending(
+            s.turn_id.is_some(),
+        ));
+    let _ = s
+        .composer
+        .apply(crate::composer::ComposerAction::SetConnection {
+            connected: s.connection == Connection::Connected,
+            detail: format!("{:?}", s.connection),
+        });
+}
+
+fn apply_composer_action(s: &mut AppState, action: &Action) -> Option<Option<String>> {
+    use crate::composer::ComposerAction as C;
+    let mapped = match action {
+        Action::Insert(c) => C::Insert(c.to_string()),
+        Action::Paste(v) => C::Paste(v.clone()),
+        Action::Backspace => C::Backspace,
+        Action::Delete => C::Delete,
+        Action::MoveLeft { select } => C::MoveLeft { selecting: *select },
+        Action::MoveRight { select } => C::MoveRight { selecting: *select },
+        Action::MoveUp { select } => C::MoveUp { selecting: *select },
+        Action::MoveDown { select } => C::MoveDown { selecting: *select },
+        Action::MoveHome { select } => C::MoveHome { selecting: *select },
+        Action::MoveEnd { select } => C::MoveEnd { selecting: *select },
+        Action::Newline => C::Newline,
+        Action::Undo => C::Undo,
+        Action::Redo => C::Redo,
+        Action::Cancel => {
+            s.cancelling = true;
+            s.replaying = false;
+            C::Cancel
+        }
+        Action::Open(Picker::Models) => C::OpenPicker(crate::composer::PickerKind::Model),
+        Action::Open(Picker::Agents) => C::OpenPicker(crate::composer::PickerKind::Agent),
+        Action::Open(Picker::Commands) => C::OpenPicker(crate::composer::PickerKind::Command),
+        Action::ClosePicker => C::ClosePicker,
+        Action::Query(c) => C::SlashQuery(format!("{}{}", s.picker_query, c)),
+        Action::QueryBackspace => C::SlashQuery(
+            s.picker_query
+                .graphemes(true)
+                .next_back()
+                .map_or_else(String::new, |last| {
+                    s.picker_query[..s.picker_query.len() - last.len()].to_owned()
+                }),
+        ),
+        Action::MovePicker(delta) => {
+            let count = match s.composer.state().picker {
+                Some(crate::composer::PickerKind::Model) => filtered_models(s).len(),
+                Some(crate::composer::PickerKind::Agent) => s.agents.len(),
+                Some(crate::composer::PickerKind::Command) => command_count(s),
+                None => 0,
+            };
+            let index = if count == 0 {
+                0
+            } else {
+                (s.composer.state().picker_index as isize + *delta as isize)
+                    .rem_euclid(count as isize) as usize
+            };
+            C::SetPickerIndex(index)
+        }
+        Action::Pick => match s.composer.state().picker {
+            Some(crate::composer::PickerKind::Model) => filtered_models(s)
+                .get(s.composer.state().picker_index)
+                .map(|model| C::ChooseModel(model.id.clone()))
+                .unwrap_or(C::ClosePicker),
+            Some(crate::composer::PickerKind::Agent) => s
+                .agents
+                .iter()
+                .filter(|agent| {
+                    s.picker_query.is_empty()
+                        || agent
+                            .to_lowercase()
+                            .contains(&s.picker_query.to_lowercase())
+                })
+                .nth(s.composer.state().picker_index)
+                .map(|agent| C::ChooseAgent(agent.clone()))
+                .unwrap_or(C::ClosePicker),
+            Some(crate::composer::PickerKind::Command) => {
+                C::ChooseSlashCommand(s.picker_query.clone())
+            }
+            None => return None,
+        },
+        Action::Submit => {
+            if !s.composer.send_enabled() {
+                return Some(None);
+            }
+            let prompt = s.composer.text().to_owned();
+            s.composer.record_history(prompt.clone());
+            let _ = s.composer.apply(C::Send);
+            let _ = s.composer.apply(C::Clear);
+            let _ = s.composer.apply(C::SetSending(false));
+            sync_composer(s);
+            s.transcript.push(format!("You: {prompt}"));
+            return Some(Some(prompt));
+        }
+        _ => return None,
+    };
+    s.composer.apply(mapped);
+    sync_composer(s);
+    Some(None)
+}
+fn command_count(s: &AppState) -> usize {
+    ["/agent", "/agents", "/model", "/help", "/replay"]
+        .iter()
+        .filter(|command| s.picker_query.is_empty() || command.contains(&s.picker_query))
+        .count()
 }
 pub fn filtered_models(s: &AppState) -> Vec<&Model> {
     let mut models: Vec<&Model> = s
@@ -590,9 +727,9 @@ fn move_horizontal(s: &mut AppState, direction: i8, select: bool) {
     } else {
         s.cursor
             + s.input[s.cursor..]
-                .chars()
-                .next()
-                .map(char::len_utf8)
+                .grapheme_indices(true)
+                .nth(1)
+                .map(|(i, _)| i)
                 .unwrap_or(0)
     };
     if select {

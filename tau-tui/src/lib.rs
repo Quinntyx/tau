@@ -2,6 +2,7 @@
 //! thin; all interesting behaviour lives in typed state and renderable components.
 mod adapter;
 pub mod components;
+pub mod composer;
 pub mod feed;
 pub mod projects;
 pub mod reducer;
@@ -117,9 +118,15 @@ async fn session(
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         // Esc closes the navigator through `key_action`; only
                         // exit the application when no modal navigator is open.
-                        if matches!(key.code, KeyCode::Esc) && !state.sessions.open { break; }
+                        if matches!(key.code, KeyCode::Esc)
+                            && !state.sessions.open
+                            && state.picker == state::Picker::None
+                        {
+                            break;
+                        }
                         reducer::key_action(&state, key)
                     }
+                    Event::Paste(text) => Some(reducer::Action::Paste(text)),
                     Event::Mouse(mouse) => reducer::mouse_action(&state, mouse),
                     Event::Resize(_, _) => Some(reducer::Action::Reconnect),
                     _ => None,
@@ -213,11 +220,51 @@ async fn session(
                 match message {
                     adapter::ClientEvent::Complete { session_id, turn_id } => {
                         state.session_id = Some(session_id);
-                        state.turn_id = Some(turn_id);
+                        let _ = turn_id;
+                        state.turn_id = None;
+                        // A completed stream is terminal from the composer’s
+                        // perspective, even if the daemon did not emit a
+                        // separate terminal event before closing it.
+                        state.cancelling = false;
+                        let _ = state
+                            .composer
+                            .apply(crate::composer::ComposerAction::SetSending(false));
+                        reducer::sync_composer(&mut state);
                     }
-                    adapter::ClientEvent::Turn(event) => adapter::reduce_event(&mut state, event),
-                    adapter::ClientEvent::Disconnected => state.connection = state::Connection::Disconnected,
-                    other => adapter::ScriptedClient { events: vec![other] }.drive(&mut state),
+                    adapter::ClientEvent::Turn(event) => {
+                        let finished = matches!(
+                            &event.event,
+                            tau_proto::prelude::TurnEvent::TurnCompleted { .. }
+                                | tau_proto::prelude::TurnEvent::TurnCancelled { .. }
+                                | tau_proto::prelude::TurnEvent::TurnFailed { .. }
+                        );
+                        adapter::reduce_event(&mut state, event);
+                        if finished {
+                            let _ = state
+                                .composer
+                                .apply(crate::composer::ComposerAction::SetSending(false));
+                        }
+                        reducer::sync_composer(&mut state);
+                    }
+                    adapter::ClientEvent::Disconnected => {
+                        state.connection = state::Connection::Disconnected;
+                        state.cancelling = false;
+                        let _ = state
+                            .composer
+                            .apply(crate::composer::ComposerAction::SetSending(false));
+                        reducer::sync_composer(&mut state);
+                    }
+                    other => {
+                        let failed = matches!(&other, adapter::ClientEvent::Error(_));
+                        adapter::ScriptedClient { events: vec![other] }.drive(&mut state);
+                        if failed {
+                            state.cancelling = false;
+                            let _ = state
+                                .composer
+                                .apply(crate::composer::ComposerAction::SetSending(false));
+                        }
+                        reducer::sync_composer(&mut state);
+                    }
                 }
             }
             else => break,

@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod chat;
+pub mod composer;
 pub mod feed;
 pub mod input;
 pub mod picker;

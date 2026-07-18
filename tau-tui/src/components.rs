@@ -2,9 +2,9 @@
 use crate::{feed, projects::ProjectState, reducer::filtered_models, shell, state::*};
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
@@ -26,6 +26,11 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
         shell::render(frame, s);
     }
     let content = shell::content_area(frame.area());
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(7)])
+        .split(content);
+    let transcript = s.transcript.join("\n");
     if !s.raw_events.is_empty() {
         let mut projection =
             feed::project_with_humans(&s.raw_events, &s.human_messages, s.connection, s.following);
@@ -34,16 +39,66 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
                 item.collapsed = false;
             }
         }
-        feed::render(frame, content, &projection);
+        feed::render(frame, root[0], &projection);
+    } else {
+        frame.render_widget(
+            Paragraph::new(transcript).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Conversation "),
+            ),
+            root[0],
+        );
     }
-    // Keep the terminal cursor at the UTF-8 byte cursor's visual column.
+    let footer = Line::from(vec![
+        Span::styled(format!(" {} ", s.model), Style::default().fg(Color::Cyan)),
+        Span::raw(format!(
+            "  agent:{} tier:{} {}",
+            s.agent,
+            s.task_tier,
+            if s.autonomous { "AUTO" } else { "ASK" }
+        )),
+    ]);
+    let status = format!(
+        "  {}  {}  {} chars  {}",
+        if s.connection == Connection::Connected {
+            "● connected"
+        } else {
+            "○ disconnected"
+        },
+        if s.cancelling {
+            "cancelling"
+        } else if s.turn_id.is_some() {
+            "active"
+        } else {
+            "ready"
+        },
+        s.input.chars().count(),
+        if s.turn_id.is_some() {
+            "Ctrl-C cancel"
+        } else {
+            "Enter send"
+        }
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            footer,
+            Line::from(s.input.as_str()),
+            Line::from(status),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" prompt (Shift+Enter newline) "),
+        ),
+        root[1],
+    );
+    // Keep the terminal cursor at the UTF-8 byte cursor's visual column so
+    // multiline editing remains usable instead of merely storing text.
     let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
     let line = s.input[..s.cursor].matches('\n').count() as u16;
     let column = s.input[line_start..s.cursor].chars().count() as u16;
-    frame.set_cursor_position((
-        content.x + 3 + column,
-        content.y + content.height.saturating_sub(2) + line,
-    ));
+    frame.set_cursor_position((root[1].x + 1 + column, root[1].y + 2 + line));
     if s.picker != Picker::None {
         picker(frame, s);
     }
@@ -119,7 +174,9 @@ fn picker(frame: &mut Frame, s: &AppState) {
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_widget(list, area);
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(s.picker_index));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 fn permission(frame: &mut Frame, p: &Permission) {
     let area = center(frame.area(), 64, 10);

@@ -32,7 +32,15 @@ impl ScriptedClient {
                     turn_id,
                 } => {
                     s.session_id = Some(session_id.clone());
-                    s.turn_id = Some(turn_id.clone());
+                    // The stream completion is terminal; IDs are retained by
+                    // the protocol response only and must not leave an active
+                    // composer turn behind for a later cancel.
+                    let _ = turn_id;
+                    s.turn_id = None;
+                    s.cancelling = false;
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
                 }
                 ClientEvent::Tool { name, output } => {
                     s.tools.push(crate::state::ToolCard {
@@ -53,9 +61,21 @@ impl ScriptedClient {
                         stage: crate::state::PermissionStage::Choose,
                     })
                 }
-                ClientEvent::Disconnected => s.connection = Connection::Disconnected,
+                ClientEvent::Disconnected => {
+                    s.connection = Connection::Disconnected;
+                    s.cancelling = false;
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
+                }
                 ClientEvent::Reconnected => s.connection = Connection::Connected,
-                ClientEvent::Error(message) => s.transcript.push(format!("tau error: {message}")),
+                ClientEvent::Error(message) => {
+                    s.transcript.push(format!("tau error: {message}"));
+                    s.cancelling = false;
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
+                }
             }
         }
     }
@@ -195,6 +215,10 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
         return;
     }
     s.sequence = s.sequence.max(event.sequence);
+    // The event envelope is the authoritative correlation source.  Keep the
+    // session projection current even when a replay reconnects to a session
+    // before its first TurnStarted event arrives.
+    s.session_id = Some(event.session_id.clone());
     s.raw_events.push(event.clone());
     match event.event {
         TurnEvent::TurnStarted { turn_id } => {
@@ -352,14 +376,18 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
         TurnEvent::TurnCompleted { .. } => {
             s.cancelling = false;
             s.assistant_index = None;
+            s.turn_id = None;
         }
         TurnEvent::TurnCancelled { .. } => {
             s.cancelling = false;
             s.assistant_index = None;
+            s.turn_id = None;
         }
         TurnEvent::TurnFailed { message, .. } => {
             s.transcript.push(format!("tau error: {message}"));
+            s.cancelling = false;
             s.assistant_index = None;
+            s.turn_id = None;
         }
     }
 }
