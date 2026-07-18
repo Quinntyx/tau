@@ -17,3 +17,4 @@ tau-core.workspace = true
 tau-proto.workspace = true
 tokio.workspace = true
 kdl.workspace = true
+unicode-segmentation.workspace = true

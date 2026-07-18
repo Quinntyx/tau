@@ -39,6 +39,77 @@ pub enum Card {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardKind {
+    Message,
+    Tool,
+    Diff,
+    Permission,
+    Question,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardMetadata {
+    pub kind: CardKind,
+    pub interactive: bool,
+    pub expanded: bool,
+}
+
+impl Card {
+    pub fn metadata(&self) -> CardMetadata {
+        match self {
+            Self::Message { .. } => CardMetadata {
+                kind: CardKind::Message,
+                interactive: false,
+                expanded: false,
+            },
+            Self::Tool { expanded, .. } => CardMetadata {
+                kind: CardKind::Tool,
+                interactive: true,
+                expanded: *expanded,
+            },
+            Self::Diff { approved, .. } => CardMetadata {
+                kind: CardKind::Diff,
+                interactive: !*approved,
+                expanded: true,
+            },
+            Self::Permission { .. } => CardMetadata {
+                kind: CardKind::Permission,
+                interactive: true,
+                expanded: true,
+            },
+            Self::Question { answer, .. } => CardMetadata {
+                kind: CardKind::Question,
+                interactive: answer.is_none(),
+                expanded: true,
+            },
+        }
+    }
+
+    pub fn preview(&self, max_chars: usize) -> String {
+        let text = match self {
+            Self::Message { text, .. } => text,
+            Self::Tool { name, output, .. } => {
+                if output.is_empty() {
+                    name
+                } else {
+                    output
+                }
+            }
+            Self::Diff { path, patch, .. } => {
+                if patch.is_empty() {
+                    path
+                } else {
+                    patch
+                }
+            }
+            Self::Permission { description, .. } => description,
+            Self::Question { question, .. } => question,
+        };
+        text.chars().take(max_chars).collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatStatus {
     Ready,
@@ -90,6 +161,24 @@ pub enum ChatAction {
 }
 
 impl ChatState {
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.status, ChatStatus::Streaming)
+    }
+
+    pub fn can_submit(&self) -> bool {
+        !self.is_streaming()
+    }
+
+    pub fn history(&self) -> impl Iterator<Item = &str> {
+        self.cards.iter().filter_map(|card| match card {
+            Card::Message {
+                role: Role::User,
+                text,
+            } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn reduce(&mut self, action: ChatAction) -> bool {
         match action {
             ChatAction::SessionEvent(event) => self.apply_session_event(event),
@@ -280,6 +369,36 @@ impl ChatState {
 mod tests {
     use super::*;
     use tau_proto::prelude::{CompletionDelta, UsageSummary};
+
+    #[test]
+    fn card_metadata_and_preview_are_stable_for_long_cards() {
+        let card = Card::Tool {
+            name: "shell".into(),
+            input: "x".into(),
+            output: "abcdef".into(),
+            expanded: false,
+        };
+        assert_eq!(
+            card.metadata(),
+            CardMetadata {
+                kind: CardKind::Tool,
+                interactive: true,
+                expanded: false,
+            }
+        );
+        assert_eq!(card.preview(3), "abc");
+    }
+
+    #[test]
+    fn submit_records_history_and_streaming_disables_submit() {
+        let mut state = ChatState::default();
+        assert!(state.can_submit());
+        assert!(state.reduce(ChatAction::Submit("hello".into())));
+        assert_eq!(state.history().collect::<Vec<_>>(), vec!["hello"]);
+        assert!(!state.can_submit());
+        assert!(!state.reduce(ChatAction::Submit("second".into())));
+    }
+
     #[test]
     fn reducer_streams_and_finishes() {
         let mut state = ChatState::default();
