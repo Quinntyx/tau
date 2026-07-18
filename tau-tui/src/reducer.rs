@@ -435,6 +435,7 @@ pub fn params(s: &AppState, prompt: String, cwd: Option<String>) -> TurnStartPar
         RequestAction::Submit
     };
     TurnStartParams {
+        project_id: s.project_id.clone(),
         model: s.model.clone(),
         prompt,
         session_id: s.session_id.clone(),

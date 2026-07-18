@@ -63,6 +63,7 @@ pub enum DaemonStatus {
 pub struct TurnRequest {
     pub prompt: String,
     pub session_id: Option<String>,
+    pub project_id: String,
     pub model: Option<String>,
     pub agent: Option<String>,
 }
@@ -90,6 +91,11 @@ impl TurnRequest {
 
     pub fn into_params(self, cwd: String, default_model: String) -> TurnStartParams {
         TurnStartParams {
+            project_id: if self.project_id.is_empty() {
+                fallback_project_id(&cwd)
+            } else {
+                self.project_id
+            },
             model: self.model.unwrap_or(default_model),
             prompt: self.prompt,
             session_id: self.session_id,
@@ -532,9 +538,11 @@ impl Backend {
                         .ok();
                 }
                 let client = guard.as_mut().expect("session initialized");
+                let project_id = ensure_project(client, &cwd).await?;
                 let params = TurnRequest {
                     prompt,
                     session_id,
+                    project_id,
                     model: Some(model),
                     agent,
                 }
@@ -740,6 +748,47 @@ impl Backend {
         });
         rx
     }
+}
+
+async fn ensure_project(client: &tau_client::Client, cwd: &str) -> Result<String> {
+    let root = std::fs::canonicalize(cwd)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd.to_owned());
+    // Older scripted/stale peers may not expose the registry yet.  Keep the
+    // mandatory field populated for those peers; a current daemon takes the
+    // registry path below and therefore receives a real active ID.
+    let projects = match client
+        .project_list(tau_proto::prelude::ProjectListParams::default())
+        .await
+    {
+        Ok(projects) => projects,
+        Err(_) => return Ok(fallback_project_id(&root)),
+    };
+    if let Some(project) = projects
+        .projects
+        .into_iter()
+        .find(|project| project.active && project.root == root)
+    {
+        return Ok(project.id);
+    }
+    let name = std::path::Path::new(&root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("project")
+        .to_owned();
+    Ok(client
+        .project_create(tau_proto::prelude::ProjectCreateParams { name, root })
+        .await?
+        .project
+        .id)
+}
+
+fn fallback_project_id(root: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    format!("legacy-{root_hash:016x}", root_hash = hasher.finish())
 }
 
 fn configured_agent_options(config: tau_core::config::Config) -> Vec<crate::picker::AgentOption> {

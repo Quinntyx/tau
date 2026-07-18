@@ -181,7 +181,8 @@ mod tests {
     #[test]
     fn prompts_are_replayable_and_permission_owned() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("/tmp").unwrap();
+        let project = db.create_project("tmp", "/tmp").unwrap();
+        let session = db.create_session(&project.id).unwrap();
         let prompt = db
             .create_interactive_prompt(&session.id, "turn", "permission", "{}", "client-a", None)
             .unwrap();
@@ -206,7 +207,8 @@ mod tests {
     #[test]
     fn prompt_replies_and_takeovers_are_idempotent_and_terminal() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("/tmp").unwrap();
+        let project = db.create_project("tmp", "/tmp").unwrap();
+        let session = db.create_session(&project.id).unwrap();
         let prompt = db
             .create_interactive_prompt(
                 &session.id,
@@ -272,7 +274,8 @@ mod tests {
     #[test]
     fn restart_interrupts_pending_prompts_without_deleting_them() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("/tmp").unwrap();
+        let project = db.create_project("tmp", "/tmp").unwrap();
+        let session = db.create_session(&project.id).unwrap();
         let prompt = db
             .create_interactive_prompt(&session.id, "turn", "plan", "{}", "client-a", None)
             .unwrap();

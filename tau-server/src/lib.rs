@@ -368,6 +368,13 @@ async fn handle_request(
             ))
             .unwrap_or_default()
         }
+        METHOD_PROJECT_LIST => project_list(id, req.params, state).await,
+        METHOD_PROJECT_CREATE => project_create(id, req.params, state).await,
+        METHOD_PROJECT_RENAME => project_rename(id, req.params, state).await,
+        METHOD_PROJECT_REPATH => project_repath(id, req.params, state).await,
+        METHOD_PROJECT_UNREGISTER => project_unregister(id, req.params, state).await,
+        METHOD_PROJECT_REACTIVATE => project_reactivate(id, req.params, state).await,
+        METHOD_PROJECT_NEW_ID => project_new_id(id, req.params, state).await,
         METHOD_TURN_START => {
             if let Some(error) =
                 require_capability(id.clone(), negotiated, Capability::TurnStreaming).await
@@ -416,6 +423,191 @@ async fn handle_request(
             format!("unknown method: {other}"),
         ))
         .unwrap_or_default(),
+    }
+}
+
+fn project_wire(project: tau_core::db::Project) -> tau_proto::projects::Project {
+    tau_proto::projects::Project {
+        id: project.id,
+        name: project.name,
+        root: project.root,
+        active: project.active,
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+    }
+}
+
+fn rpc_error(id: Id, code: i32, message: impl Into<String>) -> String {
+    serde_json::to_string(&Response::<serde_json::Value>::err(
+        id,
+        code,
+        message.into(),
+    ))
+    .unwrap_or_default()
+}
+
+async fn project_list(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let params = match value {
+        None => ProjectListParams::default(),
+        Some(value) => match serde_json::from_value(value) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
+        },
+    };
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || {
+        db.list_projects(params.include_inactive.unwrap_or(false))
+    })
+    .await
+    {
+        Ok(Ok(projects)) => serde_json::to_string(&Response::ok(
+            id,
+            ProjectListResult {
+                projects: projects.into_iter().map(project_wire).collect(),
+            },
+        ))
+        .unwrap_or_default(),
+        Ok(Err(error)) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
+}
+
+async fn project_create(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let Some(value) = value else {
+        return rpc_error(id, INVALID_PARAMS, "project parameters required");
+    };
+    let params: ProjectCreateParams = match serde_json::from_value(value) {
+        Ok(params) => params,
+        Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
+    };
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db.create_project(&params.name, params.root)).await {
+        Ok(Ok(project)) => serde_json::to_string(&Response::ok(
+            id,
+            ProjectCreateResult {
+                project: project_wire(project),
+            },
+        ))
+        .unwrap_or_default(),
+        Ok(Err(error)) => rpc_error(id, INVALID_PARAMS, error.to_string()),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
+}
+
+async fn project_rename(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let Some(value) = value else {
+        return rpc_error(id, INVALID_PARAMS, "project parameters required");
+    };
+    let params: ProjectRenameParams = match serde_json::from_value(value) {
+        Ok(params) => params,
+        Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
+    };
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db.rename_project(&params.project_id, &params.name))
+        .await
+    {
+        Ok(Ok(project)) => serde_json::to_string(&Response::ok(
+            id,
+            ProjectMutationResult {
+                project: project_wire(project),
+            },
+        ))
+        .unwrap_or_default(),
+        Ok(Err(error)) => rpc_error(id, INVALID_PARAMS, error.to_string()),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
+}
+
+async fn project_repath(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let Some(value) = value else {
+        return rpc_error(id, INVALID_PARAMS, "project parameters required");
+    };
+    let params: ProjectRepathParams = match serde_json::from_value(value) {
+        Ok(params) => params,
+        Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
+    };
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db.repath_project(&params.project_id, params.root))
+        .await
+    {
+        Ok(Ok(project)) => serde_json::to_string(&Response::ok(
+            id,
+            ProjectMutationResult {
+                project: project_wire(project),
+            },
+        ))
+        .unwrap_or_default(),
+        Ok(Err(error)) => rpc_error(id, INVALID_PARAMS, error.to_string()),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
+}
+
+async fn project_unregister(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    project_lifecycle(id, value, state, false).await
+}
+
+async fn project_reactivate(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    project_lifecycle(id, value, state, true).await
+}
+
+async fn project_lifecycle(
+    id: Id,
+    value: Option<serde_json::Value>,
+    state: &AppState,
+    active: bool,
+) -> String {
+    let Some(value) = value else {
+        return rpc_error(id, INVALID_PARAMS, "project parameters required");
+    };
+    let params: ProjectIdParams = match serde_json::from_value(value) {
+        Ok(params) => params,
+        Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
+    };
+    let db = Arc::clone(&state.db);
+    let result = tokio::task::spawn_blocking(move || {
+        if active {
+            db.reactivate_project(&params.project_id)
+        } else {
+            db.unregister_project(&params.project_id)
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(project)) => serde_json::to_string(&Response::ok(
+            id,
+            ProjectActionResult {
+                project: project_wire(project),
+            },
+        ))
+        .unwrap_or_default(),
+        Ok(Err(error)) => rpc_error(id, INVALID_PARAMS, error.to_string()),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
+}
+
+async fn project_new_id(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let Some(value) = value else {
+        return rpc_error(id, INVALID_PARAMS, "project_id is required");
+    };
+    let params: ProjectNewIdParams = match serde_json::from_value(value) {
+        Ok(params) => params,
+        Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
+    };
+    let Some(source_id) = params.project_id else {
+        return rpc_error(id, INVALID_PARAMS, "project_id is required");
+    };
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || {
+        let project = db.new_project_id(&source_id)?;
+        Ok::<_, anyhow::Error>(ProjectNewIdResult {
+            project_id: project.id,
+        })
+    })
+    .await
+    {
+        Ok(Ok(result)) => serde_json::to_string(&Response::ok(id, result)).unwrap_or_default(),
+        Ok(Err(error)) => rpc_error(id, INVALID_PARAMS, error.to_string()),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
     }
 }
 
@@ -696,7 +888,7 @@ async fn start_turn(
     state: &AppState,
     _out: &mpsc::Sender<Message>,
 ) -> String {
-    let Some(params) = value.and_then(|v| serde_json::from_value::<TurnStartParams>(v).ok()) else {
+    let Some(value) = value else {
         return serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             INVALID_PARAMS,
@@ -704,10 +896,33 @@ async fn start_turn(
         ))
         .unwrap_or_default();
     };
+    // `project_id` is carried by the current typed protocol revision.  Keep
+    // this extraction separate from TurnStartParams so daemons built while a
+    // protocol slice is being integrated can still reject invalid project
+    // references rather than silently creating an unanchored session.
+    let project_id = value
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let Some(params) = serde_json::from_value::<TurnStartParams>(value).ok() else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "invalid turn.start params",
+        ))
+        .unwrap_or_default();
+    };
+    let Some(project_id) = project_id else {
+        return serde_json::to_string(&Response::<serde_json::Value>::err(
+            id,
+            INVALID_PARAMS,
+            "project_id is required",
+        ))
+        .unwrap_or_default();
+    };
     let db = Arc::clone(&state.db);
     let request_id = id.clone();
     let session = params.session_id.clone();
-    let cwd = params.cwd.clone().unwrap_or_else(|| ".".into());
     let request_hash = {
         let bytes = serde_json::to_vec(&params).unwrap_or_default();
         use std::hash::{Hash, Hasher};
@@ -718,10 +933,23 @@ async fn start_turn(
     let params_for_db = params.clone();
     let result = tokio::task::spawn_blocking(
         move || -> anyhow::Result<(String, String, Option<SequencedEvent>, Option<TurnStartResult>)> {
+            let project = db
+                .get_project(&project_id)?
+                .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
+            if !project.active {
+                anyhow::bail!("project is inactive: {project_id}");
+            }
             let session_id = match session {
-                Some(id) if db.get_session(&id)?.is_some() => id,
-                Some(id) => id,
-                None => db.create_session(&cwd)?.id,
+                Some(id) => {
+                    let existing = db
+                        .get_session(&id)?
+                        .ok_or_else(|| anyhow::anyhow!("unknown session: {id}"))?;
+                    if existing.project_id.as_deref() != Some(project_id.as_str()) {
+                        anyhow::bail!("session does not belong to project: {project_id}");
+                    }
+                    id
+                }
+                None => db.create_session(&project_id)?.id,
             };
             let turn_id = uuid::Uuid::new_v4().to_string();
             let result = TurnStartResult { session_id: session_id.clone(), turn_id: turn_id.clone() };

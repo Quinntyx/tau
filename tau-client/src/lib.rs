@@ -405,6 +405,47 @@ impl Client {
         serde_json::from_value(self.call(METHOD_TURN_CANCEL, Some(params)).await?)
             .context("decoding cancellation")
     }
+
+    pub async fn project_list(&self, params: ProjectListParams) -> Result<ProjectListResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_LIST, Some(params)).await?)
+            .context("decoding project list")
+    }
+
+    pub async fn project_create(&self, params: ProjectCreateParams) -> Result<ProjectCreateResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_CREATE, Some(params)).await?)
+            .context("decoding project creation")
+    }
+
+    pub async fn project_rename(
+        &self,
+        params: ProjectRenameParams,
+    ) -> Result<ProjectMutationResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_RENAME, Some(params)).await?)
+            .context("decoding project rename")
+    }
+
+    pub async fn project_repath(
+        &self,
+        params: ProjectRepathParams,
+    ) -> Result<ProjectMutationResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_REPATH, Some(params)).await?)
+            .context("decoding project repath")
+    }
+
+    pub async fn project_unregister(&self, params: ProjectIdParams) -> Result<ProjectActionResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_UNREGISTER, Some(params)).await?)
+            .context("decoding project unregister")
+    }
+
+    pub async fn project_reactivate(&self, params: ProjectIdParams) -> Result<ProjectActionResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_REACTIVATE, Some(params)).await?)
+            .context("decoding project reactivation")
+    }
+
+    pub async fn project_new_id(&self, params: ProjectNewIdParams) -> Result<ProjectNewIdResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_NEW_ID, Some(params)).await?)
+            .context("decoding project id")
+    }
     pub async fn turn_response(&self, params: TurnResponseParams) -> Result<TurnResponseResult> {
         serde_json::from_value(self.call(METHOD_TURN_RESPONSE, Some(params)).await?)
             .context("decoding turn response")

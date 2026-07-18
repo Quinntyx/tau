@@ -38,7 +38,15 @@ async fn real_daemon_broadcasts_stream_and_replays_after_control_reply() -> Resu
             .await?;
     }
     let mut events = observer.events();
+    let project = client
+        .project_create(tau_proto::prelude::ProjectCreateParams {
+            name: "real-tui".into(),
+            root: std::env::current_dir()?.to_string_lossy().into_owned(),
+        })
+        .await?
+        .project;
     let params = TurnStartParams {
+        project_id: project.id,
         model: "mock/model".into(),
         prompt: "stream while input remains live".into(),
         session_id: None,

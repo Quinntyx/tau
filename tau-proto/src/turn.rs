@@ -51,6 +51,9 @@ impl IdempotencyKey {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnStartParams {
+    /// Stable project registry identifier owning this turn.
+    #[serde(deserialize_with = "crate::projects::deserialize_non_empty")]
+    pub project_id: String,
     pub model: String,
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -522,6 +525,7 @@ mod tests {
             })
             .unwrap(),
             serde_json::to_value(TurnStartParams {
+                project_id: "p".into(),
                 model: "m".into(),
                 prompt: "p".into(),
                 session_id: None,

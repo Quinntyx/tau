@@ -67,7 +67,10 @@ async fn durable_policy_prompt_broadcasts_to_multiple_clients_and_resumes_owner(
     let socket = dir.path().join("tau.sock");
     let listener = UnixListener::bind(&socket)?;
     let state = tau_server::AppState::default();
-    let session_id = state.db().create_session("/tmp/policy-test")?.id;
+    let project = state
+        .db()
+        .create_project("policy-test", "/tmp/policy-test")?;
+    let session_id = state.db().create_session(&project.id)?.id;
     let app = tau_server::router(state.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())

@@ -100,11 +100,39 @@ pub async fn complete(
 ) -> Result<()> {
     s.transcript.push("tau: ".into());
     s.assistant_index = Some(s.transcript.len() - 1);
-    let params = reducer::params(
-        s,
-        prompt,
-        Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-    );
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let projects = client
+        .project_list(tau_proto::prelude::ProjectListParams::default())
+        .await;
+    if let Ok(projects) = projects {
+        if let Some(project) = projects.projects.into_iter().find(|project| {
+            project.active
+                && std::fs::canonicalize(&project.root).ok() == std::fs::canonicalize(&cwd).ok()
+        }) {
+            s.project_id = project.id;
+        } else {
+            let name = std::path::Path::new(&cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("project")
+                .to_owned();
+            s.project_id = client
+                .project_create(tau_proto::prelude::ProjectCreateParams {
+                    name,
+                    root: cwd.clone(),
+                })
+                .await?
+                .project
+                .id;
+        }
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        cwd.hash(&mut hasher);
+        s.project_id = format!("legacy-{hash:016x}", hash = hasher.finish());
+    }
+    let params = reducer::params(s, prompt, Some(cwd));
     tokio::spawn(turn_task(client.clone(), params, tx));
     Ok(())
 }
