@@ -1,5 +1,9 @@
 //! Async, multiplexed client for the tau JSON-RPC WebSocket protocol.
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, Stream, StreamExt};
@@ -10,6 +14,21 @@ use tokio::{
     sync::{Mutex, broadcast, mpsc},
 };
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+
+// Diff replies use the protocol's historical `decision` method on the wire.
+// Keep that detail here rather than making callers of the typed API know about
+// the compatibility name.
+const METHOD_DIFF_REPLY: &str = METHOD_DIFF_DECISION;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_reply_uses_protocol_decision_method() {
+        assert_eq!(METHOD_DIFF_REPLY, METHOD_DIFF_DECISION);
+    }
+}
 
 #[derive(Debug)]
 enum Incoming {
@@ -36,6 +55,7 @@ struct Inner {
     events: broadcast::Sender<SequencedEvent>,
     policy_events: broadcast::Sender<PolicyEvent>,
     disconnected: broadcast::Sender<()>,
+    is_disconnected: AtomicBool,
 }
 
 /// A connected tau daemon client. All reads are performed by one background
@@ -72,6 +92,13 @@ pub struct PolicyEventStream {
     rx: mpsc::UnboundedReceiver<PolicyEvent>,
 }
 
+impl PolicyEventStream {
+    /// Construct a policy stream backed by an application-owned receiver.
+    pub fn from_receiver(rx: mpsc::UnboundedReceiver<PolicyEvent>) -> Self {
+        Self { rx }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TurnStreamEvent {
     Event(SequencedEvent),
@@ -96,10 +123,11 @@ impl Client {
             events,
             policy_events,
             disconnected,
+            is_disconnected: AtomicBool::new(false),
         });
         let routed = Arc::clone(&inner);
         tokio::spawn(async move {
-            let error = loop {
+            let _error = loop {
                 let message = match reader.next().await {
                     Some(Ok(Message::Text(text))) => text,
                     Some(Ok(_)) => continue,
@@ -163,7 +191,12 @@ impl Client {
                     }
                 }
             };
-            let _ = error;
+            // Wake both ordinary and policy subscribers. In particular, do
+            // not leave a policy subscription waiting on a broadcast sender
+            // which remains alive in `Inner` after the socket has gone away.
+            routed
+                .is_disconnected
+                .store(true, std::sync::atomic::Ordering::Release);
             let _ = routed.disconnected.send(());
             let pending = routed.pending.lock().await;
             for tx in pending.values() {
@@ -260,7 +293,68 @@ impl Client {
         self.call(METHOD_DIFF_DECISION, Some(params)).await
     }
     pub async fn diff_reply(&self, params: DiffReply) -> Result<serde_json::Value> {
-        self.call(METHOD_DIFF_DECISION, Some(params)).await
+        self.call(METHOD_DIFF_REPLY, Some(params)).await
+    }
+    /// Reply to an interactive turn event without exposing the JSON-RPC
+    /// envelope to callers.  The request id is part of the typed response so
+    /// retries can be correlated by the daemon.
+    pub async fn permission_response(
+        &self,
+        session_id: String,
+        turn_id: String,
+        _request_id: String,
+        choice: TurnPermissionChoice,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<TurnResponseResult> {
+        self.turn_response(TurnResponseParams {
+            session_id,
+            turn_id,
+            idempotency_key,
+            response: ClientResponse::Permission {
+                choice: match choice {
+                    TurnPermissionChoice::AllowOnce => "allow_once",
+                    TurnPermissionChoice::AllowAlways => "allow_always",
+                    TurnPermissionChoice::Reject => "reject",
+                    TurnPermissionChoice::Inspect => "inspect",
+                    TurnPermissionChoice::Cancel => "cancel",
+                }
+                .into(),
+            },
+        })
+        .await
+    }
+    pub async fn question_response(
+        &self,
+        session_id: String,
+        turn_id: String,
+        _question_id: String,
+        answer: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<TurnResponseResult> {
+        self.turn_response(TurnResponseParams {
+            session_id,
+            turn_id,
+            idempotency_key,
+            response: ClientResponse::Question { answer },
+        })
+        .await
+    }
+    pub async fn diff_response(
+        &self,
+        session_id: String,
+        turn_id: String,
+        _path: String,
+        index: u32,
+        approved: bool,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<TurnResponseResult> {
+        self.turn_response(TurnResponseParams {
+            session_id,
+            turn_id,
+            idempotency_key,
+            response: ClientResponse::DiffHunk { index, approved },
+        })
+        .await
     }
     pub async fn plan_reply(&self, params: PlanReply) -> Result<serde_json::Value> {
         self.call(METHOD_PLAN_REPLY, Some(params)).await
@@ -344,14 +438,30 @@ impl Client {
     pub fn policy_events(&self) -> PolicyEventStream {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut source = self.inner.policy_events.subscribe();
+        let mut disconnected = self.inner.disconnected.subscribe();
+        let already_disconnected = self
+            .inner
+            .is_disconnected
+            .load(std::sync::atomic::Ordering::Acquire);
         tokio::spawn(async move {
-            while let Ok(event) = source.recv().await {
-                if tx.send(event).is_err() {
-                    break;
+            if already_disconnected {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    event = source.recv() => match event {
+                        Ok(event) => if tx.send(event).is_err() { break },
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    disconnected = disconnected.recv() => {
+                        let _ = disconnected;
+                        break;
+                    }
                 }
             }
         });
-        PolicyEventStream { rx }
+        PolicyEventStream::from_receiver(rx)
     }
 }
 

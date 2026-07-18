@@ -6329,11 +6329,13 @@ dependencies = [
  "futures-util",
  "gpui",
  "kdl",
+ "serde_json",
  "tau-client",
  "tau-core",
  "tau-proto",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.29.0",
 ]
 
 [[package]]

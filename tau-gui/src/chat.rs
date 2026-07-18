@@ -1,6 +1,10 @@
 //! Pure, typed chat model used by the GPUI view and scripted fixtures.
-use tau_client::CompletionEvent;
-use tau_proto::prelude::{CompletionStreamResult, SequencedEvent, TurnEvent};
+use std::collections::BTreeMap;
+use tau_client::{CompletionEvent, PolicyEvent};
+use tau_proto::prelude::{
+    AirtightPromptRequest, CompletionStreamResult, DiffRequest, PermissionRequest, PlanRequest,
+    QuestionRequest, SequencedEvent, TurnEvent,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -23,6 +27,7 @@ pub enum Card {
         expanded: bool,
     },
     Diff {
+        request_id: String,
         path: String,
         patch: String,
         approved: bool,
@@ -36,6 +41,16 @@ pub enum Card {
         question_id: String,
         question: String,
         answer: Option<String>,
+    },
+    Plan {
+        request_id: String,
+        revision: u64,
+        accepted: Option<bool>,
+    },
+    Airtight {
+        request_id: String,
+        step: usize,
+        granted: Option<bool>,
     },
 }
 
@@ -56,12 +71,58 @@ pub enum PermissionChoice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyState {
+    Pending,
+    Ack,
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffDecision {
+    Hunk { hunk: usize, approved: bool },
+    WholeFile { approved: bool },
+}
+
+#[derive(Debug, Clone)]
+pub enum PolicyRequest {
+    Permission(PermissionRequest),
+    Question(QuestionRequest),
+    Diff(DiffRequest),
+    Plan(PlanRequest),
+    Airtight(AirtightPromptRequest),
+}
+
+impl PartialEq for PolicyRequest {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Permission(left), Self::Permission(right)) => {
+                left.request_id == right.request_id
+            }
+            (Self::Question(left), Self::Question(right)) => left.request_id == right.request_id,
+            (Self::Diff(left), Self::Diff(right)) => left.request_id == right.request_id,
+            (Self::Plan(left), Self::Plan(right)) => left.request_id == right.request_id,
+            (Self::Airtight(left), Self::Airtight(right)) => left.request_id == right.request_id,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PolicyRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatState {
     pub cards: Vec<Card>,
     pub session_id: Option<String>,
     pub usage: Option<u64>,
     pub status: ChatStatus,
     pub active_assistant: Option<usize>,
+    pub policy_states: BTreeMap<String, PolicyState>,
+    pub diff_decisions: BTreeMap<String, Vec<DiffDecision>>,
+    /// Correlation data for legacy turn events. Those events predate the
+    /// policy request envelope but still carry enough session/turn identity
+    /// for the typed turn-response methods.
+    pub request_context: BTreeMap<String, (String, String)>,
+    pub policy_requests: BTreeMap<String, PolicyRequest>,
 }
 
 impl Default for ChatState {
@@ -72,6 +133,10 @@ impl Default for ChatState {
             usage: None,
             status: ChatStatus::Ready,
             active_assistant: None,
+            policy_states: BTreeMap::new(),
+            diff_decisions: BTreeMap::new(),
+            request_context: BTreeMap::new(),
+            policy_requests: BTreeMap::new(),
         }
     }
 }
@@ -82,17 +147,42 @@ pub enum ChatAction {
     Completion(CompletionEvent),
     /// Durable event from the typed session backend.
     SessionEvent(SequencedEvent),
+    PolicyEvent(PolicyEvent),
     Error(String),
     ToggleTool(usize),
     ApproveDiff(usize, bool),
     Permission(usize, PermissionChoice),
     AnswerQuestion(usize, String),
+    PolicyDecision {
+        request_id: String,
+        choice: String,
+    },
+    PolicyAck {
+        request_id: String,
+    },
+    PolicyError {
+        request_id: String,
+        message: String,
+    },
+    DiffHunk {
+        request_id: String,
+        hunk: usize,
+        approved: bool,
+    },
+    DiffWholeFile {
+        request_id: String,
+        approved: bool,
+    },
+    RetryPolicy {
+        request_id: String,
+    },
 }
 
 impl ChatState {
     pub fn reduce(&mut self, action: ChatAction) -> bool {
         match action {
             ChatAction::SessionEvent(event) => self.apply_session_event(event),
+            ChatAction::PolicyEvent(event) => self.apply_policy_event(event),
             ChatAction::Submit(text)
                 if !text.trim().is_empty() && self.active_assistant.is_none() =>
             {
@@ -150,46 +240,193 @@ impl ChatState {
             },
             ChatAction::ApproveDiff(index, approved) => match self.cards.get_mut(index) {
                 Some(Card::Diff {
-                    approved: value, ..
+                    request_id,
+                    approved: value,
+                    ..
                 }) => {
-                    if approved {
-                        *value = true;
-                    } else {
-                        // Rejection is a terminal review decision. Remove the
-                        // pending card so a rejected mutation cannot be
-                        // accidentally submitted a second time.
-                        self.cards.remove(index);
-                    }
+                    // The daemon is authoritative. Keep the rendered value
+                    // unchanged until PolicyAck arrives.
+                    let _ = (value, approved);
+                    self.policy_states
+                        .insert(request_id.clone(), PolicyState::Pending);
                     true
                 }
                 _ => false,
             },
             ChatAction::Permission(index, choice) => match self.cards.get(index) {
                 Some(Card::Permission { .. }) => {
-                    if matches!(
-                        choice,
-                        PermissionChoice::AllowOnce
-                            | PermissionChoice::AllowAlways
-                            | PermissionChoice::Reject
-                    ) {
-                        self.cards.remove(index);
+                    // Every choice that leaves the prompt (including Cancel)
+                    // is ack-gated. Inspect is local-only and deliberately
+                    // leaves the request actionable.
+                    if !matches!(choice, PermissionChoice::Inspect) {
+                        if let Some(Card::Permission { request_id, .. }) = self.cards.get(index) {
+                            self.policy_states
+                                .insert(request_id.clone(), PolicyState::Pending);
+                        }
                     }
                     true
                 }
                 _ => false,
             },
             ChatAction::AnswerQuestion(index, answer) => match self.cards.get_mut(index) {
-                Some(Card::Question { answer: value, .. }) => {
-                    *value = Some(answer);
+                Some(Card::Question { question_id, .. }) => {
+                    let _ = answer;
+                    self.policy_states
+                        .insert(question_id.clone(), PolicyState::Pending);
                     true
                 }
                 _ => false,
             },
             ChatAction::Submit(_) => false,
+            ChatAction::PolicyDecision { request_id, .. }
+            | ChatAction::RetryPolicy { request_id } => {
+                self.policy_states.insert(request_id, PolicyState::Pending);
+                true
+            }
+            ChatAction::PolicyAck { request_id } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Ack);
+                self.cards.retain(|card| !matches!(card,
+                    Card::Permission { request_id: id, .. } | Card::Diff { request_id: id, .. }
+                    | Card::Question { question_id: id, .. }
+                    | Card::Plan { request_id: id, .. } | Card::Airtight { request_id: id, .. } if id == &request_id));
+                self.policy_requests.remove(&request_id);
+                self.request_context.remove(&request_id);
+                true
+            }
+            ChatAction::PolicyError {
+                request_id,
+                message,
+            } => {
+                self.policy_states
+                    .insert(request_id, PolicyState::Error(message));
+                true
+            }
+            ChatAction::DiffHunk {
+                request_id,
+                hunk,
+                approved,
+            } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
+                self.diff_decisions
+                    .entry(request_id)
+                    .or_default()
+                    .push(DiffDecision::Hunk { hunk, approved });
+                true
+            }
+            ChatAction::DiffWholeFile {
+                request_id,
+                approved,
+            } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
+                self.diff_decisions
+                    .entry(request_id)
+                    .or_default()
+                    .push(DiffDecision::WholeFile { approved });
+                true
+            }
         }
     }
 
+    fn apply_policy_event(&mut self, event: PolicyEvent) -> bool {
+        match event {
+            PolicyEvent::Permission(request) => {
+                let id = request.request_id.clone();
+                if self.policy_requests.contains_key(&id) {
+                    return false;
+                }
+                self.request_context.insert(
+                    id.clone(),
+                    (request.session_id.clone(), request.turn_id.clone()),
+                );
+                self.policy_requests
+                    .insert(id.clone(), PolicyRequest::Permission(request.clone()));
+                self.cards.push(Card::Permission {
+                    request_id: id,
+                    tool: request.tool,
+                    description: request.arguments.to_string(),
+                });
+            }
+            PolicyEvent::Question(request) => {
+                let id = request.request_id.clone();
+                if self.policy_requests.contains_key(&id) {
+                    return false;
+                }
+                self.request_context.insert(
+                    id.clone(),
+                    (request.session_id.clone(), request.turn_id.clone()),
+                );
+                self.policy_requests
+                    .insert(id.clone(), PolicyRequest::Question(request.clone()));
+                self.cards.push(Card::Question {
+                    question_id: id,
+                    question: request.question,
+                    answer: None,
+                });
+            }
+            PolicyEvent::Diff(request) => {
+                let id = request.request_id.clone();
+                if self.policy_requests.contains_key(&id) {
+                    return false;
+                }
+                self.request_context.insert(
+                    id.clone(),
+                    (request.session_id.clone(), request.turn_id.clone()),
+                );
+                self.policy_requests
+                    .insert(id.clone(), PolicyRequest::Diff(request.clone()));
+                let patch = request
+                    .files
+                    .iter()
+                    .flat_map(|file| file.hunks.iter().map(|hunk| hunk.patch.clone()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.cards.push(Card::Diff {
+                    request_id: id,
+                    path: request
+                        .files
+                        .first()
+                        .map(|file| file.path.clone())
+                        .unwrap_or_default(),
+                    patch,
+                    approved: false,
+                });
+            }
+            PolicyEvent::Plan(request) => {
+                let id = request.request_id.clone();
+                if self.policy_requests.contains_key(&id) {
+                    return false;
+                }
+                self.policy_requests
+                    .insert(id.clone(), PolicyRequest::Plan(request.clone()));
+                self.cards.push(Card::Plan {
+                    request_id: id,
+                    revision: request.revision,
+                    accepted: None,
+                });
+            }
+            PolicyEvent::Airtight(request) => {
+                let id = request.request_id.clone();
+                if self.policy_requests.contains_key(&id) {
+                    return false;
+                }
+                self.policy_requests
+                    .insert(id.clone(), PolicyRequest::Airtight(request.clone()));
+                self.cards.push(Card::Airtight {
+                    request_id: id,
+                    step: request.step,
+                    granted: None,
+                });
+            }
+        }
+        true
+    }
+
     fn apply_session_event(&mut self, event: SequencedEvent) -> bool {
+        let session_id = event.session_id;
+        self.session_id = Some(session_id.clone());
         match event.event {
             TurnEvent::TextDelta { text, .. } => {
                 let Some(index) = self.active_assistant else {
@@ -211,36 +448,53 @@ impl ChatState {
                 true
             }
             TurnEvent::PermissionRequested {
+                turn_id,
                 request_id,
                 tool,
                 description,
                 ..
             } => {
+                let context_id = request_id.clone();
                 self.cards.push(Card::Permission {
                     request_id,
                     tool,
                     description,
                 });
+                self.request_context
+                    .insert(context_id, (session_id, turn_id));
                 true
             }
             TurnEvent::QuestionAsked {
+                turn_id,
                 question_id,
                 question,
                 ..
             } => {
+                let context_id = question_id.clone();
                 self.cards.push(Card::Question {
                     question_id,
                     question,
                     answer: None,
                 });
+                self.request_context
+                    .insert(context_id, (session_id, turn_id));
                 true
             }
-            TurnEvent::DiffRequested { path, diff, .. } => {
+            TurnEvent::DiffRequested {
+                turn_id,
+                request_id,
+                path,
+                diff,
+            } => {
+                let context_id = request_id.clone();
                 self.cards.push(Card::Diff {
+                    request_id,
                     path,
                     patch: diff,
                     approved: false,
                 });
+                self.request_context
+                    .insert(context_id, (session_id, turn_id));
                 true
             }
             TurnEvent::TurnCompleted { .. } => {
@@ -326,6 +580,15 @@ mod tests {
         });
         assert!(state.reduce(ChatAction::Permission(1, PermissionChoice::AllowOnce)));
         assert!(
+            state
+                .cards
+                .iter()
+                .any(|card| matches!(card, Card::Permission { .. }))
+        );
+        assert!(state.reduce(ChatAction::PolicyAck {
+            request_id: "r1".into()
+        }));
+        assert!(
             !state
                 .cards
                 .iter()
@@ -371,13 +634,14 @@ mod tests {
         ));
 
         state.cards.push(Card::Diff {
+            request_id: "test-diff".into(),
             path: "file.rs".into(),
             patch: "@@".into(),
             approved: false,
         });
         assert!(state.reduce(ChatAction::ApproveDiff(2, false)));
         assert!(
-            !state
+            state
                 .cards
                 .iter()
                 .any(|card| matches!(card, Card::Diff { .. }))

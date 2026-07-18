@@ -15,5 +15,9 @@ tempfile.workspace = true
 tau-client.workspace = true
 tau-core.workspace = true
 tau-proto.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 kdl.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true

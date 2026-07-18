@@ -1,13 +1,20 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{
-    IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams, TurnStartParams,
+    AirtightPromptReply, AirtightPromptRequest, DiffDecision, DiffReply, IdempotencyKey,
+    PermissionChoice, PermissionReply, PermissionRequest, PermissionScope, PlanReply, PlanRequest,
+    PromptActor, QuestionReply, QuestionRequest, RequestAction, TurnCancelParams,
+    TurnPermissionChoice, TurnReplayParams, TurnStartParams,
 };
 use tokio::sync::mpsc;
 
@@ -20,6 +27,7 @@ pub struct Backend {
     session: Arc<tokio::sync::Mutex<Option<tau_client::Client>>>,
     active: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     active_turn: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
+    turn_epoch: Arc<AtomicU64>,
     _daemon: Arc<Mutex<Option<Child>>>,
     auto_started: bool,
 }
@@ -69,6 +77,313 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    fn turn_key(
+        session_id: Option<&str>,
+        prompt: &str,
+        agent: Option<&str>,
+        model: &str,
+        cwd: &str,
+    ) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        session_id.hash(&mut hasher);
+        prompt.hash(&mut hasher);
+        agent.hash(&mut hasher);
+        model.hash(&mut hasher);
+        cwd.hash(&mut hasher);
+        format!("gui-turn-{:016x}", hasher.finish())
+    }
+
+    fn policy_key(request_id: &str, operation: &str) -> String {
+        format!("gui-policy-{operation}-{request_id}")
+    }
+
+    fn policy_task<F, Fut>(
+        &self,
+        action: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>>
+    where
+        F: FnOnce(tau_client::Client) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<serde_json::Value>> + Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let session = self.session.clone();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    *guard = Some(tau_client::Client::connect(socket).await?);
+                }
+                let client = guard.as_ref().expect("session initialized").clone();
+                drop(guard);
+                action(client).await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    pub fn policy_events(&self) -> tau_client::PolicyEventStream {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let session = self.session.clone();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let client = match async {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    *guard = Some(tau_client::Client::connect(socket).await?);
+                }
+                Ok::<_, anyhow::Error>(guard.as_ref().expect("session initialized").clone())
+            }
+            .await
+            {
+                Ok(client) => client,
+                Err(_) => return,
+            };
+            let mut events = client.policy_events();
+            while let Some(event) = events.next().await {
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        tau_client::PolicyEventStream::from_receiver(rx)
+    }
+
+    pub fn reply_permission(
+        &self,
+        request: PermissionRequest,
+        choice: PermissionChoice,
+        scope: PermissionScope,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok::<serde_json::Value, anyhow::Error>(
+                    client
+                        .permission_reply(PermissionReply {
+                            request_id: request_id.clone(),
+                            idempotency_key: Self::policy_key(&request_id, "permission"),
+                            choice,
+                            scope,
+                            actor: PromptActor::Human,
+                        })
+                        .await?,
+                )
+            })
+        })
+    }
+
+    pub fn reply_question(
+        &self,
+        request: QuestionRequest,
+        answer: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok::<serde_json::Value, anyhow::Error>(
+                    client
+                        .question_reply(QuestionReply {
+                            request_id: request_id.clone(),
+                            idempotency_key: Self::policy_key(&request_id, "question"),
+                            answer,
+                            actor: PromptActor::Human,
+                        })
+                        .await?,
+                )
+            })
+        })
+    }
+
+    pub fn reply_diff(
+        &self,
+        request: tau_proto::prelude::DiffRequest,
+        accepted: bool,
+        decisions: Vec<tau_proto::prelude::HunkDecision>,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok::<serde_json::Value, anyhow::Error>(
+                    client
+                        .diff_reply(DiffReply {
+                            request_id: request_id.clone(),
+                            idempotency_key: Self::policy_key(&request_id, "diff"),
+                            accepted,
+                            decisions,
+                            actor: PromptActor::Human,
+                        })
+                        .await?,
+                )
+            })
+        })
+    }
+
+    pub fn decide_diff(
+        &self,
+        request: tau_proto::prelude::DiffRequest,
+        decisions: Vec<tau_proto::prelude::HunkDecision>,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok::<serde_json::Value, anyhow::Error>(
+                    client
+                        .diff_decision(DiffDecision {
+                            request_id: request_id.clone(),
+                            idempotency_key: Self::policy_key(&request_id, "diff-decision"),
+                            decisions,
+                            actor: PromptActor::Human,
+                        })
+                        .await?,
+                )
+            })
+        })
+    }
+
+    pub fn reply_plan(
+        &self,
+        request: PlanRequest,
+        accepted: bool,
+        revision: u64,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok::<serde_json::Value, anyhow::Error>(
+                    client
+                        .plan_reply(PlanReply {
+                            request_id: request_id.clone(),
+                            idempotency_key: Self::policy_key(&request_id, "plan"),
+                            accepted,
+                            revision,
+                            actor: PromptActor::Human,
+                        })
+                        .await?,
+                )
+            })
+        })
+    }
+
+    pub fn reply_airtight(
+        &self,
+        request: AirtightPromptRequest,
+        granted: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok::<serde_json::Value, anyhow::Error>(
+                    client
+                        .airtight_reply(AirtightPromptReply {
+                            request_id: request_id.clone(),
+                            idempotency_key: Self::policy_key(&request_id, "airtight"),
+                            granted,
+                            actor: PromptActor::Human,
+                        })
+                        .await?,
+                )
+            })
+        })
+    }
+
+    pub fn reply_turn_permission(
+        &self,
+        session_id: String,
+        turn_id: String,
+        request_id: String,
+        choice: TurnPermissionChoice,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.turn_policy_task(move |client| async move {
+            client
+                .permission_response(
+                    session_id,
+                    turn_id,
+                    request_id.clone(),
+                    choice,
+                    IdempotencyKey::new(Self::policy_key(&request_id, "turn-permission")),
+                )
+                .await
+        })
+    }
+
+    pub fn reply_turn_question(
+        &self,
+        session_id: String,
+        turn_id: String,
+        question_id: String,
+        answer: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.turn_policy_task(move |client| async move {
+            client
+                .question_response(
+                    session_id,
+                    turn_id,
+                    question_id.clone(),
+                    answer,
+                    IdempotencyKey::new(Self::policy_key(&question_id, "turn-question")),
+                )
+                .await
+        })
+    }
+
+    pub fn reply_turn_diff(
+        &self,
+        session_id: String,
+        turn_id: String,
+        path: String,
+        approved: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.turn_policy_task(move |client| async move {
+            client
+                .diff_response(
+                    session_id,
+                    turn_id,
+                    path.clone(),
+                    0,
+                    approved,
+                    IdempotencyKey::new(Self::policy_key(&path, "turn-diff")),
+                )
+                .await
+        })
+    }
+
+    fn turn_policy_task<F, Fut>(
+        &self,
+        action: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    where
+        F: FnOnce(tau_client::Client) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<tau_proto::prelude::TurnResponseResult>>
+            + Send
+            + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let session = self.session.clone();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    *guard = Some(tau_client::Client::connect(socket).await?);
+                }
+                let client = guard.as_ref().expect("session initialized").clone();
+                drop(guard);
+                action(client).await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
+    }
     pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, bool, String, String)> {
         let daemon = ensure_daemon(socket).await?;
         let auto_started = daemon.is_some();
@@ -127,6 +442,7 @@ impl Backend {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             active: Arc::new(Mutex::new(None)),
             active_turn: Arc::new(Mutex::new(None)),
+            turn_epoch: Arc::new(AtomicU64::new(0)),
             _daemon: Arc::new(Mutex::new(daemon)),
             auto_started,
         }
@@ -199,16 +515,26 @@ impl Backend {
         let socket = self.socket.clone();
         let cwd = self.cwd.clone();
         let model = model.unwrap_or_else(|| self.model.clone());
+        let idempotency_key = Self::turn_key(
+            session_id.as_deref(),
+            &prompt,
+            agent.as_deref(),
+            &model,
+            &cwd,
+        );
         let session = self.session.clone();
         let active_turn = self.active_turn.clone();
+        let turn_epoch = self.turn_epoch.clone();
         self.cancel();
+        let epoch = turn_epoch.load(Ordering::Acquire);
         let task = self.runtime.spawn(async move {
             let result = async {
                 let mut guard = session.lock().await;
                 if guard.is_none() {
                     *guard = Some(tau_client::Client::connect(&socket).await?);
                 }
-                let client = guard.as_mut().expect("session initialized");
+                let client = guard.as_ref().expect("session initialized").clone();
+                drop(guard);
                 let params = TurnStartParams {
                     model,
                     prompt,
@@ -218,12 +544,7 @@ impl Backend {
                     task_tier: None,
                     autonomous: None,
                     action: Some(RequestAction::Submit),
-                    idempotency_key: IdempotencyKey::new(format!(
-                        "gui-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_nanos())
-                    )),
+                    idempotency_key: IdempotencyKey::new(idempotency_key),
                 };
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
@@ -232,12 +553,14 @@ impl Backend {
                         if let tau_proto::prelude::TurnEvent::TurnStarted { turn_id } =
                             &sequenced.event
                         {
-                            if let Ok(mut active) = active_turn.lock() {
-                                *active = Some((
-                                    client.clone(),
-                                    sequenced.session_id.clone(),
-                                    turn_id.clone(),
-                                ));
+                            if turn_epoch.load(Ordering::Acquire) == epoch {
+                                if let Ok(mut active) = active_turn.lock() {
+                                    *active = Some((
+                                        client.clone(),
+                                        sequenced.session_id.clone(),
+                                        turn_id.clone(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -246,8 +569,10 @@ impl Backend {
                         .send(Ok(event))
                         .map_err(|_| anyhow::anyhow!("GUI closed"))?;
                     if complete {
-                        if let Ok(mut active) = active_turn.lock() {
-                            active.take();
+                        if turn_epoch.load(Ordering::Acquire) == epoch {
+                            if let Ok(mut active) = active_turn.lock() {
+                                active.take();
+                            }
                         }
                         break;
                     }
@@ -268,20 +593,17 @@ impl Backend {
     /// Stop delivery for the active turn. The daemon owns cancellation; the
     /// next replay/turn remains available on the persistent session.
     pub fn cancel(&self) {
+        self.turn_epoch.fetch_add(1, Ordering::AcqRel);
         let active_turn = self.active_turn.clone();
         self.runtime.spawn(async move {
             let active = active_turn.lock().ok().and_then(|mut value| value.take());
             if let Some((client, session_id, turn_id)) = active {
+                let key = format!("gui-cancel-{session_id}-{turn_id}");
                 let _ = client
                     .turn_cancel(TurnCancelParams {
                         session_id,
                         turn_id,
-                        idempotency_key: IdempotencyKey::new(format!(
-                            "gui-cancel-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |d| d.as_nanos())
-                        )),
+                        idempotency_key: IdempotencyKey::new(key),
                     })
                     .await;
             }
@@ -299,10 +621,16 @@ impl Backend {
         after_sequence: u64,
     ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnReplayResult, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let session = self.session.clone();
         let socket = self.socket.clone();
         self.runtime.spawn(async move {
             let result = async {
-                let client = tau_client::Client::connect(socket).await?;
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    *guard = Some(tau_client::Client::connect(socket).await?);
+                }
+                let client = guard.as_ref().expect("session initialized").clone();
+                drop(guard);
                 client
                     .turn_replay(TurnReplayParams {
                         session_id,
