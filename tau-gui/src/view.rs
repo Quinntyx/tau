@@ -11,6 +11,7 @@ use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, Permission
 use crate::composer::ComposerAction;
 use crate::feed;
 use crate::input::{TextInput, command_mode};
+use crate::operations::OperationsModel;
 use crate::picker::{
     AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
     next_agent, parse_command,
@@ -31,7 +32,18 @@ gpui::actions!(
         PickItem,
         ToggleSidebar,
         ToggleFollow,
-        ToggleSessions
+        ToggleSessions,
+        OperationsStatus,
+        OperationsGit,
+        OperationsChanges,
+        OperationsRefresh,
+        OperationsStage,
+        OperationsUnstage,
+        OperationsRevert,
+        OperationsKeep,
+        OperationsAcknowledge,
+        OperationsCreateBranch,
+        OperationsSwitchBranch
     ]
 );
 
@@ -391,6 +403,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", PickerUp, None),
         KeyBinding::new("down", PickerDown, None),
         KeyBinding::new("enter", PickItem, Some("Picker")),
+        KeyBinding::new("ctrl-shift-r", OperationsRefresh, None),
     ]);
 }
 
@@ -425,6 +438,17 @@ pub struct TauView {
     sessions: Navigator,
     session_query: Entity<TextInput>,
     sessions_open: bool,
+    operations: OperationsModel,
+    operations_loading: bool,
+    operations_error: Option<String>,
+    operations_tab: OperationsTab,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationsTab {
+    Status,
+    Git,
+    Changes,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -482,7 +506,7 @@ impl TauView {
             input.set_model(initial_model);
             input.set_agent(agent.clone());
         });
-        let view = Self {
+        let mut view = Self {
             input,
             picker_input,
             backend,
@@ -509,8 +533,13 @@ impl TauView {
             sessions: Navigator::default(),
             session_query,
             sessions_open: false,
+            operations: OperationsModel::new(),
+            operations_loading: false,
+            operations_error: None,
+            operations_tab: OperationsTab::Status,
         };
         // Session loading begins only after an explicit project selection.
+        view.refresh_operations(cx);
         view
     }
 
@@ -518,6 +547,486 @@ impl TauView {
     /// intentionally rejected until this explicit selection is supplied.
     pub fn select_project(&mut self, project_id: Option<String>) {
         self.selected_project_id = project_id.filter(|id| !id.trim().is_empty());
+    }
+
+    fn refresh_operations(&mut self, cx: &mut Context<Self>) {
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = self.backend.operations_status();
+        cx.spawn(async move |view, cx| {
+            let _ = match receiver.await {
+                Ok(Ok(result)) => view.update(cx, |view, cx| {
+                    view.operations.apply_status(result.branch, result.files);
+                    view.operations_loading = false;
+                    cx.notify();
+                }),
+                Ok(Err(error)) => view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                }),
+                Err(error) => view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                }),
+            };
+        })
+        .detach();
+        self.refresh_operation_branches(cx);
+    }
+
+    fn refresh_operation_branches(&mut self, cx: &mut Context<Self>) {
+        let receiver = self.backend.operations_branches();
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(result)) = receiver.await {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations.branch = result.current;
+                    view.operations.apply_branches(result.branches);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn set_operations_tab(&mut self, tab: OperationsTab, cx: &mut Context<Self>) {
+        self.operations_tab = tab;
+        cx.notify();
+    }
+
+    fn open_operation_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = self.backend.operations_file(path);
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(file)) => {
+                let _ = view.update(cx, |view, cx| {
+                    let revision = crate::operations::content_revision(&file.content);
+                    view.operations.invalidate_revision(&file.path, &revision);
+                    view.operations.select_file(file);
+                    view.operations_loading = false;
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn operation_path(&self) -> Option<String> {
+        self.operations
+            .selected
+            .as_ref()
+            .map(|file| file.path.clone())
+    }
+
+    fn operation_mutation(&mut self, path: String, kind: &'static str, cx: &mut Context<Self>) {
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = match kind {
+            "stage" => self.backend.operations_stage(path),
+            "unstage" => self.backend.operations_unstage(path),
+            "revert" => self.backend.operations_revert(path, true),
+            _ => return,
+        };
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(_)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations.acknowledge(true);
+                    view.refresh_operations(cx);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn keep_operation(&mut self, cx: &mut Context<Self>) {
+        if let Some(file) = self.operations.selected.as_ref() {
+            let revision = crate::operations::content_revision(&file.content);
+            self.operations.toggle_keep(file.path.clone(), revision);
+            cx.notify();
+        }
+    }
+
+    fn acknowledge_operation(&mut self, cx: &mut Context<Self>) {
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = self.backend.operations_ack("operations".into(), true);
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(result)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations.acknowledge(result.acknowledged);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error);
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn create_operation_branch(&mut self, cx: &mut Context<Self>) {
+        let receiver = self
+            .backend
+            .operations_create_branch("tau/gui-review".into());
+        cx.spawn(async move |view, cx| {
+            let _ = receiver.await;
+            let _ = view.update(cx, |view, cx| {
+                view.refresh_operation_branches(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn switch_operation_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        let receiver = self.backend.operations_switch_branch(name);
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(_)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.refresh_operations(cx);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn operations_refresh_action(
+        &mut self,
+        _: &OperationsRefresh,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_operations(cx);
+    }
+
+    fn operations_status_action(
+        &mut self,
+        _: &OperationsStatus,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_operations_tab(OperationsTab::Status, cx);
+    }
+
+    fn operations_git_action(&mut self, _: &OperationsGit, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_operations_tab(OperationsTab::Git, cx);
+    }
+
+    fn operations_changes_action(
+        &mut self,
+        _: &OperationsChanges,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_operations_tab(OperationsTab::Changes, cx);
+    }
+
+    fn operations_stage_action(
+        &mut self,
+        _: &OperationsStage,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.operation_path() {
+            self.operation_mutation(path, "stage", cx);
+        }
+    }
+
+    fn operations_unstage_action(
+        &mut self,
+        _: &OperationsUnstage,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.operation_path() {
+            self.operation_mutation(path, "unstage", cx);
+        }
+    }
+
+    fn operations_revert_action(
+        &mut self,
+        _: &OperationsRevert,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.operation_path() {
+            self.operation_mutation(path, "revert", cx);
+        }
+    }
+
+    fn operations_keep_action(
+        &mut self,
+        _: &OperationsKeep,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.keep_operation(cx);
+    }
+
+    fn operations_acknowledge_action(
+        &mut self,
+        _: &OperationsAcknowledge,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.acknowledge_operation(cx);
+    }
+
+    fn operations_create_action(
+        &mut self,
+        _: &OperationsCreateBranch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.create_operation_branch(cx);
+    }
+
+    fn operations_switch_action(
+        &mut self,
+        _: &OperationsSwitchBranch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(branch) = self
+            .operations
+            .branches
+            .iter()
+            .find(|branch| !branch.current)
+        {
+            self.switch_operation_branch(branch.name.clone(), cx);
+        }
+    }
+
+    fn operations_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = if self.operations_loading {
+            "Loading…"
+        } else if let Some(error) = &self.operations_error {
+            error.as_str()
+        } else {
+            "Ready"
+        };
+        let branch = if self.operations.branch.is_empty() {
+            "(unknown)"
+        } else {
+            &self.operations.branch
+        };
+        let acknowledgement = self
+            .operations
+            .acknowledgement
+            .map(|value| {
+                if value {
+                    "acknowledged"
+                } else {
+                    "not acknowledged"
+                }
+            })
+            .unwrap_or("—");
+        let active_tab = match self.operations_tab {
+            OperationsTab::Status => "Status",
+            OperationsTab::Git => "Git",
+            OperationsTab::Changes => "Changes",
+        };
+        let mut panel = div()
+            .w(px(340.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .border_l_1()
+            .border_color(rgb(0x2c3340))
+            .child(div().text_lg().child("Status / Git / Changes"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8994a8))
+                    .child(format!("Status · {status}")),
+            )
+            .child(div().child(format!("Branch: {branch}")))
+            .child(div().text_xs().child(format!("Ack · {acknowledgement}")))
+            .child(div().text_xs().child(format!("Tab · {active_tab}")))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(toast_button(
+                        "Status",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.set_operations_tab(OperationsTab::Status, cx)
+                        }),
+                    ))
+                    .child(toast_button(
+                        "Git",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.set_operations_tab(OperationsTab::Git, cx)
+                        }),
+                    ))
+                    .child(toast_button(
+                        "Changes",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.set_operations_tab(OperationsTab::Changes, cx)
+                        }),
+                    ))
+                    .child(toast_button(
+                        "Refresh",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| view.refresh_operations(cx)),
+                    )),
+            );
+        panel = panel.children(self.operations.files.iter().map(|file| {
+            let path = file.path.clone();
+            let callback_path = path.clone();
+            div()
+                .flex()
+                .justify_between()
+                .child(toast_button(
+                    path,
+                    0x263348,
+                    cx.listener(move |view, _, _, cx| {
+                        view.open_operation_file(callback_path.clone(), cx)
+                    }),
+                ))
+                .child(if file.staged {
+                    "staged"
+                } else if file.untracked {
+                    "untracked"
+                } else {
+                    "modified"
+                })
+        }));
+        if let Some(file) = &self.operations.selected {
+            let stage_path = file.path.clone();
+            let unstage_path = file.path.clone();
+            let revert_path = file.path.clone();
+            let revision = crate::operations::content_revision(&file.content);
+            let keep_label = if self.operations.is_kept(&file.path, &revision) {
+                "Unkeep"
+            } else {
+                "Keep"
+            };
+            let mut details = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().child(format!(
+                    "{}\n\nCONTENT\n{}\nDIFF\n{}",
+                    file.path, file.content, file.diff
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(toast_button(
+                            "Stage",
+                            0x33445f,
+                            cx.listener(move |view, _, _, cx| {
+                                view.operation_mutation(stage_path.clone(), "stage", cx)
+                            }),
+                        ))
+                        .child(toast_button(
+                            "Unstage",
+                            0x33445f,
+                            cx.listener(move |view, _, _, cx| {
+                                view.operation_mutation(unstage_path.clone(), "unstage", cx)
+                            }),
+                        ))
+                        .child(toast_button(
+                            "Revert (confirm)",
+                            0x7d3b3b,
+                            cx.listener(move |view, _, _, cx| {
+                                view.operation_mutation(revert_path.clone(), "revert", cx)
+                            }),
+                        ))
+                        .child(toast_button(
+                            keep_label,
+                            0x52627a,
+                            cx.listener(|view, _, _, cx| view.keep_operation(cx)),
+                        )),
+                )
+                .child(div().child("Branches"));
+            details = details.children(self.operations.branches.iter().map(|branch| {
+                let name = branch.name.clone();
+                let callback_name = name.clone();
+                toast_button(
+                    name,
+                    0x263348,
+                    cx.listener(move |view, _, _, cx| {
+                        view.switch_operation_branch(callback_name.clone(), cx)
+                    }),
+                )
+            }));
+            details = details.child(toast_button(
+                "Create tau/gui-review",
+                0x33445f,
+                cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
+            ));
+            details = details.child(toast_button(
+                "Acknowledge",
+                0x52627a,
+                cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
+            ));
+            panel = panel.child(details);
+        }
+        panel
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -2112,6 +2621,17 @@ impl Render for TauView {
         }
         root = root.on_action(cx.listener(Self::toggle_sidebar));
         root = root.on_action(cx.listener(Self::toggle_follow));
+        root = root.on_action(cx.listener(Self::operations_status_action));
+        root = root.on_action(cx.listener(Self::operations_git_action));
+        root = root.on_action(cx.listener(Self::operations_changes_action));
+        root = root.on_action(cx.listener(Self::operations_refresh_action));
+        root = root.on_action(cx.listener(Self::operations_stage_action));
+        root = root.on_action(cx.listener(Self::operations_unstage_action));
+        root = root.on_action(cx.listener(Self::operations_revert_action));
+        root = root.on_action(cx.listener(Self::operations_keep_action));
+        root = root.on_action(cx.listener(Self::operations_acknowledge_action));
+        root = root.on_action(cx.listener(Self::operations_create_action));
+        root = root.on_action(cx.listener(Self::operations_switch_action));
         root.child(header)
             .when(self.sessions_open, |root| {
                 root.child(self.session_panel(cx))
@@ -2123,7 +2643,9 @@ impl Render for TauView {
                     .flex_1()
                     .min_h(px(0.))
                     .child(transcript)
-                    .when(self.sidebar_visible, |view| view.child(sidebar)),
+                    .when(self.sidebar_visible, |view| {
+                        view.child(sidebar).child(self.operations_panel(cx))
+                    }),
             )
             .child(footer)
             .when(self.toast_visible, |root| {
@@ -2159,11 +2681,10 @@ fn sidebar_card(title: &str, value: &str) -> impl IntoElement {
         .child(div().text_sm().child(value.to_string()))
 }
 
-fn toast_button(
-    label: &str,
-    color: u32,
-    callback: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+fn toast_button<T>(label: impl Into<String>, color: u32, callback: T) -> impl IntoElement
+where
+    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+{
     div()
         .px_2()
         .py_1()
@@ -2171,7 +2692,7 @@ fn toast_button(
         .bg(rgb(color))
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
-        .child(label.to_string())
+        .child(label.into())
 }
 
 #[cfg(test)]

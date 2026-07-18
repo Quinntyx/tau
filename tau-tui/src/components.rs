@@ -1,4 +1,5 @@
 //! Small composable widgets. Keeping these pure makes ratatui snapshots cheap.
+use crate::operations::OperationsState;
 use crate::{feed, projects::ProjectState, reducer::filtered_models, shell, state::*};
 use ratatui::{
     Frame,
@@ -27,9 +28,13 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
     }
     let content = shell::content_area(frame.area());
     let root = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(40), Constraint::Length(38)])
+        .split(content);
+    let conversation = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(7)])
-        .split(content);
+        .split(root[0]);
     let transcript = s.transcript.join("\n");
     if !s.raw_events.is_empty() {
         let mut projection =
@@ -39,7 +44,7 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
                 item.collapsed = false;
             }
         }
-        feed::render(frame, root[0], &projection);
+        feed::render(frame, conversation[0], &projection);
     } else {
         frame.render_widget(
             Paragraph::new(transcript).wrap(Wrap { trim: false }).block(
@@ -47,7 +52,7 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
                     .borders(Borders::ALL)
                     .title(" Conversation "),
             ),
-            root[0],
+            conversation[0],
         );
     }
     let footer = Line::from(vec![
@@ -91,14 +96,23 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
                 .borders(Borders::ALL)
                 .title(" prompt (Shift+Enter newline) "),
         ),
-        root[1],
+        conversation[1],
     );
     // Keep the terminal cursor at the UTF-8 byte cursor's visual column so
     // multiline editing remains usable instead of merely storing text.
     let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
     let line = s.input[..s.cursor].matches('\n').count() as u16;
     let column = s.input[line_start..s.cursor].chars().count() as u16;
-    frame.set_cursor_position((root[1].x + 1 + column, root[1].y + 2 + line));
+    frame.set_cursor_position((conversation[1].x + 1 + column, conversation[1].y + 2 + line));
+    render_operations_panel(
+        frame,
+        root[1],
+        &s.operations,
+        s.operations_tab,
+        s.operations_loading,
+        s.operations_error.as_deref(),
+        s.operations_ack.as_deref(),
+    );
     if s.picker != Picker::None {
         picker(frame, s);
     }
@@ -137,6 +151,114 @@ fn session_navigator(frame: &mut Frame, s: &AppState) {
         state.select(Some(s.sessions.selected.min(item_count - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Render the daemon-backed operations projection. The caller owns loading,
+/// error, selected-tab, and acknowledgement state; this widget only reads it.
+/// `OperationsState` currently carries the durable portion of that projection.
+pub fn render_operations_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &OperationsState,
+    tab: OperationsTab,
+    loading: bool,
+    error: Option<&str>,
+    acknowledgement: Option<&str>,
+) {
+    let tab_label = |name, selected| {
+        if selected {
+            Span::styled(
+                format!(" {name} "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(format!(" {name} "))
+        }
+    };
+    let tabs = Line::from(vec![
+        tab_label("Status", tab == OperationsTab::Status),
+        tab_label("Git", tab == OperationsTab::Git),
+        tab_label("Changes", tab == OperationsTab::Changes),
+    ]);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+        .split(area);
+    let files = state
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let marker = if file.staged { "●" } else { "○" };
+            let selected = if i == state.selected { ">" } else { " " };
+            ListItem::new(format!("{selected}{marker} {}", file.path))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(files).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Operations [{}]", state.branch)),
+    );
+    frame.render_widget(list, columns[0]);
+    let mut body = vec![tabs];
+    body.push(Line::from(if loading {
+        " Loading: yes"
+    } else {
+        " Loading: no"
+    }));
+    body.push(Line::from(match error {
+        Some(error) => format!(" Error: {error}"),
+        None => " Error: —".to_owned(),
+    }));
+    if let Some(acknowledgement) = acknowledgement {
+        body.push(Line::from(format!(" Acknowledgement: {acknowledgement}")));
+    }
+    if let Some(content) = &state.content {
+        body.push(Line::from(content.path.to_string()));
+        if tab == OperationsTab::Status {
+            body.push(Line::from("Status: selected project file"));
+        }
+        if tab == OperationsTab::Changes {
+            body.push(Line::from("Changes: full content and diff"));
+            body.extend(
+                content
+                    .content
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}"))),
+            );
+        }
+        body.push(Line::from(" Actions: [Enter/o] open  [R] refresh"));
+        body.push(Line::from(" [s] stage  [u] unstage  [v] revert"));
+        body.push(Line::from(" [K] keep  [a] acknowledge"));
+        body.push(Line::from(" [b] switch branch  [c] create branch"));
+        if tab != OperationsTab::Status {
+            body.extend(content.diff.lines().map(Line::from));
+        }
+        if state
+            .acknowledged
+            .get(&content.path)
+            .copied()
+            .unwrap_or(false)
+        {
+            body.insert(2, Line::from(" acknowledged ✓ "));
+        }
+    } else {
+        body.push(Line::from("Select a file to inspect full content/diff."));
+        body.push(Line::from(
+            "Actions: [R] refresh  [↑/↓] select  [Enter/o] open",
+        ));
+        body.push(Line::from("[b] switch branch  [c] create branch"));
+    }
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Git / Changes "),
+        ),
+        columns[1],
+    );
 }
 fn picker(frame: &mut Frame, s: &AppState) {
     let area = center(frame.area(), 60, 14);

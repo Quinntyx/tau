@@ -37,6 +37,7 @@ pub struct AppState {
     events: tokio::sync::broadcast::Sender<SequencedEvent>,
     policy: Arc<PolicyBroker>,
     provider_override: Option<tau_core::provider::Provider>,
+    git_acks: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 struct PolicyBroker {
@@ -83,6 +84,7 @@ impl AppState {
             events: tokio::sync::broadcast::channel(4096).0,
             policy: Arc::new(PolicyBroker::new()),
             provider_override: None,
+            git_acks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -423,6 +425,15 @@ async fn handle_request(
             resolve_prompt(id, req.params, state, client_id, "airtight", true).await
         }
         METHOD_PROMPT_TAKEOVER => takeover_prompt(id, req.params, state, client_id).await,
+        METHOD_GIT_STATUS => git_status(id, req.params, state).await,
+        METHOD_GIT_FILE => git_file(id, req.params, state).await,
+        METHOD_GIT_STAGE => git_path_op(id, req.params, state, true).await,
+        METHOD_GIT_UNSTAGE => git_path_op(id, req.params, state, false).await,
+        METHOD_GIT_REVERT => git_revert(id, req.params, state).await,
+        METHOD_GIT_ACK => git_ack(id, req.params, state).await,
+        METHOD_GIT_BRANCHES => git_branches(id, req.params, state).await,
+        METHOD_GIT_BRANCH_CREATE => git_branch_create(id, req.params, state).await,
+        METHOD_GIT_BRANCH_SWITCH => git_branch_switch(id, req.params, state).await,
         other => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             METHOD_NOT_FOUND,
@@ -448,6 +459,15 @@ fn rpc_error(id: Id, code: i32, message: impl Into<String>) -> String {
         id,
         code,
         message.into(),
+    ))
+    .unwrap_or_default()
+}
+
+fn git_error(id: Id, error: impl std::fmt::Display) -> String {
+    serde_json::to_string(&Response::<serde_json::Value>::err(
+        id,
+        INVALID_PARAMS,
+        error.to_string(),
     ))
     .unwrap_or_default()
 }
@@ -837,6 +857,222 @@ where
             e.to_string(),
         ))
         .unwrap_or_default(),
+    }
+}
+
+fn parse_git<T: serde::de::DeserializeOwned>(
+    value: Option<serde_json::Value>,
+    message: &str,
+) -> anyhow::Result<T> {
+    value
+        .ok_or_else(|| anyhow::anyhow!(message.to_owned()))
+        .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+}
+
+fn ack_response(id: Id) -> String {
+    serde_json::to_string(&Response::ok(
+        id,
+        tau_proto::git::GitAckResult { acknowledged: true },
+    ))
+    .unwrap_or_default()
+}
+
+async fn git_status(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+    let Ok(params) =
+        parse_git::<tau_proto::git::GitStatusParams>(value, "invalid git status parameters")
+    else {
+        return git_error(id, "invalid git status parameters");
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace = tau_core::git::GitWorkspace::open(params.project)?;
+        let status = workspace.status(std::path::Path::new("."))?;
+        Ok::<_, anyhow::Error>(tau_proto::git::GitStatusResult {
+            branch: status.branch,
+            files: status
+                .files
+                .into_iter()
+                .map(|file| tau_proto::git::GitFileStatus {
+                    path: file.path,
+                    staged: file.staged,
+                    modified: file.modified,
+                    untracked: file.untracked,
+                })
+                .collect(),
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => serde_json::to_string(&Response::ok(id, result)).unwrap_or_default(),
+        Ok(Err(error)) => git_error(id, error),
+        Err(error) => git_error(id, error),
+    }
+}
+
+async fn git_file(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+    let Ok(params) =
+        parse_git::<tau_proto::git::GitFileParams>(value, "invalid git file parameters")
+    else {
+        return git_error(id, "invalid git file parameters");
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
+        let file = workspace.file(
+            std::path::Path::new("."),
+            std::path::Path::new(&params.path),
+        )?;
+        Ok::<_, anyhow::Error>(tau_proto::git::GitFileResult {
+            path: file.path,
+            content: file.content,
+            diff: file.diff,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => serde_json::to_string(&Response::ok(id, result)).unwrap_or_default(),
+        Ok(Err(error)) => git_error(id, error),
+        Err(error) => git_error(id, error),
+    }
+}
+
+async fn git_path_op(
+    id: Id,
+    value: Option<serde_json::Value>,
+    _state: &AppState,
+    stage: bool,
+) -> String {
+    let Ok(params) =
+        parse_git::<tau_proto::git::GitPathParams>(value, "invalid git path parameters")
+    else {
+        return git_error(id, "invalid git path parameters");
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
+        let project = std::path::Path::new(".");
+        let path = std::path::Path::new(&params.path);
+        if stage {
+            workspace.stage(project, path)?;
+        } else {
+            workspace.unstage(project, path)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => ack_response(id),
+        Ok(Err(error)) => git_error(id, error),
+        Err(error) => git_error(id, error),
+    }
+}
+
+async fn git_revert(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+    let Ok(params) =
+        parse_git::<tau_proto::git::GitRevertParams>(value, "invalid revert parameters")
+    else {
+        return git_error(id, "invalid revert parameters");
+    };
+    if !params.validate() {
+        return git_error(id, "confirmation and safe path required");
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
+        workspace.revert(
+            std::path::Path::new("."),
+            std::path::Path::new(&params.path),
+            params.confirmed,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => ack_response(id),
+        Ok(Err(error)) => git_error(id, error),
+        Err(error) => git_error(id, error),
+    }
+}
+
+async fn git_ack(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
+    let Ok(params) = parse_git::<tau_proto::git::GitAckParams>(value, "invalid ack parameters")
+    else {
+        return git_error(id, "invalid ack parameters");
+    };
+    let project = params.project.clone();
+    let valid =
+        tokio::task::spawn_blocking(move || tau_core::git::GitWorkspace::open(project).map(|_| ()))
+            .await;
+    match valid {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return git_error(id, error),
+        Err(error) => return git_error(id, error),
+    }
+    let key = format!("{}\0{}", params.project, params.operation);
+    let mut acknowledgements = state.git_acks.lock().await;
+    let acknowledged = *acknowledgements.entry(key).or_insert(params.acknowledged);
+    serde_json::to_string(&Response::ok(
+        id,
+        tau_proto::git::GitAckResult { acknowledged },
+    ))
+    .unwrap_or_default()
+}
+
+async fn git_branches(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+    let Ok(params) =
+        parse_git::<tau_proto::git::GitBranchesParams>(value, "invalid branches parameters")
+    else {
+        return git_error(id, "invalid branches parameters");
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace = tau_core::git::GitWorkspace::open(params.project)?;
+        let current = workspace.status(std::path::Path::new("."))?.branch;
+        let branches = workspace
+            .branches(std::path::Path::new("."))?
+            .into_iter()
+            .map(|branch| tau_proto::git::GitBranch {
+                name: branch.name,
+                current: branch.current,
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(tau_proto::git::GitBranchesResult { current, branches })
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => serde_json::to_string(&Response::ok(id, result)).unwrap_or_default(),
+        Ok(Err(error)) => git_error(id, error),
+        Err(error) => git_error(id, error),
+    }
+}
+
+async fn git_branch_create(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+    let Ok(params) =
+        parse_git::<tau_proto::git::GitBranchCreateParams>(value, "invalid branch parameters")
+    else {
+        return git_error(id, "invalid branch parameters");
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
+        workspace.create_branch(std::path::Path::new("."), &params.name)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => ack_response(id),
+        Ok(Err(error)) => git_error(id, error),
+        Err(error) => git_error(id, error),
+    }
+}
+
+async fn git_branch_switch(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+    let Ok(params) =
+        parse_git::<tau_proto::git::GitBranchSwitchParams>(value, "invalid branch parameters")
+    else {
+        return git_error(id, "invalid branch parameters");
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
+        workspace.switch_branch(std::path::Path::new("."), &params.name)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => ack_response(id),
+        Ok(Err(error)) => git_error(id, error),
+        Err(error) => git_error(id, error),
     }
 }
 

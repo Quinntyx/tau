@@ -5,6 +5,7 @@ pub mod chat;
 pub mod composer;
 pub mod feed;
 pub mod input;
+pub mod operations;
 pub mod picker;
 pub mod preferences;
 pub mod projects;

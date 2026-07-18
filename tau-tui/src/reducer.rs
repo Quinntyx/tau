@@ -68,6 +68,17 @@ pub enum Action {
     SessionRestore,
     SessionToggleArchived,
     NewChat,
+    OperationsTab(OperationsTab),
+    OperationsRefresh,
+    OperationsSelect(i8),
+    OperationsOpen,
+    OperationsStage,
+    OperationsUnstage,
+    OperationsRevertConfirmed,
+    OperationsKeep,
+    OperationsAcknowledge,
+    OperationsCreateBranch(String),
+    OperationsSwitchBranch(String),
 }
 
 pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
@@ -142,6 +153,41 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
             Some(Action::ToggleSessions)
         }
         KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::NewChat),
+        KeyCode::F(6) => Some(Action::OperationsTab(OperationsTab::Status)),
+        KeyCode::F(7) => Some(Action::OperationsTab(OperationsTab::Git)),
+        KeyCode::F(8) => Some(Action::OperationsTab(OperationsTab::Changes)),
+        KeyCode::Tab if s.operations_focused => {
+            Some(Action::OperationsTab(match s.operations_tab {
+                OperationsTab::Status => OperationsTab::Git,
+                OperationsTab::Git => OperationsTab::Changes,
+                OperationsTab::Changes => OperationsTab::Status,
+            }))
+        }
+        KeyCode::Enter if s.operations_focused => Some(Action::OperationsOpen),
+        KeyCode::Char('R') if s.operations_focused => Some(Action::OperationsRefresh),
+        KeyCode::Char('s') if s.operations_focused => Some(Action::OperationsStage),
+        KeyCode::Char('u') if s.operations_focused => Some(Action::OperationsUnstage),
+        KeyCode::Char('K') if s.operations_focused => Some(Action::OperationsKeep),
+        // Keep Ctrl-A's existing accept-file binding; plain `a` is the
+        // operations-only acknowledgement shortcut.
+        KeyCode::Char('a')
+            if s.operations_focused && !k.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::OperationsAcknowledge)
+        }
+        KeyCode::Char('v') if s.operations_focused => Some(Action::OperationsRevertConfirmed),
+        KeyCode::Char('c') if s.operations_focused => {
+            Some(Action::OperationsCreateBranch("tau/tui-review".into()))
+        }
+        KeyCode::Char('b') if s.operations_focused => s
+            .operations
+            .branches
+            .iter()
+            .find(|branch| !branch.current)
+            .map(|branch| Action::OperationsSwitchBranch(branch.name.clone())),
+        KeyCode::Char('o') if s.operations_focused => Some(Action::OperationsOpen),
+        KeyCode::Up if s.operations_focused => Some(Action::OperationsSelect(-1)),
+        KeyCode::Down if s.operations_focused => Some(Action::OperationsSelect(1)),
         KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' => {
             Some(Action::Cancel)
         }
@@ -518,6 +564,41 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             s.transcript = vec!["New chat".into()];
             s.sessions.open = false;
         }
+        Action::OperationsTab(tab) => {
+            s.operations_tab = tab;
+            s.operations_focused = true;
+        }
+        Action::OperationsSelect(delta) => {
+            let n = s.operations.files.len();
+            if n > 0 {
+                s.operations.selected = if delta < 0 {
+                    s.operations.selected.saturating_sub(1)
+                } else {
+                    (s.operations.selected + 1).min(n - 1)
+                };
+            }
+        }
+        Action::OperationsRefresh => {
+            s.operations_loading = true;
+            s.operations_error = None;
+        }
+        Action::OperationsOpen => {
+            if let Some(path) = s.operations.path().map(str::to_owned) {
+                crate::operations::reduce(&mut s.operations, crate::operations::Action::Open(path));
+                s.operations_loading = true;
+            }
+        }
+        Action::OperationsKeep => {
+            if let Some(path) = s.operations.path().map(str::to_owned) {
+                crate::operations::reduce(&mut s.operations, crate::operations::Action::Keep(path));
+            }
+        }
+        Action::OperationsStage
+        | Action::OperationsUnstage
+        | Action::OperationsRevertConfirmed
+        | Action::OperationsAcknowledge
+        | Action::OperationsCreateBranch(_)
+        | Action::OperationsSwitchBranch(_) => s.operations_loading = true,
     }
     sync_composer(s);
     None

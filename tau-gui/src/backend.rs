@@ -10,6 +10,7 @@ use tau_client::{
     ActiveSessionStore, CreateSession, ProjectId, SessionHistory, SessionRef, SessionRename,
     SessionSummary,
 };
+use tau_proto::git::{GitAckResult, GitBranchesResult, GitFileResult, GitStatusResult};
 use tau_proto::prelude::{
     Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
     RequestAction, TurnCancelParams, TurnReplayParams, TurnResponseParams, TurnStartParams,
@@ -264,6 +265,18 @@ impl Backend {
         })
     }
 
+    /// The daemon-backed operations seam.  Keep repository effects here so
+    /// the GPUI view only deals in typed results and never touches Git.
+    pub fn operations_status(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitStatusResult, String>> {
+        self.operations_call(|client, project| async move {
+            client
+                .git_status(tau_proto::git::GitStatusParams { project })
+                .await
+        })
+    }
+
     pub fn session_rename(
         &self,
         params: SessionRename,
@@ -334,6 +347,153 @@ impl Backend {
             })?;
             Ok(())
         })
+    }
+
+    pub fn operations_file(
+        &self,
+        path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitFileResult, String>> {
+        self.operations_call(move |client, project| async move {
+            client
+                .git_file(tau_proto::git::GitFileParams { project, path })
+                .await
+        })
+    }
+
+    pub fn operations_stage(
+        &self,
+        path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(move |client, project| async move {
+            client
+                .git_stage(tau_proto::git::GitPathParams { project, path })
+                .await
+        })
+    }
+
+    pub fn operations_unstage(
+        &self,
+        path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(move |client, project| async move {
+            client
+                .git_unstage(tau_proto::git::GitPathParams { project, path })
+                .await
+        })
+    }
+
+    pub fn operations_revert(
+        &self,
+        path: String,
+        confirmed: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(move |client, project| async move {
+            client
+                .git_revert(tau_proto::git::GitRevertParams {
+                    project,
+                    path,
+                    confirmed,
+                })
+                .await
+        })
+    }
+
+    pub fn operations_branches(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitBranchesResult, String>> {
+        self.operations_call(|client, project| async move {
+            client
+                .git_branches(tau_proto::git::GitBranchesParams { project })
+                .await
+        })
+    }
+
+    pub fn operations_create_branch(
+        &self,
+        name: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(move |client, project| async move {
+            client
+                .git_branch_create(tau_proto::git::GitBranchCreateParams { project, name })
+                .await
+        })
+    }
+
+    pub fn operations_switch_branch(
+        &self,
+        name: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(move |client, project| async move {
+            client
+                .git_branch_switch(tau_proto::git::GitBranchSwitchParams { project, name })
+                .await
+        })
+    }
+
+    pub fn operations_ack(
+        &self,
+        operation: String,
+        acknowledged: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(move |client, project| async move {
+            client
+                .git_ack(tau_proto::git::GitAckParams {
+                    project,
+                    operation,
+                    acknowledged,
+                })
+                .await
+        })
+    }
+
+    fn operations_call<F, Fut, T>(
+        &self,
+        call: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, String>>
+    where
+        F: FnOnce(tau_client::Client, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let socket = self.socket.clone();
+        let cwd = self.cwd.clone();
+        let session = self.session.clone();
+        let daemon = self._daemon.clone();
+        let status = self.status.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Connecting)
+                        .ok();
+                    *guard = Some(connect_or_start(&socket, &daemon).await?);
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Negotiating)
+                        .ok();
+                    let report = guard
+                        .as_ref()
+                        .unwrap()
+                        .negotiate_checked(ProtocolNegotiateParams {
+                            version: ProtocolVersion { major: 1, minor: 0 },
+                            capabilities: vec![],
+                        })
+                        .await?;
+                    if !report.is_usable() {
+                        anyhow::bail!("daemon protocol incompatible")
+                    }
+                    status.lock().map(|mut s| *s = DaemonStatus::Ready).ok();
+                }
+                call(guard.as_ref().unwrap().clone(), cwd).await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
     }
     /// Return configured agent identifiers from the daemon's shared config
     /// schema. The current protocol has no catalog/list RPC, so this explicit

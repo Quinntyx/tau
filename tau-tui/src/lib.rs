@@ -4,6 +4,7 @@ mod adapter;
 pub mod components;
 pub mod composer;
 pub mod feed;
+pub mod operations;
 pub mod projects;
 pub mod reducer;
 pub mod sessions;
@@ -82,7 +83,11 @@ async fn session(
     mut client: Client,
     socket: PathBuf,
 ) -> Result<()> {
-    let mut state = AppState::default();
+    let mut state = AppState {
+        project_root: std::env::current_dir()?.to_string_lossy().into_owned(),
+        ..AppState::default()
+    };
+    state.operations.project = state.project_root.clone();
     // Projects are a client-local projection.  Keep their lifecycle entirely
     // on this side of the daemon adapter: turns continue to use AppState and
     // no project wire protocol is implied by the shell.
@@ -131,7 +136,8 @@ async fn session(
                     Event::Resize(_, _) => Some(reducer::Action::Reconnect),
                     _ => None,
                 };
-                if let Some(action) = action {
+                    if let Some(action) = action {
+                        let operation_action = action.clone();
                     let is_cancel = matches!(action, reducer::Action::Cancel);
                     let is_submit = matches!(action, reducer::Action::Submit);
                     let reconnect_requested = matches!(action, reducer::Action::Reconnect);
@@ -160,11 +166,13 @@ async fn session(
                         }),
                         _ => None,
                     };
-                    if let Some(prompt) = reducer::apply(&mut state, action) {
-                        if is_submit {
-                            adapter::complete(&mut state, &client, prompt, events_tx.clone()).await?;
-                        }
-                    }
+                     let prompt = reducer::apply(&mut state, action);
+                     if let Some(prompt) = prompt {
+                         if is_submit {
+                             adapter::complete(&mut state, &client, prompt, events_tx.clone()).await?;
+                         }
+                     }
+                     handle_operations(&mut state, &client, operation_action).await;
                     if let Some(response) = response {
                         let snapshot = state.clone();
                         let c = client.clone();
@@ -302,6 +310,74 @@ pub fn apply_project_action(
     action: ProjectAction,
 ) -> Result<(), projects::ProjectError> {
     projects.apply(action)
+}
+
+async fn handle_operations(state: &mut AppState, client: &Client, action: reducer::Action) {
+    use reducer::Action;
+    let is_acknowledgement = matches!(&action, Action::OperationsAcknowledge);
+    let result = match action {
+        Action::OperationsRefresh => {
+            match operations::status(client, &mut state.operations).await {
+                Ok(()) => operations::branches(client, &mut state.operations).await,
+                Err(error) => Err(error),
+            }
+        }
+        Action::OperationsOpen => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::file(client, &mut state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsStage => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::stage(client, &state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsUnstage => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::unstage(client, &state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsRevertConfirmed => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::revert(client, &state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsAcknowledge => {
+            operations::acknowledge(client, &state.operations, "operations".into(), true)
+                .await
+                .map(|value| {
+                    state.operations_ack = Some(
+                        if value {
+                            "acknowledged"
+                        } else {
+                            "not acknowledged"
+                        }
+                        .into(),
+                    );
+                })
+        }
+        Action::OperationsCreateBranch(name) => {
+            operations::create_branch(client, &state.operations, name).await
+        }
+        Action::OperationsSwitchBranch(name) => {
+            operations::switch_branch(client, &state.operations, name).await
+        }
+        _ => return,
+    };
+    state.operations_loading = false;
+    match result {
+        Ok(()) if !is_acknowledgement => state.operations_ack = Some("operation complete".into()),
+        Err(e) => state.operations_error = Some(e.to_string()),
+        Ok(()) => {}
+    }
 }
 
 fn permission_choice(choice: state::PermissionChoice) -> TurnPermissionChoice {

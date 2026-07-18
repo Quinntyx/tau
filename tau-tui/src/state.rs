@@ -90,6 +90,14 @@ pub struct AppState {
     /// Canonical composer contract; legacy fields below remain as a protocol
     /// projection for the existing transcript/reducer APIs.
     pub composer: Composer,
+    /// Project root passed to the daemon-backed operations API.
+    pub project_root: String,
+    pub operations: crate::operations::OperationsState,
+    pub operations_tab: OperationsTab,
+    pub operations_focused: bool,
+    pub operations_loading: bool,
+    pub operations_error: Option<String>,
+    pub operations_ack: Option<String>,
     pub connection: Connection,
     pub input: String,
     pub cursor: usize,
@@ -143,6 +151,14 @@ pub struct AppState {
     pub sessions: Navigator,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OperationsTab {
+    #[default]
+    Status,
+    Git,
+    Changes,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferSnapshot {
     pub input: String,
@@ -189,6 +205,13 @@ impl Default for AppState {
     fn default() -> Self {
         let mut state = Self {
             composer: Composer::new("", ""),
+            project_root: ".".into(),
+            operations: crate::operations::OperationsState::default(),
+            operations_tab: OperationsTab::Status,
+            operations_focused: false,
+            operations_loading: false,
+            operations_error: None,
+            operations_ack: None,
             connection: Connection::Connected,
             input: String::new(),
             cursor: 0,
