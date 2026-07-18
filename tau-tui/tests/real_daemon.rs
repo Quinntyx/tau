@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use tau_proto::prelude::{IdempotencyKey, RequestAction, TurnStartParams};
+use tau_proto::prelude::{
+    Capability, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion, RequestAction,
+    TurnStartParams,
+};
 use tokio::net::UnixListener;
 
 #[tokio::test]
@@ -22,6 +25,18 @@ async fn real_daemon_broadcasts_stream_and_replays_after_control_reply() -> Resu
 
     let client = tau_client::Client::connect(&socket).await?;
     let observer = tau_client::Client::connect(&socket).await?;
+    for connection in [&client, &observer] {
+        connection
+            .negotiate_checked(ProtocolNegotiateParams {
+                version: ProtocolVersion { major: 1, minor: 0 },
+                capabilities: vec![
+                    Capability::TurnStreaming,
+                    Capability::TurnCancellation,
+                    Capability::EventReplay,
+                ],
+            })
+            .await?;
+    }
     let mut events = observer.events();
     let params = TurnStartParams {
         model: "mock/model".into(),
