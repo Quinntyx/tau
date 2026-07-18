@@ -11,6 +11,21 @@ use tokio::{
 };
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
+// Diff replies use the protocol's historical `decision` method on the wire.
+// Keep that detail here rather than making callers of the typed API know about
+// the compatibility name.
+const METHOD_DIFF_REPLY: &str = METHOD_DIFF_DECISION;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_reply_uses_protocol_decision_method() {
+        assert_eq!(METHOD_DIFF_REPLY, METHOD_DIFF_DECISION);
+    }
+}
+
 #[derive(Debug)]
 enum Incoming {
     Response(Response),
@@ -72,6 +87,17 @@ pub struct PolicyEventStream {
     rx: mpsc::UnboundedReceiver<PolicyEvent>,
 }
 
+impl PolicyEventStream {
+    /// Construct a policy stream backed by an application-owned receiver.
+    ///
+    /// This is useful for brokers which expose a long-lived client session
+    /// through another task, and keeps the stream type independent of the
+    /// transport implementation.
+    pub fn from_receiver(rx: mpsc::UnboundedReceiver<PolicyEvent>) -> Self {
+        Self { rx }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TurnStreamEvent {
     Event(SequencedEvent),
@@ -99,7 +125,7 @@ impl Client {
         });
         let routed = Arc::clone(&inner);
         tokio::spawn(async move {
-            let error = loop {
+            let _error = loop {
                 let message = match reader.next().await {
                     Some(Ok(Message::Text(text))) => text,
                     Some(Ok(_)) => continue,
@@ -163,7 +189,9 @@ impl Client {
                     }
                 }
             };
-            let _ = error;
+            // Wake both ordinary and policy subscribers.  In particular, do
+            // not leave a policy subscription waiting on a broadcast sender
+            // which remains alive in `Inner` after the socket has gone away.
             let _ = routed.disconnected.send(());
             let pending = routed.pending.lock().await;
             for tx in pending.values() {
@@ -260,7 +288,7 @@ impl Client {
         self.call(METHOD_DIFF_DECISION, Some(params)).await
     }
     pub async fn diff_reply(&self, params: DiffReply) -> Result<serde_json::Value> {
-        self.call(METHOD_DIFF_DECISION, Some(params)).await
+        self.call(METHOD_DIFF_REPLY, Some(params)).await
     }
     pub async fn plan_reply(&self, params: PlanReply) -> Result<serde_json::Value> {
         self.call(METHOD_PLAN_REPLY, Some(params)).await
@@ -344,14 +372,30 @@ impl Client {
     pub fn policy_events(&self) -> PolicyEventStream {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut source = self.inner.policy_events.subscribe();
+        let mut disconnected = self.inner.disconnected.subscribe();
         tokio::spawn(async move {
-            while let Ok(event) = source.recv().await {
-                if tx.send(event).is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    event = source.recv() => match event {
+                        Ok(event) => if tx.send(event).is_err() { break },
+                        // A lagging subscriber can resume at the next event;
+                        // this is preferable to terminating a long-lived
+                        // policy broker for a transient burst.
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    disconnected = disconnected.recv() => {
+                        // PolicyEventStream retains its historical
+                        // `Item = PolicyEvent` API, so transport failure is
+                        // represented by stream termination rather than an
+                        // invented policy event.
+                        let _ = disconnected;
+                        break;
+                    }
                 }
             }
         });
-        PolicyEventStream { rx }
+        PolicyEventStream::from_receiver(rx)
     }
 }
 

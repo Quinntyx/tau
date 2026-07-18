@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{
-    IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams, TurnStartParams,
+    AirtightPromptReply, AirtightPromptRequest, DiffDecision, DiffReply, IdempotencyKey,
+    PermissionChoice, PermissionReply, PermissionRequest, PermissionScope, PlanReply, PlanRequest,
+    PromptActor, QuestionReply, QuestionRequest, RequestAction, TurnCancelParams, TurnReplayParams,
+    TurnStartParams,
 };
 use tokio::sync::mpsc;
 
@@ -69,6 +72,204 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    /// Idempotency is tied to the logical prompt, rather than to an attempt to
+    /// deliver it.  This is important when a view retries after a lost reply:
+    /// the daemon can safely collapse both attempts.
+    fn policy_key(request_id: &str, operation: &str) -> String {
+        format!("gui-policy-{operation}-{request_id}")
+    }
+
+    fn policy_task<F>(
+        &self,
+        action: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>>
+    where
+        F: FnOnce(
+                tau_client::Client,
+            )
+                -> futures_util::future::BoxFuture<'static, anyhow::Result<serde_json::Value>>
+            + Send
+            + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let session = self.session.clone();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    *guard = Some(tau_client::Client::connect(socket).await?);
+                }
+                let client = guard.as_ref().expect("session initialized").clone();
+                drop(guard);
+                action(client).await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// Subscribe to typed policy requests received by the long-lived session.
+    pub fn policy_events(&self) -> tau_client::PolicyEventStream {
+        // Subscription itself is tied to the client connection; create it lazily
+        // on the same session used for replies.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let session = self.session.clone();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let client = match async {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    *guard = Some(tau_client::Client::connect(socket).await?);
+                }
+                Ok::<_, anyhow::Error>(guard.as_ref().unwrap().clone())
+            }
+            .await
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let mut events = client.policy_events();
+            while let Some(event) = events.next().await {
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        tau_client::PolicyEventStream::from_receiver(rx)
+    }
+
+    pub fn reply_permission(
+        &self,
+        request: PermissionRequest,
+        choice: PermissionChoice,
+        scope: PermissionScope,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok(client
+                    .permission_reply(PermissionReply {
+                        request_id: request_id.clone(),
+                        idempotency_key: Self::policy_key(&request_id, "permission"),
+                        choice,
+                        scope,
+                        actor: PromptActor::Human,
+                    })
+                    .await?)
+            })
+        })
+    }
+
+    pub fn reply_question(
+        &self,
+        request: QuestionRequest,
+        answer: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok(client
+                    .question_reply(QuestionReply {
+                        request_id: request_id.clone(),
+                        idempotency_key: Self::policy_key(&request_id, "question"),
+                        answer,
+                        actor: PromptActor::Human,
+                    })
+                    .await?)
+            })
+        })
+    }
+
+    pub fn reply_diff(
+        &self,
+        request: tau_proto::prelude::DiffRequest,
+        accepted: bool,
+        decisions: Vec<tau_proto::prelude::HunkDecision>,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok(client
+                    .diff_reply(DiffReply {
+                        request_id: request_id.clone(),
+                        idempotency_key: Self::policy_key(&request_id, "diff"),
+                        accepted,
+                        decisions,
+                        actor: PromptActor::Human,
+                    })
+                    .await?)
+            })
+        })
+    }
+
+    /// Send the protocol's hunk-level decision form.  A whole-file decision is
+    /// represented by a decision whose `hunk` is `None`; keeping this separate
+    /// from `reply_diff` lets views use either wire form without manufacturing
+    /// an artificial aggregate reply.
+    pub fn decide_diff(
+        &self,
+        request: tau_proto::prelude::DiffRequest,
+        decisions: Vec<tau_proto::prelude::HunkDecision>,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok(client
+                    .diff_decision(DiffDecision {
+                        request_id: request_id.clone(),
+                        idempotency_key: Self::policy_key(&request_id, "diff-decision"),
+                        decisions,
+                        actor: PromptActor::Human,
+                    })
+                    .await?)
+            })
+        })
+    }
+
+    pub fn reply_plan(
+        &self,
+        request: PlanRequest,
+        accepted: bool,
+        revision: u64,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok(client
+                    .plan_reply(PlanReply {
+                        request_id: request_id.clone(),
+                        idempotency_key: Self::policy_key(&request_id, "plan"),
+                        accepted,
+                        revision,
+                        actor: PromptActor::Human,
+                    })
+                    .await?)
+            })
+        })
+    }
+
+    pub fn reply_airtight(
+        &self,
+        request: AirtightPromptRequest,
+        granted: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>> {
+        self.policy_task(move |client| {
+            Box::pin(async move {
+                let request_id = request.request_id;
+                Ok(client
+                    .airtight_reply(AirtightPromptReply {
+                        request_id: request_id.clone(),
+                        idempotency_key: Self::policy_key(&request_id, "airtight"),
+                        granted,
+                        actor: PromptActor::Human,
+                    })
+                    .await?)
+            })
+        })
+    }
     pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, bool, String, String)> {
         let daemon = ensure_daemon(socket).await?;
         let auto_started = daemon.is_some();

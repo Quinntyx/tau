@@ -1,4 +1,5 @@
 //! Pure, typed chat model used by the GPUI view and scripted fixtures.
+use std::collections::BTreeMap;
 use tau_client::CompletionEvent;
 use tau_proto::prelude::{CompletionStreamResult, SequencedEvent, TurnEvent};
 
@@ -23,6 +24,7 @@ pub enum Card {
         expanded: bool,
     },
     Diff {
+        request_id: String,
         path: String,
         patch: String,
         approved: bool,
@@ -36,6 +38,16 @@ pub enum Card {
         question_id: String,
         question: String,
         answer: Option<String>,
+    },
+    Plan {
+        request_id: String,
+        revision: u64,
+        accepted: Option<bool>,
+    },
+    Airtight {
+        request_id: String,
+        step: usize,
+        granted: Option<bool>,
     },
 }
 
@@ -55,6 +67,21 @@ pub enum PermissionChoice {
     Cancel,
 }
 
+/// Lifecycle of a policy request.  The card remains visible while a decision
+/// is in flight; the daemon is the authority for transitioning to Ack/Error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyState {
+    Pending,
+    Ack,
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffDecision {
+    Hunk { hunk: usize, approved: bool },
+    WholeFile { approved: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatState {
     pub cards: Vec<Card>,
@@ -62,6 +89,12 @@ pub struct ChatState {
     pub usage: Option<u64>,
     pub status: ChatStatus,
     pub active_assistant: Option<usize>,
+    /// Correlation id -> lifecycle, retained independently of rendering so a
+    /// late daemon acknowledgement cannot accidentally remove local state.
+    pub policy_states: BTreeMap<String, PolicyState>,
+    pub diff_decisions: BTreeMap<String, Vec<DiffDecision>>,
+    /// Raw tool payload/metadata for inspect and copy affordances.
+    pub raw_tool_metadata: BTreeMap<usize, String>,
 }
 
 impl Default for ChatState {
@@ -72,6 +105,9 @@ impl Default for ChatState {
             usage: None,
             status: ChatStatus::Ready,
             active_assistant: None,
+            policy_states: BTreeMap::new(),
+            diff_decisions: BTreeMap::new(),
+            raw_tool_metadata: BTreeMap::new(),
         }
     }
 }
@@ -87,6 +123,30 @@ pub enum ChatAction {
     ApproveDiff(usize, bool),
     Permission(usize, PermissionChoice),
     AnswerQuestion(usize, String),
+    /// Optimistically record a decision without deleting its card.
+    PolicyDecision {
+        request_id: String,
+        choice: String,
+    },
+    PolicyAck {
+        request_id: String,
+    },
+    PolicyError {
+        request_id: String,
+        message: String,
+    },
+    DiffHunk {
+        request_id: String,
+        hunk: usize,
+        approved: bool,
+    },
+    DiffWholeFile {
+        request_id: String,
+        approved: bool,
+    },
+    RetryPolicy {
+        request_id: String,
+    },
 }
 
 impl ChatState {
@@ -152,27 +212,23 @@ impl ChatState {
                 Some(Card::Diff {
                     approved: value, ..
                 }) => {
-                    if approved {
-                        *value = true;
-                    } else {
-                        // Rejection is a terminal review decision. Remove the
-                        // pending card so a rejected mutation cannot be
-                        // accidentally submitted a second time.
-                        self.cards.remove(index);
-                    }
+                    // Keep the card until daemon acknowledgement; this also
+                    // makes rejection feedback renderable by the view.
+                    *value = approved;
                     true
                 }
                 _ => false,
             },
             ChatAction::Permission(index, choice) => match self.cards.get(index) {
-                Some(Card::Permission { .. }) => {
+                Some(Card::Permission { request_id, .. }) => {
                     if matches!(
                         choice,
                         PermissionChoice::AllowOnce
                             | PermissionChoice::AllowAlways
                             | PermissionChoice::Reject
                     ) {
-                        self.cards.remove(index);
+                        self.policy_states
+                            .insert(request_id.clone(), PolicyState::Pending);
                     }
                     true
                 }
@@ -185,6 +241,60 @@ impl ChatState {
                 }
                 _ => false,
             },
+            ChatAction::PolicyDecision { request_id, .. } => {
+                self.policy_states.insert(request_id, PolicyState::Pending);
+                true
+            }
+            ChatAction::PolicyAck { request_id } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Ack);
+                self.cards.retain(|card| match card {
+                    Card::Permission { request_id: id, .. }
+                    | Card::Diff { request_id: id, .. }
+                    | Card::Plan { request_id: id, .. }
+                    | Card::Airtight { request_id: id, .. } => id != &request_id,
+                    Card::Question { question_id, .. } => question_id != &request_id,
+                    _ => true,
+                });
+                true
+            }
+            ChatAction::PolicyError {
+                request_id,
+                message,
+            } => {
+                self.policy_states
+                    .insert(request_id, PolicyState::Error(message));
+                true
+            }
+            ChatAction::RetryPolicy { request_id } => {
+                self.policy_states.insert(request_id, PolicyState::Pending);
+                true
+            }
+            ChatAction::DiffHunk {
+                request_id,
+                hunk,
+                approved,
+            } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
+                self.diff_decisions
+                    .entry(request_id)
+                    .or_default()
+                    .push(DiffDecision::Hunk { hunk, approved });
+                true
+            }
+            ChatAction::DiffWholeFile {
+                request_id,
+                approved,
+            } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
+                self.diff_decisions
+                    .entry(request_id)
+                    .or_default()
+                    .push(DiffDecision::WholeFile { approved });
+                true
+            }
             ChatAction::Submit(_) => false,
         }
     }
@@ -202,12 +312,14 @@ impl ChatState {
                 false
             }
             TurnEvent::ToolOutput { output, .. } => {
+                let raw = output.inline.clone();
                 self.cards.push(Card::Tool {
                     name: "tool".into(),
                     input: String::new(),
                     output: output.inline,
                     expanded: false,
                 });
+                self.raw_tool_metadata.insert(self.cards.len() - 1, raw);
                 true
             }
             TurnEvent::PermissionRequested {
@@ -216,6 +328,8 @@ impl ChatState {
                 description,
                 ..
             } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
                 self.cards.push(Card::Permission {
                     request_id,
                     tool,
@@ -228,6 +342,8 @@ impl ChatState {
                 question,
                 ..
             } => {
+                self.policy_states
+                    .insert(question_id.clone(), PolicyState::Pending);
                 self.cards.push(Card::Question {
                     question_id,
                     question,
@@ -235,8 +351,16 @@ impl ChatState {
                 });
                 true
             }
-            TurnEvent::DiffRequested { path, diff, .. } => {
+            TurnEvent::DiffRequested {
+                request_id,
+                path,
+                diff,
+                ..
+            } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
                 self.cards.push(Card::Diff {
+                    request_id: request_id.clone(),
                     path,
                     patch: diff,
                     approved: false,
@@ -326,15 +450,16 @@ mod tests {
         });
         assert!(state.reduce(ChatAction::Permission(1, PermissionChoice::AllowOnce)));
         assert!(
-            !state
+            state
                 .cards
                 .iter()
                 .any(|card| matches!(card, Card::Permission { .. }))
         );
+        assert!(matches!(state.policy_states["r1"], PolicyState::Pending));
     }
 
     #[test]
-    fn typed_prompt_events_keep_correlation_ids_and_diff_rejection_is_terminal() {
+    fn typed_prompt_events_keep_correlation_ids_and_diff_rejection_is_retained() {
         let mut state = ChatState::default();
         let event = |event| SequencedEvent {
             event_id: "event".into(),
@@ -371,16 +496,69 @@ mod tests {
         ));
 
         state.cards.push(Card::Diff {
+            request_id: "d1".into(),
             path: "file.rs".into(),
             patch: "@@".into(),
             approved: false,
         });
         assert!(state.reduce(ChatAction::ApproveDiff(2, false)));
-        assert!(
-            !state
-                .cards
-                .iter()
-                .any(|card| matches!(card, Card::Diff { .. }))
+        assert!(state.cards.iter().any(|card| matches!(
+            card,
+            Card::Diff {
+                approved: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn policy_decisions_stay_pending_until_ack_and_rejection_is_visible() {
+        let mut state = ChatState::default();
+        state.cards.push(Card::Permission {
+            request_id: "p1".into(),
+            tool: "shell".into(),
+            description: "run".into(),
+        });
+        assert!(state.reduce(ChatAction::Permission(0, PermissionChoice::Reject)));
+        assert!(matches!(state.policy_states["p1"], PolicyState::Pending));
+        assert!(matches!(state.cards[0], Card::Permission { .. }));
+        state.reduce(ChatAction::PolicyError {
+            request_id: "p1".into(),
+            message: "denied".into(),
+        });
+        assert!(matches!(state.policy_states["p1"], PolicyState::Error(ref e) if e == "denied"));
+        state.reduce(ChatAction::RetryPolicy {
+            request_id: "p1".into(),
+        });
+        assert!(matches!(state.policy_states["p1"], PolicyState::Pending));
+        state.reduce(ChatAction::PolicyAck {
+            request_id: "p1".into(),
+        });
+        assert!(matches!(state.policy_states["p1"], PolicyState::Ack));
+    }
+
+    #[test]
+    fn diff_tracks_hunks_and_whole_file_without_losing_local_decisions() {
+        let mut state = ChatState::default();
+        state.reduce(ChatAction::DiffHunk {
+            request_id: "d1".into(),
+            hunk: 2,
+            approved: false,
+        });
+        state.reduce(ChatAction::DiffWholeFile {
+            request_id: "d1".into(),
+            approved: true,
+        });
+        assert_eq!(
+            state.diff_decisions["d1"],
+            vec![
+                DiffDecision::Hunk {
+                    hunk: 2,
+                    approved: false
+                },
+                DiffDecision::WholeFile { approved: true },
+            ]
         );
+        assert!(matches!(state.policy_states["d1"], PolicyState::Pending));
     }
 }

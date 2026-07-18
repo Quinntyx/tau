@@ -1,8 +1,13 @@
 use gpui::{
-    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, Task, Window,
-    div, prelude::*, px, rgb,
+    App, ClipboardItem, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render,
+    Task, Window, div, prelude::*, px, rgb,
 };
+use tau_client::PolicyEvent;
 use tau_client::TurnStreamEvent;
+use tau_proto::prelude::{
+    AirtightPromptRequest, DiffRequest, PermissionRequest, PermissionScope, PlanRequest,
+    QuestionRequest,
+};
 
 use crate::backend::{Backend, DaemonAction};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
@@ -49,6 +54,14 @@ pub struct TauView {
     model_index: usize,
     models: Vec<String>,
     sidebar_visible: bool,
+    pending_permissions: std::collections::HashMap<String, PermissionRequest>,
+    pending_questions: std::collections::HashMap<String, QuestionRequest>,
+    pending_diffs: std::collections::HashMap<String, DiffRequest>,
+    pending_plans: std::collections::HashMap<String, PlanRequest>,
+    pending_airtight: std::collections::HashMap<String, AirtightPromptRequest>,
+    policy_error: Option<String>,
+    inspector: Option<String>,
+    inspector_index: Option<usize>,
 }
 
 impl TauView {
@@ -65,7 +78,7 @@ impl TauView {
             .chain(preferences.recent_models.iter())
             .cloned()
             .collect();
-        Self {
+        let view = Self {
             input,
             backend,
             chat: ChatState::default(),
@@ -75,7 +88,27 @@ impl TauView {
             model_index: 0,
             models,
             sidebar_visible: preferences.sidebar,
-        }
+            pending_permissions: Default::default(),
+            pending_questions: Default::default(),
+            pending_diffs: Default::default(),
+            pending_plans: Default::default(),
+            pending_airtight: Default::default(),
+            policy_error: None,
+            inspector: None,
+            inspector_index: None,
+        };
+        let events = view.backend.policy_events();
+        cx.spawn(async move |this, cx| {
+            use futures_util::StreamExt;
+            let mut events = events;
+            while let Some(event) = events.next().await {
+                let _ = this.update(cx, |view, cx| {
+                    view.apply_policy_event(event, cx);
+                });
+            }
+        })
+        .detach();
+        view
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -110,6 +143,48 @@ impl TauView {
         cx.notify();
     }
 
+    fn inspect_tool(
+        &mut self,
+        index: usize,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Card::Tool {
+            name,
+            input,
+            output,
+            ..
+        }) = self.chat.cards.get(index)
+        {
+            self.inspector = Some(format!("tool: {name}\ninput: {input}\noutput: {output}"));
+            self.inspector_index = Some(index);
+            cx.notify();
+        }
+    }
+
+    fn copy_tool(
+        &mut self,
+        index: usize,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Card::Tool {
+            name,
+            input,
+            output,
+            ..
+        }) = self.chat.cards.get(index)
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(format!(
+                "tool: {name}\ninput: {input}\noutput: {output}"
+            )));
+            self.inspector = Some("Copied raw tool JSON/metadata to clipboard.".into());
+            cx.notify();
+        }
+    }
+
     fn choose_diff(
         &mut self,
         index: usize,
@@ -118,8 +193,67 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chat.reduce(ChatAction::ApproveDiff(index, approved));
-        cx.notify();
+        let Some(Card::Diff {
+            request_id,
+            path,
+            patch,
+            ..
+        }) = self.chat.cards.get(index).cloned()
+        else {
+            return;
+        };
+        let request = self
+            .pending_diffs
+            .get(&request_id)
+            .cloned()
+            .unwrap_or(DiffRequest {
+                request_id: request_id.clone(),
+                session_id: self.chat.session_id.clone().unwrap_or_default(),
+                turn_id: String::new(),
+                files: vec![tau_proto::prelude::DiffFile {
+                    path,
+                    hunks: vec![tau_proto::prelude::DiffHunk {
+                        id: "whole-file".into(),
+                        patch,
+                    }],
+                    binary: false,
+                }],
+                initiating_client_id: "gui".into(),
+            });
+        self.pending_diffs
+            .insert(request_id.clone(), request.clone());
+        let decisions = vec![tau_proto::prelude::HunkDecision {
+            file: path,
+            hunk: None,
+            accept: approved,
+        }];
+        self.chat.reduce(ChatAction::PolicyDecision {
+            request_id: request_id.clone(),
+            choice: if approved { "accept" } else { "reject" }.into(),
+        });
+        let receiver = self.backend.reply_diff(request, approved, decisions);
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|_| Err("policy reply channel closed".into()));
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => {
+                        view.chat.reduce(ChatAction::PolicyAck { request_id });
+                        view.policy_error = None;
+                    }
+                    Err(error) => {
+                        view.chat.reduce(ChatAction::PolicyError {
+                            request_id,
+                            message: error.clone(),
+                        });
+                        view.policy_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn choose_permission(
@@ -130,8 +264,166 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chat.reduce(ChatAction::Permission(index, choice));
-        cx.notify();
+        let Some(Card::Permission {
+            request_id,
+            tool,
+            description,
+        }) = self.chat.cards.get(index).cloned()
+        else {
+            return;
+        };
+        if matches!(choice, PermissionChoice::Inspect) {
+            self.inspector = Some(format!("permission for {tool}: {description}"));
+            self.inspector_index = None;
+            cx.notify();
+            return;
+        }
+        if matches!(choice, PermissionChoice::Cancel) {
+            return;
+        }
+        let request = self
+            .pending_permissions
+            .get(&request_id)
+            .cloned()
+            .unwrap_or(PermissionRequest {
+                request_id: request_id.clone(),
+                session_id: self.chat.session_id.clone().unwrap_or_default(),
+                turn_id: String::new(),
+                tool,
+                arguments: serde_json::json!({"description": description}),
+                initiating_client_id: "gui".into(),
+            });
+        let scope = if matches!(choice, PermissionChoice::AllowAlways) {
+            PermissionScope::Global
+        } else {
+            PermissionScope::Once
+        };
+        let receiver = self.backend.reply_permission(
+            request,
+            if matches!(choice, PermissionChoice::Reject) {
+                tau_proto::prelude::PermissionChoice::Reject
+            } else {
+                tau_proto::prelude::PermissionChoice::Allow
+            },
+            scope,
+        );
+        self.chat.reduce(ChatAction::PolicyDecision {
+            request_id: request_id.clone(),
+            choice: "permission".into(),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|_| Err("policy reply channel closed".into()));
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => {
+                        view.chat.reduce(ChatAction::PolicyAck { request_id });
+                        view.policy_error = None;
+                    }
+                    Err(error) => {
+                        view.chat.reduce(ChatAction::PolicyError {
+                            request_id,
+                            message: error.clone(),
+                        });
+                        view.policy_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn choose_plan(
+        &mut self,
+        index: usize,
+        accepted: bool,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Card::Plan {
+            request_id,
+            revision,
+            ..
+        }) = self.chat.cards.get(index).cloned()
+        else {
+            return;
+        };
+        let Some(request) = self.pending_plans.get(&request_id).cloned() else {
+            return;
+        };
+        self.chat.reduce(ChatAction::PolicyDecision {
+            request_id: request_id.clone(),
+            choice: if accepted { "accept" } else { "reject" }.into(),
+        });
+        let receiver = self.backend.reply_plan(request, accepted, revision);
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|_| Err("policy reply channel closed".into()));
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => {
+                        view.chat.reduce(ChatAction::PolicyAck { request_id });
+                        view.policy_error = None;
+                    }
+                    Err(error) => {
+                        view.chat.reduce(ChatAction::PolicyError {
+                            request_id,
+                            message: error.clone(),
+                        });
+                        view.policy_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn choose_airtight(
+        &mut self,
+        index: usize,
+        granted: bool,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Card::Airtight { request_id, .. }) = self.chat.cards.get(index).cloned() else {
+            return;
+        };
+        let Some(request) = self.pending_airtight.get(&request_id).cloned() else {
+            return;
+        };
+        self.chat.reduce(ChatAction::PolicyDecision {
+            request_id: request_id.clone(),
+            choice: if granted { "grant" } else { "revoke" }.into(),
+        });
+        let receiver = self.backend.reply_airtight(request, granted);
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|_| Err("policy reply channel closed".into()));
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => {
+                        view.chat.reduce(ChatAction::PolicyAck { request_id });
+                        view.policy_error = None;
+                    }
+                    Err(error) => {
+                        view.chat.reduce(ChatAction::PolicyError {
+                            request_id,
+                            message: error.clone(),
+                        });
+                        view.policy_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn answer_question(
@@ -142,8 +434,116 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chat
-            .reduce(ChatAction::AnswerQuestion(index, answer.into()));
+        let Some(Card::Question {
+            question_id,
+            question,
+            ..
+        }) = self.chat.cards.get(index).cloned()
+        else {
+            return;
+        };
+        let request =
+            self.pending_questions
+                .get(&question_id)
+                .cloned()
+                .unwrap_or(QuestionRequest {
+                    request_id: question_id,
+                    session_id: self.chat.session_id.clone().unwrap_or_default(),
+                    turn_id: String::new(),
+                    question,
+                    options: Vec::new(),
+                    initiating_client_id: "gui".into(),
+                });
+        let receiver = self.backend.reply_question(request, answer.into());
+        self.chat.reduce(ChatAction::PolicyDecision {
+            request_id: question_id.clone(),
+            choice: "answer".into(),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|_| Err("policy reply channel closed".into()));
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => {
+                        view.chat
+                            .reduce(ChatAction::AnswerQuestion(index, answer.into()));
+                        view.chat.reduce(ChatAction::PolicyAck {
+                            request_id: question_id,
+                        });
+                        view.policy_error = None;
+                    }
+                    Err(error) => {
+                        view.chat.reduce(ChatAction::PolicyError {
+                            request_id: question_id,
+                            message: error.clone(),
+                        });
+                        view.policy_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_policy_event(&mut self, event: PolicyEvent, cx: &mut Context<Self>) {
+        match event {
+            PolicyEvent::Permission(request) => {
+                self.pending_permissions
+                    .insert(request.request_id.clone(), request.clone());
+                self.chat.cards.push(Card::Permission {
+                    request_id: request.request_id,
+                    tool: request.tool,
+                    description: request.arguments.to_string(),
+                });
+            }
+            PolicyEvent::Question(request) => {
+                self.pending_questions
+                    .insert(request.request_id.clone(), request.clone());
+                self.chat.cards.push(Card::Question {
+                    question_id: request.request_id,
+                    question: request.question,
+                    answer: None,
+                });
+            }
+            PolicyEvent::Diff(request) => {
+                let request_id = request.request_id.clone();
+                self.pending_diffs
+                    .insert(request_id.clone(), request.clone());
+                for file in request.files {
+                    self.chat.cards.push(Card::Diff {
+                        request_id: request_id.clone(),
+                        path: file.path,
+                        patch: file
+                            .hunks
+                            .iter()
+                            .map(|h| h.patch.clone())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        approved: false,
+                    });
+                }
+            }
+            PolicyEvent::Plan(request) => {
+                self.pending_plans
+                    .insert(request.request_id.clone(), request.clone());
+                self.chat.cards.push(Card::Plan {
+                    request_id: request.request_id,
+                    revision: request.revision,
+                    accepted: None,
+                });
+            }
+            PolicyEvent::Airtight(request) => {
+                self.pending_airtight
+                    .insert(request.request_id.clone(), request.clone());
+                self.chat.cards.push(Card::Airtight {
+                    request_id: request.request_id,
+                    step: request.step,
+                    granted: None,
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -307,6 +707,24 @@ impl Render for TauView {
                     ))
                     .child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui))),
             );
+        let policy_feedback = self.policy_error.as_ref().map(|error| {
+            div().p_2().bg(rgb(0x7d3b3b)).child(format!(
+                "Policy request failed: {error} (retry the control)"
+            ))
+        });
+        let inspector_panel = self.inspector.as_ref().map(|raw| {
+            let mut panel = div().p_3().bg(rgb(0x202630)).child(raw.clone());
+            if let Some(index) = self.inspector_index {
+                panel = panel.child(toast_button(
+                    "Copy raw JSON",
+                    0x52627a,
+                    cx.listener(move |view, event, window, cx| {
+                        view.copy_tool(index, event, window, cx)
+                    }),
+                ));
+            }
+            panel
+        });
         let transcript = div()
             .id("transcript")
             .flex_1()
@@ -352,6 +770,7 @@ impl Render for TauView {
                         path,
                         patch,
                         approved,
+                        ..
                     } => (
                         0x293b32,
                         "diff",
@@ -359,6 +778,36 @@ impl Render for TauView {
                         format!(
                             "{path} ({})\n{patch}",
                             if *approved { "approved" } else { "pending" }
+                        ),
+                    ),
+                    Card::Plan {
+                        request_id: _,
+                        revision,
+                        accepted,
+                    } => (
+                        0x293b32,
+                        "plan",
+                        false,
+                        format!(
+                            "revision {revision}\n{}",
+                            accepted
+                                .map(|value| if value { "accepted" } else { "rejected" })
+                                .unwrap_or("awaiting decision")
+                        ),
+                    ),
+                    Card::Airtight {
+                        request_id: _,
+                        step,
+                        granted,
+                    } => (
+                        0x463b24,
+                        "airtight",
+                        false,
+                        format!(
+                            "step {step}\n{}",
+                            granted
+                                .map(|value| if value { "granted" } else { "rejected" })
+                                .unwrap_or("awaiting decision")
                         ),
                     ),
                     Card::Permission {
@@ -400,6 +849,12 @@ impl Render for TauView {
                         MouseButton::Left,
                         cx.listener(move |view, event, window, cx| {
                             view.toggle_tool(index, event, window, cx)
+                        }),
+                    );
+                    card_view = card_view.on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(move |view, event, window, cx| {
+                            view.inspect_tool(index, event, window, cx)
                         }),
                     );
                 }
@@ -470,6 +925,48 @@ impl Render for TauView {
                                 0x7d3b3b,
                                 cx.listener(move |view, event, window, cx| {
                                     view.answer_question(index, "no", event, window, cx)
+                                }),
+                            )),
+                    );
+                }
+                if matches!(card, Card::Plan { .. }) {
+                    card_view = card_view.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(toast_button(
+                                "Accept plan",
+                                0x39734a,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.choose_plan(index, true, event, window, cx)
+                                }),
+                            ))
+                            .child(toast_button(
+                                "Reject plan",
+                                0x7d3b3b,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.choose_plan(index, false, event, window, cx)
+                                }),
+                            )),
+                    );
+                }
+                if matches!(card, Card::Airtight { .. }) {
+                    card_view = card_view.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(toast_button(
+                                "Grant airtight",
+                                0x39734a,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.choose_airtight(index, true, event, window, cx)
+                                }),
+                            ))
+                            .child(toast_button(
+                                "Revoke airtight",
+                                0x7d3b3b,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.choose_airtight(index, false, event, window, cx)
                                 }),
                             )),
                     );
@@ -553,6 +1050,12 @@ impl Render for TauView {
         root = root.on_action(cx.listener(Self::cycle_model));
         if self.toast_visible {
             root = root.child(toast);
+        }
+        if let Some(feedback) = policy_feedback {
+            root = root.child(feedback);
+        }
+        if let Some(inspector) = inspector_panel {
+            root = root.child(inspector);
         }
         root.child(header)
             .child(
