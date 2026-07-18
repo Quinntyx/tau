@@ -73,6 +73,7 @@ pub struct PolicyEventStream {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum TurnStreamEvent {
     Event(SequencedEvent),
     Complete(TurnStartResult),

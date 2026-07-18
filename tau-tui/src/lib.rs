@@ -14,7 +14,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, path::PathBuf, time::Duration};
 use tau_client::Client;
-use tau_proto::prelude::ClientResponse;
+use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
 
 pub use adapter::{ClientEvent, ScriptedClient};
 pub use reducer::{Action, apply as reduce};
@@ -98,12 +98,20 @@ async fn session(
                     let response = match &action {
                         reducer::Action::Permission(choice)
                         | reducer::Action::PermissionReply(choice) => {
-                            Some(ClientResponse::Permission { choice: permission_choice(*choice).into() })
+                            Some(ClientResponse::Permission {
+                                request_id: state.permission_request_id.clone().unwrap_or_default(),
+                                choice: permission_choice(*choice),
+                            })
                         }
                         reducer::Action::QuestionReply(answer) => {
-                            Some(ClientResponse::Question { answer: answer.clone() })
+                            Some(ClientResponse::Question {
+                                question_id: state.question_id.clone().unwrap_or_default(),
+                                answer: QuestionAnswer(answer.clone()),
+                            })
                         }
                         reducer::Action::DiffReply(approved) => Some(ClientResponse::DiffHunk {
+                            request_id: state.diff_request_id.clone().unwrap_or_default(),
+                            path: state.diff_path.clone().unwrap_or_default(),
                             index: state.hunk_index as u32,
                             approved: *approved,
                         }),
@@ -184,13 +192,13 @@ async fn session(
     Ok(())
 }
 
-fn permission_choice(choice: state::PermissionChoice) -> &'static str {
+fn permission_choice(choice: state::PermissionChoice) -> TurnPermissionChoice {
     match choice {
-        state::PermissionChoice::AllowOnce => "allow_once",
-        state::PermissionChoice::AllowAlways => "allow_always",
-        state::PermissionChoice::AllowSession => "allow_session",
-        state::PermissionChoice::DenyOnce => "deny_once",
-        state::PermissionChoice::Reject => "reject",
+        state::PermissionChoice::AllowOnce => TurnPermissionChoice::AllowOnce,
+        state::PermissionChoice::AllowAlways => TurnPermissionChoice::AllowAlways,
+        state::PermissionChoice::AllowSession => TurnPermissionChoice::AllowSession,
+        state::PermissionChoice::DenyOnce => TurnPermissionChoice::DenyOnce,
+        state::PermissionChoice::Reject => TurnPermissionChoice::Reject,
     }
 }
 

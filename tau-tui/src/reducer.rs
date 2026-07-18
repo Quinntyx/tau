@@ -285,6 +285,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             if let Some(p) = s.permission.as_mut() {
                 if p.stage == PermissionStage::AlwaysConfirm && c == PermissionChoice::AllowOnce {
                     s.permission = None;
+                    s.permission_request_id = None;
                     return None;
                 }
                 p.choice = c;
@@ -292,6 +293,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                     p.stage = PermissionStage::AlwaysConfirm;
                 } else {
                     s.permission = None;
+                    s.permission_request_id = None;
                 }
             }
         }
@@ -302,6 +304,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                     p.stage = PermissionStage::AlwaysConfirm;
                 } else {
                     s.permission = None;
+                    s.permission_request_id = None;
                 }
                 return Some(format!("permission:{c:?}"));
             }
@@ -310,6 +313,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             if let Some(q) = s.question.as_mut() {
                 q.answer = Some(answer.clone());
                 s.question = None;
+                s.question_id = None;
                 s.input.clear();
                 s.cursor = 0;
                 return Some(answer);
@@ -318,6 +322,8 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         Action::DiffReply(accepted) => {
             if let Some(reply) = s.diff_reply.as_mut() {
                 reply.accepted = Some(accepted);
+                s.diff_request_id = None;
+                s.diff_path = None;
                 return Some(if accepted {
                     "diff:accept".into()
                 } else {

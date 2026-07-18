@@ -10,6 +10,7 @@ authors.workspace = true
 anyhow.workspace = true
 gpui.workspace = true
 futures-util.workspace = true
+serde_json.workspace = true
 dirs.workspace = true
 tempfile.workspace = true
 tau-client.workspace = true

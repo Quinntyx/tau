@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{
-    IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams, TurnStartParams,
+    ClientResponse, IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams,
+    TurnResponseParams, TurnStartParams,
 };
 use tokio::sync::mpsc;
 
@@ -36,6 +37,71 @@ pub enum DaemonAction {
     AlwaysDisown,
     /// Persist hiding this warning, while retaining current ownership policy.
     NeverShowAgain,
+}
+
+/// Facts currently known by the backend for sidebar/view-model consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackendSnapshot {
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub session: SessionSnapshot,
+    pub cwd: Option<String>,
+    pub plan: PlanSnapshot,
+    pub lsp: ServiceSnapshot,
+    pub usage: UsageSnapshot,
+    pub mcp: ServiceSnapshot,
+    pub task: TaskSnapshot,
+    pub startup: StartupSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionSnapshot {
+    pub id: Option<String>,
+    pub state: SessionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionState {
+    #[default]
+    Unavailable,
+    Connected,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanSnapshot {
+    pub name: Option<String>,
+    pub current_step: Option<String>,
+    pub airtight: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceSnapshot {
+    pub available: Option<bool>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageSnapshot {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskSnapshot {
+    pub tier: Option<u8>,
+    pub autonomous: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StartupSnapshot {
+    #[default]
+    Loading,
+    Ready,
+    Unavailable,
+    Error(String),
 }
 
 /// Ownership is explicit: a daemon found before connection is never stopped;
@@ -147,6 +213,41 @@ impl Backend {
                 .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
                 .map(|preferences| preferences.daemon_warning)
                 .unwrap_or(true)
+    }
+
+    /// Return known backend facts without probing or inventing server state.
+    pub fn operational_snapshot(&self) -> BackendSnapshot {
+        let active = self
+            .active_turn
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|(_, session_id, _)| session_id.clone()));
+        let session = self.session.try_lock().ok();
+        let connected = session.as_ref().is_some_and(|guard| guard.is_some());
+        BackendSnapshot {
+            model: Some(self.model.clone()),
+            session: SessionSnapshot {
+                id: active.clone(),
+                state: if active.is_some() {
+                    SessionState::Active
+                } else if connected {
+                    SessionState::Connected
+                } else {
+                    SessionState::Unavailable
+                },
+            },
+            cwd: Some(self.cwd.clone()),
+            startup: if connected {
+                StartupSnapshot::Ready
+            } else {
+                StartupSnapshot::Unavailable
+            },
+            ..BackendSnapshot::default()
+        }
+    }
+
+    pub fn snapshot(&self) -> BackendSnapshot {
+        self.operational_snapshot()
     }
 
     /// Apply one of the five ownership decisions. Existing daemons are never
@@ -293,6 +394,31 @@ impl Backend {
         }
     }
 
+    /// Submit an interactive decision on the typed response channel. The
+    /// transcript card is only a projection; acknowledgement belongs to the
+    /// daemon and is not faked by the view.
+    pub fn respond(&self, response: ClientResponse) {
+        let active_turn = self.active_turn.clone();
+        self.runtime.spawn(async move {
+            let active = active_turn.lock().ok().and_then(|value| value.clone());
+            if let Some((client, session_id, turn_id)) = active {
+                let _ = client
+                    .turn_response(TurnResponseParams {
+                        session_id,
+                        turn_id,
+                        idempotency_key: IdempotencyKey::new(format!(
+                            "gui-response-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |duration| duration.as_nanos())
+                        )),
+                        response,
+                    })
+                    .await;
+            }
+        });
+    }
+
     pub fn replay(
         &self,
         session_id: String,
@@ -365,6 +491,28 @@ fn daemon_executable() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_defaults_are_explicitly_unavailable() {
+        let snapshot = BackendSnapshot::default();
+        assert_eq!(snapshot.session.state, SessionState::Unavailable);
+        assert_eq!(snapshot.lsp.available, None);
+        assert_eq!(snapshot.usage.total_tokens, None);
+        assert!(matches!(snapshot.startup, StartupSnapshot::Loading));
+    }
+
+    #[test]
+    fn snapshot_preserves_unavailable_server_facts() {
+        let snapshot = BackendSnapshot {
+            model: None,
+            cwd: None,
+            startup: StartupSnapshot::Unavailable,
+            ..Default::default()
+        };
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.session.id, None);
+        assert_eq!(snapshot.plan.airtight, None);
+    }
 
     #[cfg(unix)]
     #[test]
