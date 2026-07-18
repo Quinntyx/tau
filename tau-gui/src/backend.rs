@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{
-    IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams, TurnStartParams,
+    Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
+    RequestAction, TurnCancelParams, TurnDiffDecision, TurnPermissionChoice, TurnReplayParams,
+    TurnResponseParams, TurnStartParams,
 };
 use tokio::sync::mpsc;
 
@@ -206,7 +208,7 @@ impl Backend {
             let result = async {
                 let mut guard = session.lock().await;
                 if guard.is_none() {
-                    *guard = Some(tau_client::Client::connect(&socket).await?);
+                    *guard = Some(connect_ready(&socket).await?);
                 }
                 let client = guard.as_mut().expect("session initialized");
                 let params = turn_start_request(model, prompt, session_id, cwd, agent);
@@ -278,7 +280,7 @@ impl Backend {
         let socket = self.socket.clone();
         self.runtime.spawn(async move {
             let result = async {
-                let client = tau_client::Client::connect(socket).await?;
+                let client = connect_ready(&socket).await?;
                 client
                     .turn_replay(replay_request(session_id, after_sequence))
                     .await
@@ -288,6 +290,77 @@ impl Backend {
             let _ = tx.send(result);
         });
         rx
+    }
+
+    /// Send a typed response to an interactive daemon event.  Keeping this on
+    /// the production backend makes scripted acceptance tests exercise the
+    /// same websocket path as the view, rather than manufacturing replies.
+    pub fn respond(
+        &self,
+        session_id: String,
+        turn_id: String,
+        response: ClientResponse,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let client = connect_ready(&socket).await?;
+                client
+                    .turn_response(response_request(session_id, turn_id, response))
+                    .await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    pub fn permission_reply(
+        &self,
+        session_id: String,
+        turn_id: String,
+        _request_id: String,
+        choice: TurnPermissionChoice,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.respond(
+            session_id,
+            turn_id,
+            ClientResponse::Permission {
+                choice: permission_choice_name(choice).into(),
+            },
+        )
+    }
+
+    pub fn question_reply(
+        &self,
+        session_id: String,
+        turn_id: String,
+        answer: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.respond(session_id, turn_id, ClientResponse::Question { answer })
+    }
+
+    pub fn diff_reply(
+        &self,
+        session_id: String,
+        turn_id: String,
+        index: u32,
+        decision: TurnDiffDecision,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.respond(
+            session_id,
+            turn_id,
+            ClientResponse::DiffHunk {
+                index,
+                approved: matches!(decision, TurnDiffDecision::Approve),
+            },
+        )
     }
 }
 
@@ -332,7 +405,40 @@ fn cancel_request(session_id: String, turn_id: String) -> TurnCancelParams {
 }
 
 fn replay_request(session_id: String, after_sequence: u64) -> TurnReplayParams {
-    TurnReplayParams { session_id, after_sequence, limit: Some(500) }
+    TurnReplayParams {
+        session_id,
+        after_sequence,
+        limit: Some(500),
+    }
+}
+
+fn response_request(
+    session_id: String,
+    turn_id: String,
+    response: ClientResponse,
+) -> TurnResponseParams {
+    TurnResponseParams {
+        session_id,
+        turn_id,
+        idempotency_key: IdempotencyKey::new(format!("gui-response-{}", unique_nonce())),
+        response,
+    }
+}
+
+fn unique_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+fn permission_choice_name(choice: TurnPermissionChoice) -> &'static str {
+    match choice {
+        TurnPermissionChoice::AllowOnce => "allow_once",
+        TurnPermissionChoice::AllowAlways => "allow_always",
+        TurnPermissionChoice::Reject => "reject",
+        TurnPermissionChoice::Inspect => "inspect",
+        TurnPermissionChoice::Cancel => "cancel",
+    }
 }
 
 fn is_terminal_event(event: &TurnStreamEvent) -> bool {
@@ -362,12 +468,38 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
 }
 
 async fn daemon_reachable(socket: &PathBuf) -> bool {
-    tokio::time::timeout(
+    tokio::time::timeout(Duration::from_millis(250), connect_ready(socket))
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+async fn connect_ready(socket: &PathBuf) -> Result<tau_client::Client> {
+    let client = tau_client::Client::connect(socket).await?;
+    let negotiated = tokio::time::timeout(
         Duration::from_millis(250),
-        tau_client::Client::connect(socket),
+        client.negotiate(negotiation_request()),
     )
     .await
-    .is_ok_and(|result| result.is_ok())
+    .context("daemon negotiation timed out")??;
+    anyhow::ensure!(
+        negotiated.version.major == 1,
+        "daemon negotiated unsupported major version {}",
+        negotiated.version.major
+    );
+    Ok(client)
+}
+
+fn negotiation_request() -> ProtocolNegotiateParams {
+    ProtocolNegotiateParams {
+        version: ProtocolVersion { major: 1, minor: 0 },
+        capabilities: vec![
+            Capability::TurnStreaming,
+            Capability::TurnCancellation,
+            Capability::EventReplay,
+            Capability::Idempotency,
+            Capability::ArtifactReferences,
+        ],
+    }
 }
 
 fn daemon_executable() -> Result<PathBuf> {
@@ -414,7 +546,11 @@ mod tests {
     #[test]
     fn turn_request_uses_submit_and_preserves_typed_fields() {
         let request = turn_start_request(
-            "m".into(), "hello".into(), Some("s".into()), "/tmp".into(), Some("a".into()),
+            "m".into(),
+            "hello".into(),
+            Some("s".into()),
+            "/tmp".into(),
+            Some("a".into()),
         );
         assert_eq!(request.model, "m");
         assert_eq!(request.prompt, "hello");
@@ -435,12 +571,57 @@ mod tests {
     }
 
     #[test]
+    fn interactive_replies_preserve_typed_protocol_values() {
+        let permission = response_request(
+            "s".into(),
+            "t".into(),
+            ClientResponse::Permission {
+                choice: permission_choice_name(TurnPermissionChoice::AllowOnce).into(),
+            },
+        );
+        assert_eq!(permission.session_id, "s");
+        assert_eq!(permission.turn_id, "t");
+        assert_eq!(
+            permission.response,
+            ClientResponse::Permission {
+                choice: "allow_once".into()
+            }
+        );
+
+        let diff = response_request(
+            "s".into(),
+            "t".into(),
+            ClientResponse::DiffHunk {
+                index: 2,
+                approved: false,
+            },
+        );
+        assert_eq!(
+            diff.response,
+            ClientResponse::DiffHunk {
+                index: 2,
+                approved: false
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_socket_is_not_reported_as_reachable() {
+        assert!(!daemon_reachable(&PathBuf::from("/tmp/tau-gui-definitely-missing.sock",)).await);
+    }
+
+    #[test]
     fn terminal_stream_is_only_completion_not_interactive_events() {
         let event = TurnStreamEvent::Event(tau_proto::prelude::SequencedEvent {
-            event_id: "e".into(), session_id: "s".into(), sequence: 1,
-            occurred_at: 0, request_id: None,
+            event_id: "e".into(),
+            session_id: "s".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: None,
             event: tau_proto::prelude::TurnEvent::PermissionRequested {
-                turn_id: "t".into(), request_id: "p".into(), tool: "shell".into(),
+                turn_id: "t".into(),
+                request_id: "p".into(),
+                tool: "shell".into(),
                 description: "run".into(),
             },
         });

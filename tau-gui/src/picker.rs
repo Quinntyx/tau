@@ -80,4 +80,38 @@ mod tests {
         ];
         assert_eq!(next_agent(&a, Some("plan"), false), Some("build".into()));
     }
+
+    #[test]
+    fn typed_selection_actions_cover_model_query_and_agent_cycle() {
+        let models = vec![
+            ModelOption {
+                id: "openai/fast".into(),
+                provider: "openai".into(),
+                recent: true,
+                favorite: false,
+            },
+            ModelOption {
+                id: "anthropic/slow".into(),
+                provider: "anthropic".into(),
+                recent: false,
+                favorite: true,
+            },
+        ];
+        assert_eq!(fuzzy_models(&models, "ANTH")[0].id, "anthropic/slow");
+        let agents = vec![
+            AgentOption {
+                name: "plan".into(),
+                in_tab_cycle: true,
+            },
+            AgentOption {
+                name: "build".into(),
+                in_tab_cycle: true,
+            },
+        ];
+        assert_eq!(next_agent(&agents, None, false), Some("plan".into()));
+        assert_eq!(
+            next_agent(&agents, Some("plan"), true),
+            Some("build".into())
+        );
+    }
 }

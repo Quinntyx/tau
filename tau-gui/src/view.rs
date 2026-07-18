@@ -3,6 +3,7 @@ use gpui::{
     div, prelude::*, px, rgb,
 };
 use tau_client::TurnStreamEvent;
+use tau_proto::prelude::{TurnDiffDecision, TurnPermissionChoice};
 
 use crate::backend::{Backend, DaemonAction};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
@@ -17,25 +18,97 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-#[derive(Clone, Copy)]
-enum AgentMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
     Plan,
     Code,
 }
 
 impl AgentMode {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Plan => "Plan",
             Self::Code => "Code",
         }
     }
 
-    fn next(self) -> Self {
+    pub fn next(self) -> Self {
         match self {
             Self::Plan => Self::Code,
             Self::Code => Self::Plan,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnRequest {
+    prompt: String,
+    session_id: Option<String>,
+    agent: String,
+    model: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayRequest {
+    session_id: String,
+    after_sequence: u64,
+}
+
+#[cfg(test)]
+fn replay_request(session_id: impl Into<String>, after_sequence: u64) -> ReplayRequest {
+    ReplayRequest {
+        session_id: session_id.into(),
+        after_sequence,
+    }
+}
+
+fn make_turn_request(
+    prompt: String,
+    session_id: Option<String>,
+    agent: AgentMode,
+    model: Option<String>,
+) -> TurnRequest {
+    TurnRequest {
+        prompt,
+        session_id,
+        agent: agent.label().into(),
+        model,
+    }
+}
+
+/// Typed action seams used by GUI acceptance tests and alternate frontends.
+pub fn submit_action(prompt: impl Into<String>) -> ChatAction {
+    ChatAction::Submit(prompt.into())
+}
+
+pub fn stream_event_action(event: tau_proto::prelude::SequencedEvent) -> ChatAction {
+    ChatAction::SessionEvent(event)
+}
+
+pub fn diff_reply_action(index: usize, approved: bool) -> ChatAction {
+    ChatAction::ApproveDiff(index, approved)
+}
+
+pub fn prompt_reply_action(index: usize, answer: impl Into<String>) -> ChatAction {
+    ChatAction::AnswerQuestion(index, answer.into())
+}
+
+pub fn permission_reply_action(index: usize, choice: PermissionChoice) -> ChatAction {
+    ChatAction::Permission(index, choice)
+}
+
+/// Cursor passed to `Backend::replay` when reconnecting a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayCursor {
+    pub session_id: String,
+    pub after_sequence: u64,
+}
+
+pub fn replay_cursor(session_id: impl Into<String>, after_sequence: u64) -> ReplayCursor {
+    ReplayCursor {
+        session_id: session_id.into(),
+        after_sequence,
     }
 }
 
@@ -52,6 +125,29 @@ pub struct TauView {
 }
 
 impl TauView {
+    /// Returns the exact typed request used when the user submits the prompt.
+    pub fn turn_request_for(
+        &self,
+        prompt: impl Into<String>,
+    ) -> (String, Option<String>, String, Option<String>) {
+        let request = self.turn_request(prompt.into());
+        (
+            request.prompt,
+            request.session_id,
+            request.agent,
+            request.model,
+        )
+    }
+
+    fn turn_request(&self, prompt: String) -> TurnRequest {
+        make_turn_request(
+            prompt,
+            self.chat.session_id.clone(),
+            self.agent,
+            self.models.get(self.model_index).cloned(),
+        )
+    }
+
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
         let toast_visible = backend.auto_started();
@@ -110,6 +206,27 @@ impl TauView {
         cx.notify();
     }
 
+    fn interactive_correlation(&self, index: usize) -> Option<(String, String)> {
+        match self.chat.cards.get(index) {
+            Some(Card::Permission {
+                session_id,
+                turn_id,
+                ..
+            })
+            | Some(Card::Question {
+                session_id,
+                turn_id,
+                ..
+            })
+            | Some(Card::Diff {
+                session_id,
+                turn_id,
+                ..
+            }) => Some((session_id.clone(), turn_id.clone())),
+            _ => None,
+        }
+    }
+
     fn choose_diff(
         &mut self,
         index: usize,
@@ -118,6 +235,16 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((session_id, turn_id)) = self.interactive_correlation(index) {
+            let decision = if approved {
+                TurnDiffDecision::Approve
+            } else {
+                TurnDiffDecision::Reject
+            };
+            let _ = self
+                .backend
+                .diff_reply(session_id, turn_id, index as u32, decision);
+        }
         self.chat.reduce(ChatAction::ApproveDiff(index, approved));
         cx.notify();
     }
@@ -130,6 +257,22 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((session_id, turn_id)) = self.interactive_correlation(index) {
+            let wire_choice = match choice {
+                PermissionChoice::AllowOnce => TurnPermissionChoice::AllowOnce,
+                PermissionChoice::AllowAlways => TurnPermissionChoice::AllowAlways,
+                PermissionChoice::Reject => TurnPermissionChoice::Reject,
+                PermissionChoice::Inspect => TurnPermissionChoice::Inspect,
+                PermissionChoice::Cancel => TurnPermissionChoice::Cancel,
+            };
+            let request_id = match self.chat.cards.get(index) {
+                Some(Card::Permission { request_id, .. }) => request_id.clone(),
+                _ => String::new(),
+            };
+            let _ = self
+                .backend
+                .permission_reply(session_id, turn_id, request_id, wire_choice);
+        }
         self.chat.reduce(ChatAction::Permission(index, choice));
         cx.notify();
     }
@@ -142,6 +285,11 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((session_id, turn_id)) = self.interactive_correlation(index) {
+            let _ = self
+                .backend
+                .question_reply(session_id, turn_id, answer.into());
+        }
         self.chat
             .reduce(ChatAction::AnswerQuestion(index, answer.into()));
         cx.notify();
@@ -197,12 +345,12 @@ impl TauView {
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
-        let selected_model = self.models.get(self.model_index).cloned();
+        let request = self.turn_request(prompt);
         let receiver = self.backend.turn_with_options(
-            prompt,
-            self.chat.session_id.clone(),
-            Some(self.agent.label().into()),
-            selected_model,
+            request.prompt,
+            request.session_id,
+            Some(request.agent),
+            request.model,
         );
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;
@@ -352,6 +500,7 @@ impl Render for TauView {
                         path,
                         patch,
                         approved,
+                        ..
                     } => (
                         0x293b32,
                         "diff",
@@ -596,4 +745,41 @@ fn toast_button(
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
         .child(label.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_selection_is_typed_and_cycles() {
+        assert_eq!(AgentMode::Code.label(), "Code");
+        assert_eq!(AgentMode::Code.next().label(), "Plan");
+        assert_eq!(AgentMode::Plan.next().label(), "Code");
+    }
+
+    #[test]
+    fn replay_selection_preserves_protocol_cursor() {
+        assert_eq!(
+            replay_request("session-7", 41),
+            ReplayRequest {
+                session_id: "session-7".into(),
+                after_sequence: 41,
+            }
+        );
+    }
+
+    #[test]
+    fn turn_request_contains_selected_agent_model_and_session() {
+        let request = make_turn_request(
+            "ship it".into(),
+            Some("session-7".into()),
+            AgentMode::Plan,
+            Some("test/model".into()),
+        );
+        assert_eq!(request.prompt, "ship it");
+        assert_eq!(request.session_id.as_deref(), Some("session-7"));
+        assert_eq!(request.agent, "Plan");
+        assert_eq!(request.model.as_deref(), Some("test/model"));
+    }
 }
