@@ -1,6 +1,7 @@
 use crate::state::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tau_proto::prelude::{IdempotencyKey, RequestAction, TurnStartParams};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -164,8 +165,9 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
     match a {
         Action::Insert(c) => {
             replace_selection(s);
-            s.input.insert(s.cursor, c);
-            s.cursor += c.len_utf8();
+            let value = c.to_string();
+            s.input.insert_str(s.cursor, &value);
+            s.cursor += value.len();
         }
         Action::Paste(text) => {
             replace_selection(s);
@@ -177,8 +179,8 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                 replace_selection(s);
             } else if s.cursor > 0 {
                 let p = s.input[..s.cursor]
-                    .char_indices()
-                    .last()
+                    .grapheme_indices(true)
+                    .next_back()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 s.input.drain(p..s.cursor);
@@ -189,12 +191,12 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             if s.selection.is_some() {
                 replace_selection(s);
             } else if s.cursor < s.input.len() {
-                let n = s.input[s.cursor..]
-                    .char_indices()
+                let end = s.input[s.cursor..]
+                    .grapheme_indices(true)
                     .nth(1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(s.input.len() - s.cursor);
-                s.input.drain(s.cursor..s.cursor + n);
+                    .map(|(i, _)| s.cursor + i)
+                    .unwrap_or(s.input.len());
+                s.input.drain(s.cursor..end);
             }
         }
         Action::MoveLeft { select } => move_horizontal(s, -1, select),
@@ -223,6 +225,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
                 } else if p.trim() == "/models" || p.trim() == "/model" {
                     s.picker = Picker::Models;
                 }
+                sync_composer(s);
                 return Some(p);
             }
         }
@@ -408,7 +411,27 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             s.replaying = false;
         }
     }
+    sync_composer(s);
     None
+}
+
+fn sync_composer(s: &mut AppState) {
+    s.composer.set_text(s.input.clone());
+    let anchor = s.selection.unwrap_or(s.cursor);
+    s.composer.set_selection(anchor, s.cursor);
+    s.composer.set_model(s.model.clone());
+    s.composer.set_agent(s.agent.clone());
+    let _ = s
+        .composer
+        .apply(crate::composer::ComposerAction::SetSending(
+            s.turn_id.is_some(),
+        ));
+    let _ = s
+        .composer
+        .apply(crate::composer::ComposerAction::SetConnection {
+            connected: s.connection == Connection::Connected,
+            detail: format!("{:?}", s.connection),
+        });
 }
 pub fn filtered_models(s: &AppState) -> Vec<&Model> {
     let mut models: Vec<&Model> = s
@@ -477,9 +500,9 @@ fn move_horizontal(s: &mut AppState, direction: i8, select: bool) {
     } else {
         s.cursor
             + s.input[s.cursor..]
-                .chars()
-                .next()
-                .map(char::len_utf8)
+                .grapheme_indices(true)
+                .nth(1)
+                .map(|(i, _)| i)
                 .unwrap_or(0)
     };
     if select {

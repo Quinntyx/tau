@@ -15,6 +15,7 @@ tau-client.workspace = true
 tau-proto.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

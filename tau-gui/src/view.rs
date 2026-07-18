@@ -1476,22 +1476,67 @@ impl Render for TauView {
             .child(
                 div()
                     .flex()
+                    .flex_col()
                     .gap_3()
-                    .items_end()
                     .child(self.input.clone())
+                    .child({
+                        let input = self.input.read(cx);
+                        let refs = input.file_references();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(0x8994a8))
+                            .children(refs.into_iter().map(|reference| {
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x293b52))
+                                    .child(reference)
+                            }))
+                            .child(format!("{} characters", input.char_count()))
+                    })
                     .child(
                         div()
-                            .id("send-button")
-                            .px_4()
-                            .py_3()
-                            .bg(rgb(0x85b8ff))
-                            .hover(|style| style.bg(rgb(0xa8ccff)))
-                            .focusable()
-                            .text_color(rgb(0x10151e))
-                            .rounded_lg()
-                            .cursor_pointer()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
-                            .child("Send"),
+                            .flex()
+                            .items_end()
+                            .gap_3()
+                            .child(toast_button(
+                                &format!(
+                                    "Agent · {}",
+                                    if self.agent.is_empty() {
+                                        "default"
+                                    } else {
+                                        &self.agent
+                                    }
+                                ),
+                                0x33445f,
+                                cx.listener(Self::click_agent),
+                            ))
+                            .child(toast_button(
+                                &format!("Model · {}", current_model),
+                                0x33445f,
+                                cx.listener(Self::click_model),
+                            ))
+                            .child(
+                                div()
+                                    .id("send-button")
+                                    .px_4()
+                                    .py_3()
+                                    .bg(rgb(0x85b8ff))
+                                    .hover(|style| style.bg(rgb(0xa8ccff)))
+                                    .focusable()
+                                    .text_color(rgb(0x10151e))
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .when(self.chat.active_assistant.is_some(), |button| {
+                                        button.opacity(0.45)
+                                    })
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
+                                    .child("Send"),
+                            ),
                     ),
             )
             .when(self.chat.active_assistant.is_some(), |footer| {
@@ -1508,7 +1553,29 @@ impl Render for TauView {
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_turn))
                         .child("Cancel"),
                 )
-            });
+            })
+            .child(
+                div()
+                    .mt_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(0x2c3340))
+                    .text_xs()
+                    .text_color(rgb(0x8994a8))
+                    .child(format!(
+                        "Connection · {}",
+                        match self.backend.daemon_status() {
+                            DaemonStatus::Ready => "connected",
+                            DaemonStatus::Absent => "offline",
+                            DaemonStatus::Spawning
+                            | DaemonStatus::Connecting
+                            | DaemonStatus::Negotiating => "connecting",
+                            DaemonStatus::Incompatible
+                            | DaemonStatus::Degraded
+                            | DaemonStatus::Failed => "degraded",
+                        }
+                    )),
+            );
         let mut root = div()
             .size_full()
             .bg(rgb(0x11151b))

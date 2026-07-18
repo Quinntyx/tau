@@ -2,6 +2,7 @@
 //! thin; all interesting behaviour lives in typed state and renderable components.
 mod adapter;
 pub mod components;
+pub mod composer;
 pub mod reducer;
 pub mod state;
 
@@ -105,9 +106,10 @@ async fn session(
             Some(input) = input_rx.recv() => {
                 let action = match input {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if matches!(key.code, KeyCode::Esc) { break; }
+                        if matches!(key.code, KeyCode::Esc) && state.picker == state::Picker::None { break; }
                         reducer::key_action(&state, key)
                     }
+                    Event::Paste(text) => Some(reducer::Action::Paste(text)),
                     Event::Mouse(mouse) => reducer::mouse_action(&state, mouse),
                     Event::Resize(_, _) => Some(reducer::Action::Reconnect),
                     _ => None,

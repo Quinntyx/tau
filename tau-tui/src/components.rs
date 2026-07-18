@@ -11,7 +11,7 @@ use ratatui::{
 pub fn render(frame: &mut Frame, s: &AppState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(5)])
+        .constraints([Constraint::Min(4), Constraint::Length(7)])
         .split(frame.area());
     let mut transcript = s.transcript.join("\n");
     for tool in &s.tools {
@@ -37,8 +37,34 @@ pub fn render(frame: &mut Frame, s: &AppState) {
             if s.autonomous { "AUTO" } else { "ASK" }
         )),
     ]);
+    let status = format!(
+        "  {}  {}  {} chars  {}",
+        if s.connection == Connection::Connected {
+            "● connected"
+        } else {
+            "○ disconnected"
+        },
+        if s.cancelling {
+            "cancelling"
+        } else if s.turn_id.is_some() {
+            "active"
+        } else {
+            "ready"
+        },
+        s.input.chars().count(),
+        if s.turn_id.is_some() {
+            "Ctrl-C cancel"
+        } else {
+            "Enter send"
+        }
+    );
     frame.render_widget(
-        Paragraph::new(Text::from(vec![footer, Line::from(s.input.as_str())])).block(
+        Paragraph::new(Text::from(vec![
+            footer,
+            Line::from(s.input.as_str()),
+            Line::from(status),
+        ]))
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" prompt (Shift+Enter newline) "),
@@ -97,7 +123,9 @@ fn picker(frame: &mut Frame, s: &AppState) {
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_widget(list, area);
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(s.picker_index));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 fn permission(frame: &mut Frame, p: &Permission) {
     let area = center(frame.area(), 64, 10);

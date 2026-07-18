@@ -450,6 +450,25 @@ impl TextInput {
         self.buffer.text().to_owned()
     }
 
+    /// Unicode scalar count used by the composer counter (rather than bytes).
+    pub fn char_count(&self) -> usize {
+        self.buffer.text().chars().count()
+    }
+
+    /// File references are deliberately kept as prompt text; the backend owns
+    /// interpretation. This projection only supplies chips for the composer.
+    pub fn file_references(&self) -> Vec<String> {
+        self.buffer
+            .text()
+            .split_whitespace()
+            .filter(|word| word.starts_with('@') && word.len() > 1)
+            .map(|word| {
+                word.trim_matches(|ch: char| matches!(ch, ',' | ';' | ')' | ']'))
+                    .to_owned()
+            })
+            .collect()
+    }
+
     pub fn reset(&mut self) {
         self.buffer = EditorBuffer::default();
         self.history_index = None;

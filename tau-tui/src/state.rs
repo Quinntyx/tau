@@ -1,3 +1,4 @@
+use crate::composer::Composer;
 use serde_json::Value;
 use std::collections::VecDeque;
 use tau_proto::prelude::SequencedEvent;
@@ -85,6 +86,10 @@ pub struct Hunk {
 
 #[derive(Debug, Clone)]
 pub struct AppState {
+    /// Canonical composer contract; legacy fields below remain as a protocol
+    /// projection for the existing transcript/reducer APIs.
+    pub composer: Composer,
+    pub project_id: Option<String>,
     pub connection: Connection,
     pub input: String,
     pub cursor: usize,
@@ -137,6 +142,18 @@ pub struct BufferSnapshot {
 }
 
 impl AppState {
+    /// Build state with integration-owned identifiers; the composer keeps the
+    /// values opaque while reducers pass the existing protocol fields through.
+    pub fn with_ids(session_id: impl Into<String>, project_id: impl Into<String>) -> Self {
+        let mut state = Self::default();
+        let session_id = session_id.into();
+        let project_id = project_id.into();
+        state.session_id = Some(session_id.clone());
+        state.project_id = Some(project_id.clone());
+        state.composer = Composer::new(session_id, project_id);
+        state
+    }
+
     pub fn buffer_snapshot(&self) -> BufferSnapshot {
         BufferSnapshot {
             input: self.input.clone(),
@@ -156,6 +173,8 @@ impl AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            composer: Composer::new("", ""),
+            project_id: None,
             connection: Connection::Connected,
             input: String::new(),
             cursor: 0,

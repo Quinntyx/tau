@@ -6383,6 +6383,7 @@ dependencies = [
  "tau-proto",
  "tau-server",
  "tokio",
+ "unicode-segmentation",
 ]
 
 [[package]]
