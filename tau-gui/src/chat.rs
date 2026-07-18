@@ -1,4 +1,5 @@
 //! Pure, typed chat model used by the GPUI view and scripted fixtures.
+use std::collections::HashSet;
 use tau_client::CompletionEvent;
 use tau_proto::prelude::{CompletionStreamResult, SequencedEvent, TurnEvent};
 
@@ -23,16 +24,23 @@ pub enum Card {
         expanded: bool,
     },
     Diff {
+        session_id: String,
+        turn_id: String,
+        request_id: String,
         path: String,
         patch: String,
         approved: bool,
     },
     Permission {
+        session_id: String,
+        turn_id: String,
         request_id: String,
         tool: String,
         description: String,
     },
     Question {
+        session_id: String,
+        turn_id: String,
         question_id: String,
         question: String,
         answer: Option<String>,
@@ -62,6 +70,9 @@ pub struct ChatState {
     pub usage: Option<u64>,
     pub status: ChatStatus,
     pub active_assistant: Option<usize>,
+    pub last_sequence: u64,
+    active_turn_id: Option<String>,
+    seen_event_ids: HashSet<String>,
 }
 
 impl Default for ChatState {
@@ -72,6 +83,9 @@ impl Default for ChatState {
             usage: None,
             status: ChatStatus::Ready,
             active_assistant: None,
+            last_sequence: 0,
+            active_turn_id: None,
+            seen_event_ids: HashSet::new(),
         }
     }
 }
@@ -190,6 +204,28 @@ impl ChatState {
     }
 
     fn apply_session_event(&mut self, event: SequencedEvent) -> bool {
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|id| id != event.session_id)
+            || event.sequence <= self.last_sequence
+            || self.seen_event_ids.contains(&event.event_id)
+        {
+            return false;
+        }
+        let session_id = event.session_id.clone();
+        let turn_id = event_turn_id(&event.event).to_owned();
+        if self
+            .active_turn_id
+            .as_deref()
+            .is_some_and(|id| id != turn_id)
+        {
+            return false;
+        }
+        self.seen_event_ids.insert(event.event_id);
+        self.session_id = Some(session_id.clone());
+        self.last_sequence = event.sequence;
+        self.active_turn_id = Some(turn_id.clone());
         match event.event {
             TurnEvent::TextDelta { text, .. } => {
                 let Some(index) = self.active_assistant else {
@@ -217,6 +253,8 @@ impl ChatState {
                 ..
             } => {
                 self.cards.push(Card::Permission {
+                    session_id,
+                    turn_id: turn_id.clone(),
                     request_id,
                     tool,
                     description,
@@ -229,14 +267,24 @@ impl ChatState {
                 ..
             } => {
                 self.cards.push(Card::Question {
+                    session_id,
+                    turn_id: turn_id.clone(),
                     question_id,
                     question,
                     answer: None,
                 });
                 true
             }
-            TurnEvent::DiffRequested { path, diff, .. } => {
+            TurnEvent::DiffRequested {
+                request_id,
+                path,
+                diff,
+                ..
+            } => {
                 self.cards.push(Card::Diff {
+                    session_id,
+                    turn_id,
+                    request_id,
                     path,
                     patch: diff,
                     approved: false,
@@ -245,24 +293,38 @@ impl ChatState {
             }
             TurnEvent::TurnCompleted { .. } => {
                 self.active_assistant = None;
+                self.active_turn_id = None;
                 self.status = ChatStatus::Ready;
                 true
             }
             TurnEvent::TurnCancelled { .. } => {
                 self.active_assistant = None;
+                self.active_turn_id = None;
                 self.status = ChatStatus::Ready;
                 true
             }
             TurnEvent::TurnFailed { message, .. } => {
                 self.active_assistant = None;
+                self.active_turn_id = None;
                 self.status = ChatStatus::Failed(message);
                 true
             }
-            TurnEvent::TurnStarted { .. } | TurnEvent::ArtifactCreated { .. } => false,
+            TurnEvent::TurnStarted { .. } => {
+                self.status = ChatStatus::Streaming;
+                true
+            }
+            TurnEvent::ArtifactCreated { .. } => true,
         }
     }
 
     fn finish(&mut self, result: CompletionStreamResult) -> bool {
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|id| id != result.session_id)
+        {
+            return false;
+        }
         let Some(index) = self.active_assistant.take() else {
             return false;
         };
@@ -273,6 +335,21 @@ impl ChatState {
         self.usage = Some(result.usage.total_tokens);
         self.status = ChatStatus::Ready;
         true
+    }
+}
+
+fn event_turn_id(event: &TurnEvent) -> &str {
+    match event {
+        TurnEvent::TurnStarted { turn_id }
+        | TurnEvent::TextDelta { turn_id, .. }
+        | TurnEvent::ToolOutput { turn_id, .. }
+        | TurnEvent::PermissionRequested { turn_id, .. }
+        | TurnEvent::QuestionAsked { turn_id, .. }
+        | TurnEvent::DiffRequested { turn_id, .. }
+        | TurnEvent::ArtifactCreated { turn_id, .. }
+        | TurnEvent::TurnCompleted { turn_id, .. }
+        | TurnEvent::TurnCancelled { turn_id }
+        | TurnEvent::TurnFailed { turn_id, .. } => turn_id,
     }
 }
 
@@ -320,6 +397,8 @@ mod tests {
             matches!(&state.cards[0], Card::Tool { expanded: true, input, .. } if input.contains("pwd"))
         );
         state.cards.push(Card::Permission {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
             request_id: "r1".into(),
             tool: "write".into(),
             description: "modify file".into(),
@@ -336,13 +415,17 @@ mod tests {
     #[test]
     fn typed_prompt_events_keep_correlation_ids_and_diff_rejection_is_terminal() {
         let mut state = ChatState::default();
-        let event = |event| SequencedEvent {
-            event_id: "event".into(),
-            session_id: "session".into(),
-            sequence: 1,
-            occurred_at: 0,
-            request_id: None,
-            event,
+        let mut sequence = 0;
+        let mut event = |event| {
+            sequence += 1;
+            SequencedEvent {
+                event_id: format!("event-{sequence}"),
+                session_id: "session".into(),
+                sequence,
+                occurred_at: 0,
+                request_id: None,
+                event,
+            }
         };
 
         assert!(state.reduce(ChatAction::SessionEvent(event(
@@ -371,6 +454,9 @@ mod tests {
         ));
 
         state.cards.push(Card::Diff {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            request_id: "diff".into(),
             path: "file.rs".into(),
             patch: "@@".into(),
             approved: false,
@@ -382,5 +468,26 @@ mod tests {
                 .iter()
                 .any(|card| matches!(card, Card::Diff { .. }))
         );
+    }
+
+    #[test]
+    fn replay_ignores_duplicate_stale_and_wrong_session_events() {
+        let mut state = ChatState::default();
+        assert!(state.reduce(ChatAction::Submit("hello".into())));
+        let event = |session: &str, sequence: u64, event_id: &str| SequencedEvent {
+            event_id: event_id.into(),
+            session_id: session.into(),
+            sequence,
+            occurred_at: 0,
+            request_id: None,
+            event: TurnEvent::TurnStarted {
+                turn_id: "turn-1".into(),
+            },
+        };
+        assert!(state.reduce(ChatAction::SessionEvent(event("session", 1, "e1"))));
+        assert!(!state.reduce(ChatAction::SessionEvent(event("session", 1, "e1"))));
+        assert!(!state.reduce(ChatAction::SessionEvent(event("session", 0, "e0"))));
+        assert!(!state.reduce(ChatAction::SessionEvent(event("other", 2, "e2"))));
+        assert_eq!(state.last_sequence, 1);
     }
 }

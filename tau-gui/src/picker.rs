@@ -44,6 +44,23 @@ pub fn next_agent(agents: &[AgentOption], current: Option<&str>, reverse: bool) 
     Some(choices[next].name.clone())
 }
 
+/// Typed model/agent choice used by picker renderers and acceptance tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerSelection {
+    pub model: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl PickerSelection {
+    pub fn choose_model(&mut self, option: &ModelOption) {
+        self.model = Some(option.id.clone());
+    }
+
+    pub fn cycle_agent(&mut self, agents: &[AgentOption], reverse: bool) {
+        self.agent = next_agent(agents, self.agent.as_deref(), reverse);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

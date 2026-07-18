@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{
-    IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams, TurnStartParams,
+    Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
+    RequestAction, TurnCancelParams, TurnDiffDecision, TurnPermissionChoice, TurnReplayParams,
+    TurnResponseParams, TurnStartParams,
 };
 use tokio::sync::mpsc;
 
@@ -206,25 +208,10 @@ impl Backend {
             let result = async {
                 let mut guard = session.lock().await;
                 if guard.is_none() {
-                    *guard = Some(tau_client::Client::connect(&socket).await?);
+                    *guard = Some(connect_ready(&socket).await?);
                 }
                 let client = guard.as_mut().expect("session initialized");
-                let params = TurnStartParams {
-                    model,
-                    prompt,
-                    session_id,
-                    cwd: Some(cwd),
-                    agent,
-                    task_tier: None,
-                    autonomous: None,
-                    action: Some(RequestAction::Submit),
-                    idempotency_key: IdempotencyKey::new(format!(
-                        "gui-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_nanos())
-                    )),
-                };
+                let params = turn_start_request(model, prompt, session_id, cwd, agent);
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
@@ -241,7 +228,7 @@ impl Backend {
                             }
                         }
                     }
-                    let complete = matches!(event, TurnStreamEvent::Complete(_));
+                    let complete = is_terminal_event(&event);
                     sender
                         .send(Ok(event))
                         .map_err(|_| anyhow::anyhow!("GUI closed"))?;
@@ -273,16 +260,7 @@ impl Backend {
             let active = active_turn.lock().ok().and_then(|mut value| value.take());
             if let Some((client, session_id, turn_id)) = active {
                 let _ = client
-                    .turn_cancel(TurnCancelParams {
-                        session_id,
-                        turn_id,
-                        idempotency_key: IdempotencyKey::new(format!(
-                            "gui-cancel-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |d| d.as_nanos())
-                        )),
-                    })
+                    .turn_cancel(cancel_request(session_id, turn_id))
                     .await;
             }
         });
@@ -302,13 +280,9 @@ impl Backend {
         let socket = self.socket.clone();
         self.runtime.spawn(async move {
             let result = async {
-                let client = tau_client::Client::connect(socket).await?;
+                let client = connect_ready(&socket).await?;
                 client
-                    .turn_replay(TurnReplayParams {
-                        session_id,
-                        after_sequence,
-                        limit: Some(500),
-                    })
+                    .turn_replay(replay_request(session_id, after_sequence))
                     .await
             }
             .await
@@ -317,6 +291,143 @@ impl Backend {
         });
         rx
     }
+
+    pub fn respond(
+        &self,
+        session_id: String,
+        turn_id: String,
+        response: ClientResponse,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let socket = self.socket.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                connect_ready(&socket)
+                    .await?
+                    .turn_response(response_request(session_id, turn_id, response))
+                    .await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    pub fn permission_reply(
+        &self,
+        session_id: String,
+        turn_id: String,
+        _request_id: String,
+        choice: TurnPermissionChoice,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.respond(
+            session_id,
+            turn_id,
+            ClientResponse::Permission {
+                choice: permission_choice_name(choice).into(),
+            },
+        )
+    }
+
+    pub fn question_reply(
+        &self,
+        session_id: String,
+        turn_id: String,
+        answer: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.respond(session_id, turn_id, ClientResponse::Question { answer })
+    }
+
+    pub fn diff_reply(
+        &self,
+        session_id: String,
+        turn_id: String,
+        index: u32,
+        decision: TurnDiffDecision,
+    ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnResponseResult, String>>
+    {
+        self.respond(
+            session_id,
+            turn_id,
+            ClientResponse::DiffHunk {
+                index,
+                approved: matches!(decision, TurnDiffDecision::Approve),
+            },
+        )
+    }
+}
+
+fn turn_start_request(
+    model: String,
+    prompt: String,
+    session_id: Option<String>,
+    cwd: String,
+    agent: Option<String>,
+) -> TurnStartParams {
+    TurnStartParams {
+        model,
+        prompt,
+        session_id,
+        cwd: Some(cwd),
+        agent,
+        task_tier: None,
+        autonomous: None,
+        action: Some(RequestAction::Submit),
+        idempotency_key: IdempotencyKey::new(format!("gui-{}", unique_nonce())),
+    }
+}
+
+fn cancel_request(session_id: String, turn_id: String) -> TurnCancelParams {
+    TurnCancelParams {
+        session_id,
+        turn_id,
+        idempotency_key: IdempotencyKey::new(format!("gui-cancel-{}", unique_nonce())),
+    }
+}
+
+fn replay_request(session_id: String, after_sequence: u64) -> TurnReplayParams {
+    TurnReplayParams {
+        session_id,
+        after_sequence,
+        limit: Some(500),
+    }
+}
+
+fn response_request(
+    session_id: String,
+    turn_id: String,
+    response: ClientResponse,
+) -> TurnResponseParams {
+    TurnResponseParams {
+        session_id,
+        turn_id,
+        idempotency_key: IdempotencyKey::new(format!("gui-response-{}", unique_nonce())),
+        response,
+    }
+}
+
+fn unique_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
+fn permission_choice_name(choice: TurnPermissionChoice) -> &'static str {
+    match choice {
+        TurnPermissionChoice::AllowOnce => "allow_once",
+        TurnPermissionChoice::AllowAlways => "allow_always",
+        TurnPermissionChoice::Reject => "reject",
+        TurnPermissionChoice::Inspect => "inspect",
+        TurnPermissionChoice::Cancel => "cancel",
+    }
+}
+
+fn is_terminal_event(event: &TurnStreamEvent) -> bool {
+    matches!(event, TurnStreamEvent::Complete(_))
 }
 
 async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
@@ -342,12 +453,38 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
 }
 
 async fn daemon_reachable(socket: &PathBuf) -> bool {
-    tokio::time::timeout(
+    tokio::time::timeout(Duration::from_millis(250), connect_ready(socket))
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+async fn connect_ready(socket: &PathBuf) -> Result<tau_client::Client> {
+    let client = tau_client::Client::connect(socket).await?;
+    let negotiated = tokio::time::timeout(
         Duration::from_millis(250),
-        tau_client::Client::connect(socket),
+        client.negotiate(negotiation_request()),
     )
     .await
-    .is_ok_and(|result| result.is_ok())
+    .context("daemon negotiation timed out")??;
+    anyhow::ensure!(
+        negotiated.version.major == 1,
+        "daemon negotiated unsupported major version {}",
+        negotiated.version.major
+    );
+    Ok(client)
+}
+
+fn negotiation_request() -> ProtocolNegotiateParams {
+    ProtocolNegotiateParams {
+        version: ProtocolVersion { major: 1, minor: 0 },
+        capabilities: vec![
+            Capability::TurnStreaming,
+            Capability::TurnCancellation,
+            Capability::EventReplay,
+            Capability::Idempotency,
+            Capability::ArtifactReferences,
+        ],
+    }
 }
 
 fn daemon_executable() -> Result<PathBuf> {
@@ -389,5 +526,47 @@ mod tests {
             "test/model".into(),
         );
         drop(backend);
+    }
+
+    #[test]
+    fn typed_requests_preserve_submit_cancel_and_replay_fields() {
+        let start = turn_start_request(
+            "m".into(),
+            "hello".into(),
+            Some("s".into()),
+            "/tmp".into(),
+            Some("a".into()),
+        );
+        assert!(matches!(start.action, Some(RequestAction::Submit)));
+        assert_eq!(start.session_id.as_deref(), Some("s"));
+        let cancel = cancel_request("s".into(), "t".into());
+        assert_eq!(
+            (cancel.session_id.as_str(), cancel.turn_id.as_str()),
+            ("s", "t")
+        );
+        let replay = replay_request("s".into(), 41);
+        assert_eq!(
+            (replay.session_id, replay.after_sequence, replay.limit),
+            ("s".into(), 41, Some(500))
+        );
+    }
+
+    #[test]
+    fn interactive_responses_remain_typed() {
+        let response = response_request(
+            "s".into(),
+            "t".into(),
+            ClientResponse::Question {
+                answer: "yes".into(),
+            },
+        );
+        assert_eq!(response.session_id, "s");
+        assert_eq!(response.turn_id, "t");
+        assert_eq!(
+            response.response,
+            ClientResponse::Question {
+                answer: "yes".into()
+            }
+        );
     }
 }

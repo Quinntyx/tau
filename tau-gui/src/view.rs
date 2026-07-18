@@ -3,6 +3,7 @@ use gpui::{
     div, prelude::*, px, rgb,
 };
 use tau_client::TurnStreamEvent;
+use tau_proto::prelude::{TurnDiffDecision, TurnEvent, TurnPermissionChoice};
 
 use crate::backend::{Backend, DaemonAction};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
@@ -17,25 +18,47 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-#[derive(Clone, Copy)]
-enum AgentMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
     Plan,
     Code,
 }
 
 impl AgentMode {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Plan => "Plan",
             Self::Code => "Code",
         }
     }
 
-    fn next(self) -> Self {
+    pub fn next(self) -> Self {
         match self {
             Self::Plan => Self::Code,
             Self::Code => Self::Plan,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRequest {
+    pub prompt: String,
+    pub session_id: Option<String>,
+    pub agent: String,
+    pub model: Option<String>,
+}
+
+fn make_turn_request(
+    prompt: String,
+    session_id: Option<String>,
+    agent: AgentMode,
+    model: Option<String>,
+) -> TurnRequest {
+    TurnRequest {
+        prompt,
+        session_id,
+        agent: agent.label().into(),
+        model,
     }
 }
 
@@ -49,6 +72,8 @@ pub struct TauView {
     model_index: usize,
     models: Vec<String>,
     sidebar_visible: bool,
+    turn_id: Option<String>,
+    replay_cursor: u64,
 }
 
 impl TauView {
@@ -75,7 +100,27 @@ impl TauView {
             model_index: 0,
             models,
             sidebar_visible: preferences.sidebar,
+            turn_id: None,
+            replay_cursor: 0,
         }
+    }
+
+    /// Build the exact typed request submitted by the view's send action.
+    pub fn turn_request_for(
+        prompt: impl Into<String>,
+        session_id: Option<String>,
+        agent: AgentMode,
+        model: Option<String>,
+    ) -> TurnRequest {
+        make_turn_request(prompt.into(), session_id, agent, model)
+    }
+
+    pub fn sidebar_visible(&self) -> bool {
+        self.sidebar_visible
+    }
+
+    pub fn daemon_warning_visible(&self) -> bool {
+        self.toast_visible
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -118,7 +163,27 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (session_id, turn_id) = match self.chat.cards.get(index) {
+            Some(Card::Diff {
+                session_id,
+                turn_id,
+                ..
+            }) => (Some(session_id.clone()), Some(turn_id.clone())),
+            _ => (self.chat.session_id.clone(), self.turn_id.clone()),
+        };
         self.chat.reduce(ChatAction::ApproveDiff(index, approved));
+        if let (Some(session_id), Some(turn_id)) = (session_id, turn_id) {
+            let _ = self.backend.diff_reply(
+                session_id,
+                turn_id,
+                index as u32,
+                if approved {
+                    TurnDiffDecision::Approve
+                } else {
+                    TurnDiffDecision::Reject
+                },
+            );
+        }
         cx.notify();
     }
 
@@ -130,7 +195,28 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (session_id, turn_id, request_id) = match self.chat.cards.get(index) {
+            Some(Card::Permission {
+                session_id,
+                turn_id,
+                request_id,
+                ..
+            }) => (session_id.clone(), turn_id.clone(), request_id.clone()),
+            _ => return,
+        };
         self.chat.reduce(ChatAction::Permission(index, choice));
+        let _ = self.backend.permission_reply(
+            session_id,
+            turn_id,
+            request_id,
+            match choice {
+                PermissionChoice::AllowOnce => TurnPermissionChoice::AllowOnce,
+                PermissionChoice::AllowAlways => TurnPermissionChoice::AllowAlways,
+                PermissionChoice::Reject => TurnPermissionChoice::Reject,
+                PermissionChoice::Inspect => TurnPermissionChoice::Inspect,
+                PermissionChoice::Cancel => TurnPermissionChoice::Cancel,
+            },
+        );
         cx.notify();
     }
 
@@ -142,8 +228,19 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (session_id, turn_id) = match self.chat.cards.get(index) {
+            Some(Card::Question {
+                session_id,
+                turn_id,
+                ..
+            }) => (session_id.clone(), turn_id.clone()),
+            _ => return,
+        };
         self.chat
             .reduce(ChatAction::AnswerQuestion(index, answer.into()));
+        let _ = self
+            .backend
+            .question_reply(session_id, turn_id, answer.into());
         cx.notify();
     }
 
@@ -197,12 +294,17 @@ impl TauView {
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
-        let selected_model = self.models.get(self.model_index).cloned();
-        let receiver = self.backend.turn_with_options(
+        let request = Self::turn_request_for(
             prompt,
             self.chat.session_id.clone(),
-            Some(self.agent.label().into()),
-            selected_model,
+            self.agent,
+            self.models.get(self.model_index).cloned(),
+        );
+        let receiver = self.backend.turn_with_options(
+            request.prompt,
+            request.session_id,
+            Some(request.agent),
+            request.model,
         );
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;
@@ -221,12 +323,18 @@ impl TauView {
     fn apply_event(&mut self, event: Result<TurnStreamEvent, String>, cx: &mut Context<Self>) {
         match event {
             Ok(TurnStreamEvent::Event(event)) => {
+                self.replay_cursor = self.replay_cursor.max(event.sequence);
+                self.chat.session_id = Some(event.session_id.clone());
+                if let TurnEvent::TurnStarted { turn_id } = &event.event {
+                    self.turn_id = Some(turn_id.clone());
+                }
                 self.chat.reduce(ChatAction::SessionEvent(event));
                 cx.notify();
             }
             Ok(TurnStreamEvent::Complete(_)) => {
                 self.chat.active_assistant = None;
                 self.chat.status = ChatStatus::Ready;
+                self.turn_id = None;
                 cx.notify();
             }
             Err(error) => {
@@ -234,6 +342,17 @@ impl TauView {
                 cx.notify();
             }
         }
+    }
+
+    /// Request events after the last event consumed by this view.
+    pub fn replay(
+        &self,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnReplayResult, String>>>
+    {
+        self.chat
+            .session_id
+            .clone()
+            .map(|session| self.backend.replay(session, self.replay_cursor))
     }
 }
 
@@ -352,6 +471,7 @@ impl Render for TauView {
                         path,
                         patch,
                         approved,
+                        ..
                     } => (
                         0x293b32,
                         "diff",
@@ -551,7 +671,7 @@ impl Render for TauView {
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::switch_agent));
         root = root.on_action(cx.listener(Self::cycle_model));
-        if self.toast_visible {
+        if self.daemon_warning_visible() {
             root = root.child(toast);
         }
         root.child(header)
@@ -560,7 +680,7 @@ impl Render for TauView {
                     .flex()
                     .flex_1()
                     .child(transcript)
-                    .when(self.sidebar_visible, |view| view.child(sidebar)),
+                    .when(self.sidebar_visible(), |view| view.child(sidebar)),
             )
             .child(footer)
     }
@@ -596,4 +716,29 @@ fn toast_button(
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
         .child(label.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_turn_request_preserves_view_selections() {
+        let request = TauView::turn_request_for(
+            "ship it",
+            Some("session-7".into()),
+            AgentMode::Plan,
+            Some("provider/model".into()),
+        );
+        assert_eq!(request.prompt, "ship it");
+        assert_eq!(request.session_id.as_deref(), Some("session-7"));
+        assert_eq!(request.agent, "Plan");
+        assert_eq!(request.model.as_deref(), Some("provider/model"));
+    }
+
+    #[test]
+    fn agent_command_cycles_between_production_modes() {
+        assert_eq!(AgentMode::Code.next(), AgentMode::Plan);
+        assert_eq!(AgentMode::Plan.next().label(), "Code");
+    }
 }
