@@ -96,7 +96,9 @@ pub struct AppState {
     pub raw_events: Vec<SequencedEvent>,
     pub assistant_index: Option<usize>,
     pub session_id: Option<String>,
-    pub project_id: String,
+    /// Explicitly selected active project.  There is intentionally no default
+    /// or cwd-based fallback: turns must name the user's selection.
+    pub project_id: Option<String>,
     pub turn_id: Option<String>,
     pub sequence: u64,
     pub model: String,
@@ -166,7 +168,7 @@ impl Default for AppState {
             raw_events: vec![],
             assistant_index: None,
             session_id: None,
-            project_id: "default".into(),
+            project_id: None,
             turn_id: None,
             sequence: 0,
             model: "openai/gpt-4o".into(),

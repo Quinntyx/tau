@@ -385,6 +385,7 @@ pub struct TauView {
     preferences: crate::preferences::GuiPreferences,
     transcript_scroll: ScrollHandle,
     follow_output: bool,
+    selected_project_id: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -456,7 +457,14 @@ impl TauView {
             preferences,
             transcript_scroll: ScrollHandle::new(),
             follow_output: true,
+            selected_project_id: None,
         }
+    }
+
+    /// Set the active project selected by the project navigator.  Turns are
+    /// intentionally rejected until this explicit selection is supplied.
+    pub fn select_project(&mut self, project_id: Option<String>) {
+        self.selected_project_id = project_id.filter(|id| !id.trim().is_empty());
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -830,11 +838,12 @@ impl TauView {
         window.focus(&self.input.focus_handle(cx));
 
         let selected_model = self.models.get(self.model_index).cloned();
-        let receiver = self.backend.turn_with_options(
+        let receiver = self.backend.turn_with_project_options(
             prompt,
             self.chat.session_id.clone(),
             (!self.agent.is_empty()).then(|| self.agent.clone()),
             selected_model,
+            self.selected_project_id.clone(),
         );
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;

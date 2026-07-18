@@ -44,12 +44,14 @@ pub struct ProjectCreateResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRenameParams {
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub project_id: String,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRepathParams {
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub project_id: String,
     pub root: String,
 }
@@ -61,6 +63,7 @@ pub struct ProjectMutationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectIdParams {
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub project_id: String,
 }
 
@@ -71,7 +74,11 @@ pub struct ProjectActionResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectNewIdParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_empty_option"
+    )]
     pub project_id: Option<String>,
 }
 
@@ -90,6 +97,19 @@ where
         return Err(serde::de::Error::custom("value must not be empty"));
     }
     Ok(value)
+}
+
+pub fn deserialize_non_empty_option<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+        if value.is_empty() {
+            Err(serde::de::Error::custom("value must not be empty"))
+        } else {
+            Ok(Some(value))
+        }
+    })
 }
 
 #[cfg(test)]

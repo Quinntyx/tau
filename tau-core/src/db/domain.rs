@@ -24,7 +24,7 @@ pub(crate) fn now_ms() -> i64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
-    pub project_id: Option<String>,
+    pub project_id: String,
     pub cwd: String,
     pub title: Option<String>,
     pub created_at: i64,

@@ -200,6 +200,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("sql/v4.sql")),
         M::up(include_str!("sql/v5.sql")),
         M::up(include_str!("sql/v6.sql")),
+        M::up(include_str!("sql/v7.sql")),
     ])
 }
 

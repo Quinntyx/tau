@@ -819,7 +819,7 @@ async fn resolve_prompt(
         }
         Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
-            INTERNAL_ERROR,
+            INVALID_PARAMS,
             e.to_string(),
         ))
         .unwrap_or_default(),
@@ -944,7 +944,7 @@ async fn start_turn(
                     let existing = db
                         .get_session(&id)?
                         .ok_or_else(|| anyhow::anyhow!("unknown session: {id}"))?;
-                    if existing.project_id.as_deref() != Some(project_id.as_str()) {
+                    if existing.project_id != project_id {
                         anyhow::bail!("session does not belong to project: {project_id}");
                     }
                     id
@@ -1061,7 +1061,7 @@ async fn cancel_turn(id: Id, value: Option<serde_json::Value>, state: &AppState)
     .unwrap_or_default()
 }
 
-async fn respond_turn(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+async fn respond_turn(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
     let Some(params) = value.and_then(|v| serde_json::from_value::<TurnResponseParams>(v).ok())
     else {
         return serde_json::to_string(&Response::<serde_json::Value>::err(
@@ -1071,6 +1071,21 @@ async fn respond_turn(id: Id, value: Option<serde_json::Value>, _state: &AppStat
         ))
         .unwrap_or_default();
     };
+
+    let db = Arc::clone(&state.db);
+    let session_id = params.session_id.clone();
+    let session_exists = tokio::task::spawn_blocking(move || {
+        db.get_session(&session_id).map(|session| session.is_some())
+    })
+    .await;
+    match session_exists {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            return rpc_error(id, INVALID_PARAMS, "unknown session");
+        }
+        Ok(Err(error)) => return rpc_error(id, INTERNAL_ERROR, error.to_string()),
+        Err(error) => return rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
 
     // The runtime's interactive brokers own the eventual answer.  This
     // transport acknowledgement is intentionally immediate: the TUI must not

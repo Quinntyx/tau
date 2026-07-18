@@ -11,7 +11,7 @@ impl Db {
         let now = now_ms();
         let session = Session {
             id: Uuid::new_v4().to_string(),
-            project_id: Some(project_id.to_string()),
+            project_id: project_id.to_string(),
             cwd: String::new(),
             title: None,
             created_at: now,

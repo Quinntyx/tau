@@ -115,7 +115,7 @@ fn session_create_and_get() {
     let project = db.create_project("project", "/tmp/project").unwrap();
     let s = db.create_session(&project.id).unwrap();
     assert_eq!(s.cwd, project.root);
-    assert_eq!(s.project_id.as_deref(), Some(project.id.as_str()));
+    assert_eq!(s.project_id, project.id);
     assert!(s.title.is_none());
     assert!(!s.id.is_empty());
 
@@ -329,7 +329,7 @@ fn project_registry_enforces_canonical_active_roots_and_lifecycle() {
     assert!(db.reactivate_project(&first.id).is_err());
     assert_eq!(
         db.get_session(&session.id).unwrap().unwrap().project_id,
-        Some(first.id)
+        first.id
     );
     assert_eq!(db.list_projects(true).unwrap().len(), 2);
 }
@@ -344,4 +344,45 @@ fn project_paths_only_create_one_missing_final_directory() {
     let existing_file = parent.path().join("file");
     std::fs::write(&existing_file, "not a directory").unwrap();
     assert!(db.create_project("file", existing_file).is_err());
+}
+
+#[test]
+fn v6_session_data_is_rebuilt_with_mandatory_active_project_fk() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    {
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        for migration in [
+            include_str!("sql/v1.sql"),
+            include_str!("sql/v2.sql"),
+            include_str!("sql/v3.sql"),
+            include_str!("sql/v4.sql"),
+            include_str!("sql/v5.sql"),
+            include_str!("sql/v6.sql"),
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO projects (id,name,root,active,created_at,updated_at) VALUES ('p','p','/tmp',1,1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id,project_id,cwd,created_at,updated_at) VALUES ('valid','p','/tmp',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id,project_id,cwd,created_at,updated_at) VALUES ('orphan',NULL,'/tmp',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+    }
+
+    let db = Db::open(file.path()).unwrap();
+    let sessions = db.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "valid");
+    assert_eq!(sessions[0].project_id, "p");
+    assert!(db.create_session("missing").is_err());
 }

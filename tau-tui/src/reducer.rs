@@ -425,7 +425,18 @@ pub fn filtered_models(s: &AppState) -> Vec<&Model> {
     models.sort_by_key(|m| (!m.favorite, !s.recent_models.contains(&m.id)));
     models
 }
-pub fn params(s: &AppState, prompt: String, cwd: Option<String>) -> TurnStartParams {
+pub fn params(
+    s: &AppState,
+    prompt: String,
+    cwd: Option<String>,
+) -> anyhow::Result<TurnStartParams> {
+    let Some(project_id) = s
+        .project_id
+        .clone()
+        .filter(|project_id| !project_id.trim().is_empty())
+    else {
+        anyhow::bail!("cannot start turn: select an active project first");
+    };
     let idempotency_key = IdempotencyKey::new(format!("tau-tui-{}", uuid_like(prompt.as_bytes())));
     let action = if prompt.starts_with('/') {
         RequestAction::Command {
@@ -434,8 +445,8 @@ pub fn params(s: &AppState, prompt: String, cwd: Option<String>) -> TurnStartPar
     } else {
         RequestAction::Submit
     };
-    TurnStartParams {
-        project_id: s.project_id.clone(),
+    Ok(TurnStartParams {
+        project_id,
         model: s.model.clone(),
         prompt,
         session_id: s.session_id.clone(),
@@ -445,7 +456,7 @@ pub fn params(s: &AppState, prompt: String, cwd: Option<String>) -> TurnStartPar
         task_tier: Some(s.task_tier),
         autonomous: Some(s.autonomous),
         action: Some(action),
-    }
+    })
 }
 
 fn uuid_like(bytes: &[u8]) -> String {
