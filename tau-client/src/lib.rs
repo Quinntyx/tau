@@ -78,6 +78,34 @@ pub enum TurnStreamEvent {
     Complete(TurnStartResult),
 }
 
+/// The result of comparing a negotiated protocol with the features a client
+/// needs.  This is deliberately separate from the wire result: a daemon can
+/// successfully negotiate while still lacking optional GUI features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolCompatibility {
+    Compatible,
+    Degraded,
+    Incompatible,
+}
+
+#[derive(Debug, Clone)]
+pub struct NegotiationReport {
+    pub requested: ProtocolNegotiateParams,
+    pub server: ProtocolNegotiateResult,
+    pub compatibility: ProtocolCompatibility,
+    pub missing_capabilities: Vec<Capability>,
+}
+
+impl NegotiationReport {
+    pub fn is_compatible(&self) -> bool {
+        self.compatibility == ProtocolCompatibility::Compatible
+    }
+
+    pub fn is_usable(&self) -> bool {
+        self.compatibility != ProtocolCompatibility::Incompatible
+    }
+}
+
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self> {
         let stream = UnixStream::connect(path.as_ref())
@@ -165,10 +193,14 @@ impl Client {
             };
             let _ = error;
             let _ = routed.disconnected.send(());
-            let pending = routed.pending.lock().await;
+            let mut pending = routed.pending.lock().await;
             for tx in pending.values() {
                 let _ = tx.send(Incoming::Closed);
             }
+            // Requests cannot receive a response after the transport closes.
+            // Drop their senders so the request table is clean for any owner
+            // that establishes a replacement connection.
+            pending.clear();
         });
         Ok(Self {
             inner,
@@ -284,6 +316,38 @@ impl Client {
     ) -> Result<ProtocolNegotiateResult> {
         serde_json::from_value(self.call(METHOD_PROTOCOL_NEGOTIATE, Some(params)).await?)
             .context("decoding negotiation")
+    }
+
+    /// Negotiate and classify the result against the caller's requirements.
+    /// The server is authoritative for the selected version and capabilities;
+    /// missing capabilities are reported rather than silently ignored.
+    pub async fn negotiate_checked(
+        &self,
+        params: ProtocolNegotiateParams,
+    ) -> Result<NegotiationReport> {
+        let requested = params.clone();
+        let server = self.negotiate(params).await?;
+        let missing_capabilities: Vec<Capability> = requested
+            .capabilities
+            .iter()
+            .filter(|capability| !server.capabilities.contains(capability))
+            .cloned()
+            .collect::<Vec<_>>();
+        let version_compatible = server.version.major == requested.version.major
+            && server.version.minor >= requested.version.minor;
+        // Required capabilities are part of the compatibility contract, not a
+        // best-effort hint: callers must not use a feature the daemon omitted.
+        let compatibility = if !version_compatible || !missing_capabilities.is_empty() {
+            ProtocolCompatibility::Incompatible
+        } else {
+            ProtocolCompatibility::Compatible
+        };
+        Ok(NegotiationReport {
+            requested,
+            server,
+            compatibility,
+            missing_capabilities,
+        })
     }
     pub async fn turn_cancel(&self, params: TurnCancelParams) -> Result<TurnCancelResult> {
         serde_json::from_value(self.call(METHOD_TURN_CANCEL, Some(params)).await?)
@@ -492,5 +556,73 @@ impl Stream for TurnStream {
                 std::task::Poll::Ready(Some(Err(anyhow::anyhow!("connection closed"))))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(required: Vec<Capability>, offered: Vec<Capability>) -> NegotiationReport {
+        let requested = ProtocolNegotiateParams {
+            version: ProtocolVersion { major: 1, minor: 0 },
+            capabilities: required,
+        };
+        let server = ProtocolNegotiateResult {
+            version: ProtocolVersion { major: 1, minor: 0 },
+            capabilities: offered,
+        };
+        let missing_capabilities: Vec<Capability> = requested
+            .capabilities
+            .iter()
+            .filter(|capability| !server.capabilities.contains(capability))
+            .cloned()
+            .collect();
+        let version_compatible = server.version.major == requested.version.major
+            && server.version.minor >= requested.version.minor;
+        let compatibility = if !version_compatible || !missing_capabilities.is_empty() {
+            ProtocolCompatibility::Incompatible
+        } else {
+            ProtocolCompatibility::Compatible
+        };
+        NegotiationReport {
+            requested,
+            server,
+            compatibility,
+            missing_capabilities,
+        }
+    }
+
+    #[test]
+    fn missing_capabilities_are_structured() {
+        let result = report(vec![Capability::TurnStreaming], vec![]);
+        assert_eq!(result.missing_capabilities, vec![Capability::TurnStreaming]);
+        assert!(!result.is_compatible());
+        assert!(!result.is_usable());
+    }
+
+    #[test]
+    fn incompatible_versions_are_not_usable() {
+        let requested = ProtocolVersion { major: 2, minor: 0 };
+        let server = ProtocolVersion { major: 1, minor: 0 };
+        let version_compatible = server.major == requested.major && server.minor >= requested.minor;
+        let result = NegotiationReport {
+            requested: ProtocolNegotiateParams {
+                version: requested,
+                capabilities: vec![],
+            },
+            server: ProtocolNegotiateResult {
+                version: server,
+                capabilities: vec![],
+            },
+            compatibility: if version_compatible {
+                ProtocolCompatibility::Compatible
+            } else {
+                ProtocolCompatibility::Incompatible
+            },
+            missing_capabilities: vec![],
+        };
+        assert_eq!(result.compatibility, ProtocolCompatibility::Incompatible);
+        assert!(!result.is_usable());
     }
 }

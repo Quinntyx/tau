@@ -44,6 +44,11 @@ struct PolicyBroker {
     waiters: Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>>,
 }
 
+#[derive(Clone, Debug)]
+struct NegotiatedProtocol {
+    capabilities: Vec<Capability>,
+}
+
 impl PolicyBroker {
     fn new() -> Self {
         let (events, _) = broadcast::channel(4096);
@@ -218,6 +223,9 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let connection_id = state.runtime.connections.attach();
     let client_id = connection_id.to_string();
+    // Negotiation is connection-scoped: a successful handshake on one socket
+    // must never authorize requests arriving on another socket.
+    let negotiated = Arc::new(Mutex::new(None::<NegotiatedProtocol>));
     let (mut sink, mut input) = futures::StreamExt::split(socket);
     let (out, mut outgoing) = mpsc::channel::<Message>(128);
     let mut events = state.subscribe_events();
@@ -277,8 +285,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let state = state.clone();
                 let out = out.clone();
                 let client_id = client_id.clone();
+                let negotiated = Arc::clone(&negotiated);
                 tokio::spawn(async move {
-                    let response = handle_request(req, &state, &out, &client_id).await;
+                    let response = handle_request(req, &state, &out, &client_id, &negotiated).await;
                     let _ = out.send(Message::Text(response.into())).await;
                 });
             }
@@ -302,6 +311,7 @@ async fn handle_request(
     state: &AppState,
     out: &mpsc::Sender<Message>,
     client_id: &str,
+    negotiated: &Arc<Mutex<Option<NegotiatedProtocol>>>,
 ) -> String {
     let id = req.id;
     match req.method.as_str() {
@@ -334,25 +344,58 @@ async fn handle_request(
                 ))
                 .unwrap_or_default();
             }
+            let server_capabilities = vec![
+                Capability::TurnStreaming,
+                Capability::TurnCancellation,
+                Capability::EventReplay,
+                Capability::Idempotency,
+                Capability::ArtifactReferences,
+            ];
+            let capabilities = params
+                .capabilities
+                .into_iter()
+                .filter(|capability| server_capabilities.contains(capability))
+                .collect::<Vec<_>>();
+            *negotiated.lock().await = Some(NegotiatedProtocol {
+                capabilities: capabilities.clone(),
+            });
             serde_json::to_string(&Response::ok(
                 id,
                 ProtocolNegotiateResult {
                     version: ProtocolVersion { major: 1, minor: 0 },
-                    capabilities: vec![
-                        Capability::TurnStreaming,
-                        Capability::TurnCancellation,
-                        Capability::EventReplay,
-                        Capability::Idempotency,
-                        Capability::ArtifactReferences,
-                    ],
+                    capabilities,
                 },
             ))
             .unwrap_or_default()
         }
-        METHOD_TURN_START => start_turn(id, req.params, state, out).await,
-        METHOD_TURN_CANCEL => cancel_turn(id, req.params, state).await,
+        METHOD_TURN_START => {
+            if let Some(error) =
+                require_capability(id.clone(), negotiated, Capability::TurnStreaming).await
+            {
+                error
+            } else {
+                start_turn(id, req.params, state, out).await
+            }
+        }
+        METHOD_TURN_CANCEL => {
+            if let Some(error) =
+                require_capability(id.clone(), negotiated, Capability::TurnCancellation).await
+            {
+                error
+            } else {
+                cancel_turn(id, req.params, state).await
+            }
+        }
         METHOD_TURN_RESPONSE => respond_turn(id, req.params, state).await,
-        METHOD_TURN_REPLAY => replay_turn(id, req.params, state).await,
+        METHOD_TURN_REPLAY => {
+            if let Some(error) =
+                require_capability(id.clone(), negotiated, Capability::EventReplay).await
+            {
+                error
+            } else {
+                replay_turn(id, req.params, state).await
+            }
+        }
         METHOD_PERMISSION_REPLY => {
             resolve_prompt(id, req.params, state, client_id, "permission", true).await
         }
@@ -374,6 +417,37 @@ async fn handle_request(
         ))
         .unwrap_or_default(),
     }
+}
+
+async fn require_capability(
+    id: Id,
+    negotiated: &Arc<Mutex<Option<NegotiatedProtocol>>>,
+    required: Capability,
+) -> Option<String> {
+    let state = negotiated.lock().await;
+    let Some(protocol) = state.as_ref() else {
+        return Some(
+            serde_json::to_string(&Response::<serde_json::Value>::err(
+                id,
+                METHOD_NOT_FOUND,
+                "protocol negotiation required before session.turn.*; reconnect and call protocol.negotiate (the daemon may be stale)",
+            ))
+            .unwrap_or_default(),
+        );
+    };
+    if !protocol.capabilities.contains(&required) {
+        return Some(
+            serde_json::to_string(&Response::<serde_json::Value>::err(
+                id,
+                METHOD_NOT_FOUND,
+                format!(
+                    "requested session capability is unavailable after negotiation: {required:?}; reconnect to a compatible daemon or negotiate that capability"
+                ),
+            ))
+            .unwrap_or_default(),
+        );
+    }
+    None
 }
 
 async fn resolve_prompt(

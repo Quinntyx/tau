@@ -645,6 +645,12 @@ async fn mandatory_production_agent_workflow_closure() -> Result<()> {
         .await?;
     drop(client); // explicit disconnect before replay
     let replay_client = fixtures::client(&fixture).await?;
+    replay_client
+        .negotiate_checked(ProtocolNegotiateParams {
+            version: ProtocolVersion { major: 1, minor: 0 },
+            capabilities: vec![Capability::EventReplay],
+        })
+        .await?;
     let replay = replay_client
         .turn_replay(tau_proto::turn::TurnReplayParams {
             session_id: session.id.clone(),

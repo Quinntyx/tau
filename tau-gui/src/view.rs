@@ -23,6 +23,14 @@ enum AgentMode {
     Code,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimeState {
+    NotNegotiated,
+    Negotiating,
+    Ready,
+    Failed(String),
+}
+
 impl AgentMode {
     fn label(self) -> &'static str {
         match self {
@@ -49,6 +57,7 @@ pub struct TauView {
     model_index: usize,
     models: Vec<String>,
     sidebar_visible: bool,
+    runtime: RuntimeState,
 }
 
 impl TauView {
@@ -75,6 +84,7 @@ impl TauView {
             model_index: 0,
             models,
             sidebar_visible: preferences.sidebar,
+            runtime: RuntimeState::NotNegotiated,
         }
     }
 
@@ -184,6 +194,20 @@ impl TauView {
         cx.notify();
     }
 
+    fn retry_runtime(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::Retry);
+        self.runtime = RuntimeState::NotNegotiated;
+        self.chat.status = ChatStatus::Ready;
+        cx.notify();
+    }
+
+    fn restart_runtime(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::Restart);
+        self.runtime = RuntimeState::NotNegotiated;
+        self.chat.status = ChatStatus::Ready;
+        cx.notify();
+    }
+
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat.active_assistant.is_some() {
             return;
@@ -194,6 +218,7 @@ impl TauView {
         }
         self.input.update(cx, |input, _| input.reset());
         self.chat.reduce(ChatAction::Submit(prompt.clone()));
+        self.runtime = RuntimeState::Negotiating;
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
@@ -221,15 +246,18 @@ impl TauView {
     fn apply_event(&mut self, event: Result<TurnStreamEvent, String>, cx: &mut Context<Self>) {
         match event {
             Ok(TurnStreamEvent::Event(event)) => {
+                self.runtime = RuntimeState::Ready;
                 self.chat.reduce(ChatAction::SessionEvent(event));
                 cx.notify();
             }
             Ok(TurnStreamEvent::Complete(_)) => {
+                self.runtime = RuntimeState::Ready;
                 self.chat.active_assistant = None;
                 self.chat.status = ChatStatus::Ready;
                 cx.notify();
             }
             Err(error) => {
+                self.runtime = RuntimeState::Failed(error.clone());
                 self.chat.reduce(ChatAction::Error(error));
                 cx.notify();
             }
@@ -266,12 +294,66 @@ impl Render for TauView {
             .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
                 "{}  ·  {}",
                 current_model,
-                match &self.chat.status {
-                    ChatStatus::Ready => "Ready",
-                    ChatStatus::Streaming => "Thinking...",
-                    ChatStatus::Failed(_) => "Request failed",
+                match &self.runtime {
+                    RuntimeState::NotNegotiated => "Not connected",
+                    RuntimeState::Negotiating => "Negotiating...",
+                    RuntimeState::Ready => match &self.chat.status {
+                        ChatStatus::Ready => "Ready",
+                        ChatStatus::Streaming => "Thinking...",
+                        ChatStatus::Failed(_) => "Request failed",
+                    },
+                    RuntimeState::Failed(_) => "Compatibility error",
                 }
             )));
+        let runtime_banner = match &self.runtime {
+            RuntimeState::NotNegotiated => Some((
+                "Runtime is not negotiated. Send a message to begin protocol negotiation.",
+                false,
+            )),
+            RuntimeState::Negotiating => Some((
+                "Negotiating runtime capabilities and protocol; tau is not ready yet.",
+                false,
+            )),
+            RuntimeState::Ready => None,
+            RuntimeState::Failed(error) => Some((
+                if error.is_empty() {
+                    "Runtime negotiation failed."
+                } else {
+                    error.as_str()
+                },
+                true,
+            )),
+        };
+        let runtime_banner_view = runtime_banner.map(|(message, failed)| {
+            let mut banner = div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .p_3()
+                .bg(rgb(if failed { 0x4a2929 } else { 0x202b38 }))
+                .text_color(rgb(if failed { 0xffb4a8 } else { 0xb9d7ff }))
+                .child(div().flex_1().child(message.to_string()));
+            if failed {
+                banner = banner.child(toast_button(
+                    "Retry",
+                    0x52627a,
+                    cx.listener(Self::retry_runtime),
+                ));
+                banner = banner.child(toast_button(
+                    "Restart owned daemon",
+                    0x6a5834,
+                    cx.listener(Self::restart_runtime),
+                ));
+            }
+            banner
+                .child(toast_button(
+                    "Disown safely",
+                    0x6a5834,
+                    cx.listener(Self::disown_daemon),
+                ))
+                .child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui)))
+        });
         let toast = div()
             .flex()
             .items_center()
@@ -280,7 +362,16 @@ impl Render for TauView {
             .p_3()
             .bg(rgb(0x463b24))
             .text_color(rgb(0xf3d28a))
-            .child("tau started the daemon automatically for this GUI session")
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("tau started the daemon automatically for this GUI session")
+                    .child(div().text_xs().child(
+                        "The daemon will remain owned by this window unless you disown it.",
+                    )),
+            )
             .child(
                 div()
                     .flex()
@@ -555,6 +646,7 @@ impl Render for TauView {
             root = root.child(toast);
         }
         root.child(header)
+            .children(runtime_banner_view)
             .child(
                 div()
                     .flex()
