@@ -49,6 +49,7 @@ pub enum Action {
     Undo,
     Redo,
     ToggleAutonomy,
+    ToggleFollow,
     Tier(i8),
     Cancel,
     Replay,
@@ -131,6 +132,7 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
             Some(Action::AcceptFile)
         }
         KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Replay),
+        KeyCode::Char('f') => Some(Action::ToggleFollow),
         KeyCode::Char(c) => Some(Action::Insert(c)),
         KeyCode::Backspace => Some(Action::Backspace),
         KeyCode::Enter if k.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::Newline),
@@ -211,6 +213,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             if !s.input.trim().is_empty() {
                 let p = std::mem::take(&mut s.input);
                 s.cursor = 0;
+                s.human_messages.push(p.clone());
                 s.transcript.push(format!("You: {p}"));
                 if let Some(agent) = p.strip_prefix("/agent ") {
                     s.agent = agent.trim().to_string();
@@ -387,6 +390,7 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             }
         }
         Action::ToggleAutonomy => s.autonomous = !s.autonomous,
+        Action::ToggleFollow => s.following = !s.following,
         Action::Tier(d) => s.task_tier = (s.task_tier as i8 + d).clamp(1, 3) as u8,
         Action::Cancel => {
             s.cancelling = true;

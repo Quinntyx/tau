@@ -7,6 +7,7 @@ use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
 
 use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
+use crate::feed;
 use crate::input::{TextInput, command_mode};
 use crate::picker::{
     AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
@@ -43,6 +44,20 @@ pub fn next_sidebar_visibility(visible: bool) -> bool {
 
 pub fn next_follow_state(following: bool) -> bool {
     !following
+}
+
+/// Render one projected feed body with a typography-first hierarchy.  The
+/// reducer remains the source of truth; this seam deliberately accepts the
+/// already projected label/text pair so protocol actions stay on `TauView`.
+fn feed_body(label: &str, text: String) -> gpui::Div {
+    let primary = matches!(label, "You" | "tau");
+    div()
+        .max_w(px(820.))
+        .p_3()
+        .rounded_lg()
+        .when(primary, |element| element.text_base())
+        .when(!primary, |element| element.text_sm())
+        .child(text)
 }
 
 /// Build presentation data without requiring a GPUI window.  Typed protocol
@@ -1057,6 +1072,7 @@ impl Render for TauView {
             .map(String::as_str)
             .unwrap_or(self.backend.model());
         let description = describe_chat(&self.chat, &self.agent, current_model, self.backend.cwd());
+        let typed_feed = feed::FeedProjection::from_events(&self.chat.events);
         if self.follow_output {
             self.transcript_scroll.scroll_to_bottom();
         }
@@ -1321,18 +1337,7 @@ impl Render for TauView {
                     .flex_col()
                     .when(align_end, |element| element.items_end())
                     .child(div().text_xs().text_color(rgb(0x8994a8)).child(label))
-                    .child(
-                        div()
-                            .id(("card-content", index))
-                            .flex()
-                            .max_w(px(820.))
-                            .max_h(px(360.))
-                            .overflow_y_scroll()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(background))
-                            .child(text),
-                    );
+                    .child(feed_body(label, text).bg(rgb(background)));
                 if matches!(card, Card::Tool { .. }) {
                     card_view = card_view.on_mouse_up(
                         MouseButton::Left,
@@ -1414,31 +1419,31 @@ impl Render for TauView {
                 }
                 card_view
             }))
-            .children(
-                description
-                    .transcript
-                    .iter()
-                    .skip(self.chat.cards.len())
-                    .map(|(label, text)| {
+            .children(typed_feed.items.iter().map(|item| {
+                let action_hint = if item.actions.actions().next().is_some() {
+                    " · action available"
+                } else {
+                    ""
+                };
+                let label = format!(
+                    "{} {} · #{} · {}{}",
+                    item.avatar, item.role_mark, item.sequence, item.timestamp, action_hint
+                );
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x202630))
+                    .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .p_3()
-                            .rounded_md()
-                            // The event kind already selected this projection;
-                            // presentation never reparses the label text to
-                            // recover protocol semantics.
-                            .bg(rgb(0x202630))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8994a8))
-                                    .child(label.clone()),
-                            )
-                            .child(text.clone())
-                    }),
-            );
+                            .text_xs()
+                            .text_color(rgb(0x8994a8))
+                            .child(label.clone()),
+                    )
+                    .child(feed_body(item.role_mark, item.visible_detail().to_owned()))
+            }));
         let sidebar = div()
             .w(px(260.))
             .flex()

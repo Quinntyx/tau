@@ -1,5 +1,5 @@
 //! Small composable widgets. Keeping these pure makes ratatui snapshots cheap.
-use crate::{reducer::filtered_models, state::*};
+use crate::{feed, reducer::filtered_models, state::*};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -22,12 +22,21 @@ pub fn render(frame: &mut Frame, s: &AppState) {
         transcript.push_str("\n\n");
         transcript.push_str(&format_diff(s));
     }
-    frame.render_widget(
-        Paragraph::new(transcript)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" tau ")),
-        root[0],
-    );
+    if s.raw_events.is_empty() {
+        frame.render_widget(
+            Paragraph::new(transcript)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(" tau ")),
+            root[0],
+        );
+    } else {
+        // The feed owns typed event presentation. Legacy transcript strings
+        // remain the empty-state/fallback projection; no event semantics are
+        // recovered from them here.
+        let projection =
+            feed::project_with_humans(&s.raw_events, &s.human_messages, s.connection, s.following);
+        feed::render(frame, root[0], &projection);
+    }
     let footer = Line::from(vec![
         Span::styled(format!(" {} ", s.model), Style::default().fg(Color::Cyan)),
         Span::raw(format!(
@@ -36,6 +45,11 @@ pub fn render(frame: &mut Frame, s: &AppState) {
             s.task_tier,
             if s.autonomous { "AUTO" } else { "ASK" }
         )),
+        Span::raw(if s.following {
+            "  · following"
+        } else {
+            "  · paused"
+        }),
     ]);
     frame.render_widget(
         Paragraph::new(Text::from(vec![footer, Line::from(s.input.as_str())])).block(
