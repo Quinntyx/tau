@@ -1,3 +1,4 @@
-ALTER TABLE sessions ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE sessions ADD COLUMN archived_at INTEGER;
-CREATE INDEX IF NOT EXISTS idx_sessions_project_updated ON sessions(project_id, updated_at DESC);
+-- Project registry migration owned by S1.
+-- Session lifecycle storage is completed by the post-project compatibility
+-- step in Db::run_migrations and v7.sql; do not add a competing projects
+-- table or project foreign key in this migration.

@@ -58,11 +58,37 @@ impl Db {
 
     fn run_migrations(&self) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 6 {
+            migrations()
+                .to_version(&mut conn, 6)
+                .context("running database migrations")?;
+        }
+        ensure_session_columns(&mut conn)?;
         migrations()
             .to_latest(&mut conn)
-            .context("running database migrations")?;
+            .context("running post-project session migrations")?;
         Ok(())
     }
+}
+
+/// S1 owns project v6, including the authoritative project foreign key.  S3
+/// only ensures compatibility columns when running standalone or upgrading a
+/// database created before project v6; it never alters an existing project_id
+/// column, constraint, or nullability.
+fn ensure_session_columns(conn: &mut Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !columns.iter().any(|column| column == "project_id") {
+        conn.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT", [])?;
+    }
+    if !columns.iter().any(|column| column == "archived_at") {
+        conn.execute("ALTER TABLE sessions ADD COLUMN archived_at INTEGER", [])?;
+    }
+    Ok(())
 }
 
 fn migrations() -> Migrations<'static> {
@@ -73,6 +99,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("sql/v4.sql")),
         M::up(include_str!("sql/v5.sql")),
         M::up(include_str!("sql/v6.sql")),
+        M::up(include_str!("sql/v7.sql")),
     ])
 }
 

@@ -678,4 +678,42 @@ mod tests {
         apply(&mut state, Action::Connected);
         assert_eq!(state.connection, Connection::Connected);
     }
+
+    #[test]
+    fn navigator_keyboard_actions_drive_search_selection_and_archive_flow() {
+        use crate::sessions::{ProjectId, SessionEntry, SessionId};
+        use crossterm::event::KeyEvent;
+
+        let mut state = AppState::default();
+        state.sessions.project = Some(ProjectId::new("p"));
+        state.sessions.sessions = vec![
+            SessionEntry {
+                id: SessionId::new("old"),
+                project_id: ProjectId::new("p"),
+                title: "Old".into(),
+                updated_at: 1,
+                archived: false,
+            },
+            SessionEntry {
+                id: SessionId::new("new"),
+                project_id: ProjectId::new("p"),
+                title: "Newest".into(),
+                updated_at: 2,
+                archived: false,
+            },
+        ];
+        apply(&mut state, Action::ToggleSessions);
+        let down = key_action(&state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        apply(&mut state, down);
+        assert_eq!(state.sessions.selected_id().unwrap().as_str(), "old");
+        apply(&mut state, Action::SessionSearch('o'));
+        assert_eq!(state.sessions.selected_id().unwrap().as_str(), "old");
+        apply(&mut state, Action::SessionArchive);
+        assert!(state.sessions.visible().is_empty());
+        apply(&mut state, Action::SessionToggleArchived);
+        apply(&mut state, Action::SessionRestore);
+        assert!(!state.sessions.sessions[0].archived);
+        let esc = key_action(&state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(matches!(esc, Action::ToggleSessions));
+    }
 }

@@ -106,7 +106,9 @@ async fn session(
             Some(input) = input_rx.recv() => {
                 let action = match input {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if matches!(key.code, KeyCode::Esc) { break; }
+                        // Esc closes the navigator through `key_action`; only
+                        // exit the application when no modal navigator is open.
+                        if matches!(key.code, KeyCode::Esc) && !state.sessions.open { break; }
                         reducer::key_action(&state, key)
                     }
                     Event::Mouse(mouse) => reducer::mouse_action(&state, mouse),
