@@ -1,6 +1,6 @@
 use gpui::{
     App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, Task, Window,
-    div, prelude::*, px, rgb,
+    div, prelude::*, px, rgb, StatefulInteractiveElement,
 };
 use tau_client::TurnStreamEvent;
 
@@ -8,7 +8,7 @@ use crate::backend::{Backend, DaemonAction};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
 use crate::input::TextInput;
 
-gpui::actions!(tau_view, [Submit, SwitchAgent, CycleModel]);
+gpui::actions!(tau_view, [Submit, SwitchAgent, CycleModel, ToggleSidebar]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -99,6 +99,21 @@ impl TauView {
         cx.notify();
     }
 
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+        cx.notify();
+    }
+
+    fn click_toggle_sidebar(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_visible = !self.sidebar_visible;
+        cx.notify();
+    }
+
     fn toggle_tool(
         &mut self,
         index: usize,
@@ -181,6 +196,7 @@ impl TauView {
         self.chat.active_assistant = None;
         self.chat.status = ChatStatus::Ready;
         self.task = None;
+        self.input.update(cx, |input, _| input.set_disabled(false));
         cx.notify();
     }
 
@@ -192,7 +208,11 @@ impl TauView {
         if prompt.trim().is_empty() {
             return;
         }
-        self.input.update(cx, |input, _| input.reset());
+        self.input.update(cx, |input, _| {
+            input.record_submission(prompt.clone());
+            input.reset();
+            input.set_disabled(true);
+        });
         self.chat.reduce(ChatAction::Submit(prompt.clone()));
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
@@ -227,10 +247,12 @@ impl TauView {
             Ok(TurnStreamEvent::Complete(_)) => {
                 self.chat.active_assistant = None;
                 self.chat.status = ChatStatus::Ready;
+                self.input.update(cx, |input, _| input.set_disabled(false));
                 cx.notify();
             }
             Err(error) => {
                 self.chat.reduce(ChatAction::Error(error));
+                self.input.update(cx, |input, _| input.set_disabled(false));
                 cx.notify();
             }
         }
@@ -263,6 +285,13 @@ impl Render for TauView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("tau"),
             )
+            .child(div().flex().gap_2()
+                .child(div().id("sidebar-toggle").px_2().py_1().rounded_sm().cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x293140)))
+                    .focusable()
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_toggle_sidebar))
+                    .child(if self.sidebar_visible { "Hide sidebar" } else { "Show sidebar" }))
+            )
             .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
                 "{}  ·  {}",
                 current_model,
@@ -282,8 +311,10 @@ impl Render for TauView {
             .text_color(rgb(0xf3d28a))
             .child("tau started the daemon automatically for this GUI session")
             .child(
-                div()
-                    .flex()
+                            div().id("startup-actions")
+                                .flex()
+                                .max_h(px(420.))
+                                .overflow_y_scroll()
                     .gap_2()
                     .child(toast_button(
                         "Okay",
@@ -310,6 +341,7 @@ impl Render for TauView {
         let transcript = div()
             .id("transcript")
             .flex_1()
+            .min_h(px(0.))
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -382,14 +414,19 @@ impl Render for TauView {
                     ),
                 };
                 let mut card_view = div()
+                    .id(("card", index))
+                    .focusable()
+                    .hover(|style| style.bg(rgb(0x171d26)))
                     .flex()
                     .flex_col()
                     .when(align_end, |element| element.items_end())
                     .child(div().text_xs().text_color(rgb(0x8994a8)).child(label))
                     .child(
-                        div()
+                        div().id(("card-content", index))
                             .flex()
                             .max_w(px(820.))
+                            .max_h(px(360.))
+                            .overflow_y_scroll()
                             .p_3()
                             .rounded_lg()
                             .bg(rgb(background))
@@ -509,6 +546,7 @@ impl Render for TauView {
             .child(sidebar_card("DIRECTORY", self.backend.cwd()));
         let footer = div()
             .p_4()
+            .flex_none()
             .border_t_1()
             .border_color(rgb(0x2c3340))
             .child(
@@ -518,10 +556,12 @@ impl Render for TauView {
                     .items_end()
                     .child(self.input.clone())
                     .child(
-                        div()
+                        div().id("send-button")
                             .px_4()
                             .py_3()
                             .bg(rgb(0x85b8ff))
+                            .hover(|style| style.bg(rgb(0xa8ccff)))
+                            .focusable()
                             .text_color(rgb(0x10151e))
                             .rounded_lg()
                             .cursor_pointer()
@@ -531,10 +571,12 @@ impl Render for TauView {
             )
             .when(self.chat.active_assistant.is_some(), |footer| {
                 footer.child(
-                    div()
+                    div().id("cancel-button")
                         .px_3()
                         .py_2()
                         .bg(rgb(0x7d3b3b))
+                        .hover(|style| style.bg(rgb(0xa34c4c)))
+                        .focusable()
                         .rounded_lg()
                         .cursor_pointer()
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_turn))
@@ -547,22 +589,25 @@ impl Render for TauView {
             .text_color(rgb(0xe8edf5))
             .flex()
             .flex_col()
+            .relative()
             .key_context("TauView")
             .on_action(cx.listener(Self::submit))
-            .on_action(cx.listener(Self::switch_agent));
+            .on_action(cx.listener(Self::switch_agent))
+            .on_action(cx.listener(Self::toggle_sidebar));
         root = root.on_action(cx.listener(Self::cycle_model));
-        if self.toast_visible {
-            root = root.child(toast);
-        }
         root.child(header)
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .min_h(px(0.))
                     .child(transcript)
                     .when(self.sidebar_visible, |view| view.child(sidebar)),
             )
             .child(footer)
+            .when(self.toast_visible, |root| root.child(
+                toast.absolute().top(px(0.)).left(px(0.)).right(px(0.))
+            ))
     }
 }
 
@@ -588,11 +633,13 @@ fn toast_button(
     color: u32,
     callback: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
+    div().id("toast-button")
         .px_2()
         .py_1()
         .rounded_sm()
         .bg(rgb(color))
+        .hover(|style| style.bg(rgb(0x6f7f96)))
+        .focusable()
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
         .child(label.to_string())
