@@ -9,7 +9,7 @@ mod view;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use backend::Backend;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use tokio::runtime::{Handle, Runtime};
@@ -28,10 +28,15 @@ pub fn run(socket: PathBuf) -> Result<()> {
             .handle()
             .clone(),
     };
+    // Keep daemon startup in the normal Result path so a missing or stale socket
+    // can be reported without panicking before the recovery UI is available.
     let (daemon, auto_started, cwd, model) = if let Some(runtime) = owned_runtime.as_ref() {
-        runtime.block_on(Backend::prepare(&socket))?
+        runtime
+            .block_on(Backend::prepare(&socket))
+            .context("starting tau daemon")?
     } else {
-        tokio::task::block_in_place(|| handle.block_on(Backend::prepare(&socket)))?
+        tokio::task::block_in_place(|| handle.block_on(Backend::prepare(&socket)))
+            .context("starting tau daemon")?
     };
     let backend =
         Backend::from_parts_with_startup(socket, handle, daemon, auto_started, cwd, model);
@@ -39,18 +44,23 @@ pub fn run(socket: PathBuf) -> Result<()> {
         input::bind_keys(cx);
         view::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1_100.), px(760.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("tau".into()),
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("tau".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            move |_, cx| cx.new(|cx| TauView::new(backend, cx)),
-        )
-        .expect("open tau window");
+                },
+                move |_, cx| cx.new(|cx| TauView::new(backend, cx)),
+            )
+            .context("opening tau window");
+        if let Err(error) = window {
+            eprintln!("{error:#}");
+            return;
+        }
         cx.activate(true);
     });
     Ok(())
