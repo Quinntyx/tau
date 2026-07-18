@@ -1,3 +1,4 @@
+use crate::sessions::Navigator;
 use serde_json::Value;
 use std::collections::VecDeque;
 use tau_proto::prelude::SequencedEvent;
@@ -127,6 +128,7 @@ pub struct AppState {
     pub replaying: bool,
     pub server_index: usize,
     pub servers: Vec<String>,
+    pub sessions: Navigator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +207,7 @@ impl Default for AppState {
             replaying: false,
             server_index: 0,
             servers: vec!["local".into()],
+            sessions: Navigator::default(),
         }
     }
 }

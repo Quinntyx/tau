@@ -54,12 +54,38 @@ pub fn render(frame: &mut Frame, s: &AppState) {
     if s.picker != Picker::None {
         picker(frame, s);
     }
+    if s.sessions.open {
+        session_navigator(frame, s);
+    }
     if let Some(p) = &s.permission {
         permission(frame, p);
     }
     if let Some(question) = &s.question {
         question_modal(frame, question);
     }
+}
+fn session_navigator(frame: &mut Frame, s: &AppState) {
+    let area = center(frame.area(), 70, 16);
+    frame.render_widget(Clear, area);
+    let items = s
+        .sessions
+        .visible()
+        .into_iter()
+        .map(|entry| ListItem::new(format!("{}  {}", entry.title, entry.id.as_str())))
+        .collect::<Vec<_>>();
+    let item_count = items.len();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Sessions · Ctrl-S close · Ctrl-A archived · search "),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ratatui::widgets::ListState::default();
+    if item_count != 0 {
+        state.select(Some(s.sessions.selected.min(item_count - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 fn picker(frame: &mut Frame, s: &AppState) {
     let area = center(frame.area(), 60, 14);

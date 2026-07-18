@@ -55,9 +55,33 @@ pub enum Action {
     SwitchServer,
     Reconnect,
     Connected,
+    ToggleSessions,
+    SessionMove(i8),
+    SessionSearch(char),
+    SessionSearchBackspace,
+    SessionSelect,
+    SessionRename(String),
+    SessionArchive,
+    SessionRestore,
+    SessionToggleArchived,
+    NewChat,
 }
 
 pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
+    if s.sessions.open {
+        if k.code == KeyCode::Char('a') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(Action::SessionToggleArchived);
+        }
+        return match k.code {
+            KeyCode::Esc => Some(Action::ToggleSessions),
+            KeyCode::Up => Some(Action::SessionMove(-1)),
+            KeyCode::Down => Some(Action::SessionMove(1)),
+            KeyCode::Enter => Some(Action::SessionSelect),
+            KeyCode::Backspace => Some(Action::SessionSearchBackspace),
+            KeyCode::Char(c) => Some(Action::SessionSearch(c)),
+            _ => None,
+        };
+    }
     if s.permission.is_some() {
         return match k.code {
             KeyCode::Left | KeyCode::Char('h') => {
@@ -101,6 +125,10 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
         };
     }
     match k.code {
+        KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ToggleSessions)
+        }
+        KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::NewChat),
         KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' => {
             Some(Action::Cancel)
         }
@@ -406,6 +434,52 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         Action::Connected => {
             s.connection = Connection::Connected;
             s.replaying = false;
+        }
+        Action::ToggleSessions => {
+            s.sessions.open = !s.sessions.open;
+            s.sessions.selected = 0;
+        }
+        Action::SessionMove(delta) => s.sessions.select_delta(delta),
+        Action::SessionSearch(c) => {
+            s.sessions.query.push(c);
+            s.sessions.selected = 0;
+        }
+        Action::SessionSearchBackspace => {
+            s.sessions.query.pop();
+            s.sessions.selected = 0;
+        }
+        Action::SessionSelect => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.session_id = Some(id.as_str().to_owned());
+                s.sessions.open = false;
+                s.replaying = true;
+                s.connection = Connection::Reconnecting;
+                return Some("/replay".into());
+            }
+        }
+        Action::SessionRename(title) => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.sessions.rename(&id, title);
+            }
+        }
+        Action::SessionArchive => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.sessions.archive(&id);
+            }
+        }
+        Action::SessionRestore => {
+            if let Some(id) = s.sessions.selected_id() {
+                s.sessions.restore(&id);
+            }
+        }
+        Action::SessionToggleArchived => s.sessions.toggle_archived(),
+        Action::NewChat => {
+            s.session_id = None;
+            s.turn_id = None;
+            s.sequence = 0;
+            s.raw_events.clear();
+            s.transcript = vec!["New chat".into()];
+            s.sessions.open = false;
         }
     }
     None

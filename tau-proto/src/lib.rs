@@ -15,6 +15,7 @@ pub mod health;
 pub mod ping;
 pub mod policy;
 pub mod prelude;
+pub mod session;
 pub mod turn;
 
 /// Reserved binary-frame channel convention.

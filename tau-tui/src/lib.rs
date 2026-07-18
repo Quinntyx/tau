@@ -3,6 +3,7 @@
 mod adapter;
 pub mod components;
 pub mod reducer;
+pub mod sessions;
 pub mod state;
 
 use anyhow::{Context, Result};

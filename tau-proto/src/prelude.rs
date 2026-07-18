@@ -10,4 +10,5 @@ pub use crate::envelope::{Id, JsonRpc, Notification, Request, Response, RpcError
 pub use crate::health::{HealthResult, METHOD_HEALTH};
 pub use crate::ping::METHOD_PING;
 pub use crate::policy::*;
+pub use crate::session::*;
 pub use crate::turn::*;

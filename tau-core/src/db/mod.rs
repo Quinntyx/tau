@@ -22,6 +22,7 @@ pub use domain::{
     PolicyDecisionRecord, QaRecord, Session, SteeringMode, SteeringRun, Usage, default_db_path,
 };
 pub use journal::StoredArtifact;
+pub use sessions::{ProjectId, SessionRecord};
 
 /// Wrapper around a single SQLite connection (behind `Arc<Mutex>`).
 /// Cloning is cheap — it clones the `Arc`, not the connection.
@@ -71,6 +72,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("sql/v3.sql")),
         M::up(include_str!("sql/v4.sql")),
         M::up(include_str!("sql/v5.sql")),
+        M::up(include_str!("sql/v6.sql")),
     ])
 }
 
