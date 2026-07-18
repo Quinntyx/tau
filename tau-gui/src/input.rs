@@ -229,10 +229,10 @@ mod editor_tests {
         e.backspace();
         e.delete();
         assert_eq!(e.text(), "x");
+        e.move_end(false);
         e.delete();
         e.delete();
         assert_eq!(e.text(), "x");
-        e.move_end(false);
         e.backspace();
         e.backspace();
         e.backspace();

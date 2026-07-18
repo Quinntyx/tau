@@ -370,7 +370,7 @@ mod tests {
     fn malformed_known_nodes_still_report_errors_but_unknown_nodes_are_ignored() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("gui.kdl");
-        std::fs::write(&p, "future_preference (not understood)\nunknown #true\n").unwrap();
+        std::fs::write(&p, "future_preference \"not understood\"\nunknown #true\n").unwrap();
         assert!(GuiPreferences::load_from(&p).is_ok());
         std::fs::write(&p, "selected_model #true\n").unwrap();
         assert!(GuiPreferences::load_from(&p).is_err());

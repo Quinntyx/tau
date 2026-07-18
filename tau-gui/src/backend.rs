@@ -611,26 +611,44 @@ impl Backend {
     /// Submit an interactive decision on the typed response channel. The
     /// transcript card is only a projection; acknowledgement belongs to the
     /// daemon and is not faked by the view.
-    pub fn respond(&self, response: ClientResponse) {
+    pub fn respond(
+        &self,
+        response: ClientResponse,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let active_turn = self.active_turn.clone();
         self.runtime.spawn(async move {
+            let (kind, request_id) = match &response {
+                ClientResponse::Permission { request_id, .. } => {
+                    ("permission", request_id.as_str())
+                }
+                ClientResponse::Question { question_id, .. } => ("question", question_id.as_str()),
+                ClientResponse::DiffHunk { request_id, .. } => ("diff", request_id.as_str()),
+            };
             let active = active_turn.lock().ok().and_then(|value| value.clone());
-            if let Some((client, session_id, turn_id)) = active {
-                let _ = client
+            let result = if let Some((client, session_id, turn_id)) = active {
+                client
                     .turn_response(TurnResponseParams {
                         session_id,
                         turn_id,
                         idempotency_key: IdempotencyKey::new(format!(
-                            "gui-response-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |duration| duration.as_nanos())
+                            "gui-response-{kind}-{request_id}"
                         )),
                         response,
                     })
-                    .await;
-            }
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|ack| {
+                        ack.accepted
+                            .then_some(())
+                            .ok_or_else(|| "daemon rejected interactive response".to_string())
+                    })
+            } else {
+                Err("no active turn for interactive response".to_string())
+            };
+            let _ = sender.send(result);
         });
+        receiver
     }
 
     pub fn replay(

@@ -324,6 +324,7 @@ fn card_description(card: &Card) -> (String, String) {
             path,
             patch,
             approved,
+            ..
         } => (
             "diff".into(),
             format!(
@@ -371,6 +372,7 @@ pub struct TauView {
     backend: Backend,
     chat: ChatState,
     task: Option<Task<()>>,
+    ack_tasks: Vec<Task<()>>,
     agent: String,
     toast_visible: bool,
     model_index: usize,
@@ -437,6 +439,7 @@ impl TauView {
             backend,
             chat: ChatState::default(),
             task: None,
+            ack_tasks: Vec::new(),
             agent: agent.clone(),
             toast_visible,
             model_index,
@@ -633,31 +636,20 @@ impl TauView {
             .cards
             .get(index)
             .and_then(|card| match card {
-                Card::Diff { path, .. } => Some((
-                    self.chat
-                        .events
-                        .iter()
-                        .rev()
-                        .find_map(|event| match &event.kind {
-                            EventKind::DiffRequested {
-                                request_id: candidate,
-                                path: event_path,
-                                ..
-                            } if event_path == path => Some(candidate.clone()),
-                            _ => None,
-                        }),
-                    path.clone(),
-                )),
+                Card::Diff {
+                    request_id, path, ..
+                } => Some((request_id.clone(), path.clone())),
                 _ => None,
             })
             .unwrap_or_default();
         self.chat.reduce(ChatAction::ApproveDiff(index, approved));
-        self.backend.respond(ClientResponse::DiffHunk {
-            request_id: request_id.unwrap_or_default(),
+        let receiver = self.backend.respond(ClientResponse::DiffHunk {
+            request_id: request_id.clone(),
             path,
             index: index as u32,
             approved,
         });
+        self.watch_policy_ack(request_id, receiver, cx);
         cx.notify();
     }
 
@@ -674,6 +666,10 @@ impl TauView {
             _ => None,
         });
         self.chat.reduce(ChatAction::Permission(index, choice));
+        if matches!(choice, PermissionChoice::Inspect) {
+            cx.notify();
+            return;
+        }
         let choice = match choice {
             PermissionChoice::AllowOnce => TurnPermissionChoice::AllowOnce,
             PermissionChoice::AllowAlways => TurnPermissionChoice::AllowAlways,
@@ -681,10 +677,12 @@ impl TauView {
             PermissionChoice::Inspect => TurnPermissionChoice::Inspect,
             PermissionChoice::Cancel => TurnPermissionChoice::Cancel,
         };
-        self.backend.respond(ClientResponse::Permission {
-            request_id: request_id.unwrap_or_default(),
+        let request_id = request_id.unwrap_or_default();
+        let receiver = self.backend.respond(ClientResponse::Permission {
+            request_id: request_id.clone(),
             choice,
         });
+        self.watch_policy_ack(request_id, receiver, cx);
         cx.notify();
     }
 
@@ -702,11 +700,41 @@ impl TauView {
         });
         self.chat
             .reduce(ChatAction::AnswerQuestion(index, answer.into()));
-        self.backend.respond(ClientResponse::Question {
-            question_id: question_id.unwrap_or_default(),
+        let question_id = question_id.unwrap_or_default();
+        let receiver = self.backend.respond(ClientResponse::Question {
+            question_id: question_id.clone(),
             answer: QuestionAnswer(answer.into()),
         });
+        self.watch_policy_ack(question_id, receiver, cx);
         cx.notify();
+    }
+
+    fn watch_policy_ack(
+        &mut self,
+        request_id: String,
+        receiver: tokio::sync::oneshot::Receiver<Result<(), String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|_| Err("interactive response task ended".into()));
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(()) => {
+                        view.chat.reduce(ChatAction::PolicyAck { request_id });
+                    }
+                    Err(message) => {
+                        view.chat.reduce(ChatAction::PolicyError {
+                            request_id,
+                            message,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.ack_tasks.push(task);
     }
 
     fn hide_toast(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1255,6 +1283,7 @@ impl Render for TauView {
                         path,
                         patch,
                         approved,
+                        ..
                     } => (
                         0x293b32,
                         "diff",

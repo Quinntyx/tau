@@ -19,3 +19,6 @@ tau-proto.workspace = true
 tokio.workspace = true
 kdl.workspace = true
 unicode-segmentation.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true

@@ -1,5 +1,5 @@
 //! Pure, typed chat model used by the GPUI view and scripted fixtures.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use tau_client::CompletionEvent;
 use tau_proto::prelude::{CompletionStreamResult, SequencedEvent, ToolStatusValue, TurnEvent};
@@ -149,6 +149,7 @@ pub enum Card {
         expanded: bool,
     },
     Diff {
+        request_id: String,
         path: String,
         patch: String,
         approved: bool,
@@ -252,6 +253,19 @@ pub enum PermissionChoice {
     Cancel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyState {
+    Pending,
+    Ack,
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffDecision {
+    Hunk { hunk: usize, approved: bool },
+    WholeFile { approved: bool },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatState {
     pub cards: Vec<Card>,
@@ -272,6 +286,8 @@ pub struct ChatState {
     /// Correlates protocol tool lifecycle events to one rendered card.
     pub tool_indices: HashMap<String, usize>,
     pub tool_statuses: HashMap<String, ToolStatusValue>,
+    pub policy_states: BTreeMap<String, PolicyState>,
+    pub diff_decisions: BTreeMap<String, Vec<DiffDecision>>,
 }
 
 impl Default for ChatState {
@@ -291,6 +307,8 @@ impl Default for ChatState {
             sidebar: SidebarState::default(),
             tool_indices: HashMap::new(),
             tool_statuses: HashMap::new(),
+            policy_states: BTreeMap::new(),
+            diff_decisions: BTreeMap::new(),
         }
     }
 }
@@ -306,6 +324,25 @@ pub enum ChatAction {
     ApproveDiff(usize, bool),
     Permission(usize, PermissionChoice),
     AnswerQuestion(usize, String),
+    PolicyAck {
+        request_id: String,
+    },
+    PolicyError {
+        request_id: String,
+        message: String,
+    },
+    RetryPolicy {
+        request_id: String,
+    },
+    DiffHunk {
+        request_id: String,
+        hunk: usize,
+        approved: bool,
+    },
+    DiffWholeFile {
+        request_id: String,
+        approved: bool,
+    },
 }
 
 impl ChatState {
@@ -380,41 +417,85 @@ impl ChatState {
             },
             ChatAction::ApproveDiff(index, approved) => match self.cards.get_mut(index) {
                 Some(Card::Diff {
-                    approved: value, ..
+                    request_id,
+                    approved: value,
+                    ..
                 }) => {
-                    if approved {
-                        *value = true;
-                    } else {
-                        // Rejection is a terminal review decision. Remove the
-                        // pending card so a rejected mutation cannot be
-                        // accidentally submitted a second time.
-                        self.cards.remove(index);
-                    }
+                    let _ = (value, approved);
+                    self.policy_states
+                        .insert(request_id.clone(), PolicyState::Pending);
                     true
                 }
                 _ => false,
             },
             ChatAction::Permission(index, choice) => match self.cards.get(index) {
-                Some(Card::Permission { .. }) => {
-                    if matches!(
-                        choice,
-                        PermissionChoice::AllowOnce
-                            | PermissionChoice::AllowAlways
-                            | PermissionChoice::Reject
-                    ) {
-                        self.cards.remove(index);
+                Some(Card::Permission { request_id, .. }) => {
+                    if !matches!(choice, PermissionChoice::Inspect) {
+                        self.policy_states
+                            .insert(request_id.clone(), PolicyState::Pending);
                     }
                     true
                 }
                 _ => false,
             },
             ChatAction::AnswerQuestion(index, answer) => match self.cards.get_mut(index) {
-                Some(Card::Question { answer: value, .. }) => {
-                    *value = Some(answer);
+                Some(Card::Question { question_id, .. }) => {
+                    let _ = answer;
+                    self.policy_states
+                        .insert(question_id.clone(), PolicyState::Pending);
                     true
                 }
                 _ => false,
             },
+            ChatAction::PolicyAck { request_id } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Ack);
+                self.cards.retain(|card| {
+                    !matches!(card,
+                        Card::Permission { request_id: id, .. }
+                        | Card::Diff { request_id: id, .. }
+                        | Card::Question { question_id: id, .. }
+                        if id == &request_id)
+                });
+                true
+            }
+            ChatAction::PolicyError {
+                request_id,
+                message,
+            } => {
+                self.policy_states
+                    .insert(request_id, PolicyState::Error(message));
+                true
+            }
+            ChatAction::RetryPolicy { request_id } => {
+                self.policy_states.insert(request_id, PolicyState::Pending);
+                true
+            }
+            ChatAction::DiffHunk {
+                request_id,
+                hunk,
+                approved,
+            } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
+                self.diff_decisions
+                    .entry(request_id)
+                    .or_default()
+                    .push(DiffDecision::Hunk { hunk, approved });
+                true
+            }
+            ChatAction::DiffWholeFile {
+                request_id,
+                approved,
+            } => {
+                self.policy_states
+                    .insert(request_id.clone(), PolicyState::Pending);
+                self.diff_decisions
+                    .entry(request_id)
+                    .or_default()
+                    .push(DiffDecision::WholeFile { approved });
+                true
+            }
             ChatAction::Submit(_) => false,
         }
     }
@@ -575,8 +656,14 @@ impl ChatState {
                 });
                 true
             }
-            TurnEvent::DiffRequested { path, diff, .. } => {
+            TurnEvent::DiffRequested {
+                request_id,
+                path,
+                diff,
+                ..
+            } => {
                 self.cards.push(Card::Diff {
+                    request_id,
                     path,
                     patch: diff,
                     approved: false,
@@ -1046,6 +1133,16 @@ mod tests {
         });
         assert!(state.reduce(ChatAction::Permission(1, PermissionChoice::AllowOnce)));
         assert!(
+            state
+                .cards
+                .iter()
+                .any(|card| matches!(card, Card::Permission { .. }))
+        );
+        assert!(matches!(state.policy_states["r1"], PolicyState::Pending));
+        assert!(state.reduce(ChatAction::PolicyAck {
+            request_id: "r1".into(),
+        }));
+        assert!(
             !state
                 .cards
                 .iter()
@@ -1091,17 +1188,19 @@ mod tests {
         ));
 
         state.cards.push(Card::Diff {
+            request_id: "diff".into(),
             path: "file.rs".into(),
             patch: "@@".into(),
             approved: false,
         });
         assert!(state.reduce(ChatAction::ApproveDiff(2, false)));
         assert!(
-            !state
+            state
                 .cards
                 .iter()
                 .any(|card| matches!(card, Card::Diff { .. }))
         );
+        assert!(matches!(state.policy_states["diff"], PolicyState::Pending));
     }
 
     #[test]
