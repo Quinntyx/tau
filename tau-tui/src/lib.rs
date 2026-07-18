@@ -14,7 +14,10 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, path::PathBuf, time::Duration};
 use tau_client::Client;
-use tau_proto::prelude::ClientResponse;
+use tau_proto::prelude::{
+    Capability, ClientResponse, ProtocolNegotiateParams, ProtocolVersion, QuestionAnswer,
+    TurnPermissionChoice,
+};
 
 pub use adapter::{ClientEvent, ScriptedClient};
 pub use reducer::{Action, apply as reduce};
@@ -22,7 +25,7 @@ pub use state::AppState;
 
 /// Start the client without ever starting a daemon for the user.
 pub async fn run(socket: PathBuf) -> Result<()> {
-    let client = Client::connect(&socket).await.with_context(|| {
+    let client = connect_to_daemon(&socket).await.with_context(|| {
         format!(
             "daemon unavailable at {}\nhelp: to fix this, run `tau serve` before running the tui",
             socket.display()
@@ -45,6 +48,27 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     )?;
     terminal.show_cursor()?;
     result
+}
+
+async fn connect_to_daemon(socket: &PathBuf) -> Result<Client> {
+    let client = Client::connect(socket).await?;
+    let report = client
+        .negotiate_checked(ProtocolNegotiateParams {
+            version: ProtocolVersion { major: 1, minor: 0 },
+            capabilities: vec![
+                Capability::TurnStreaming,
+                Capability::TurnCancellation,
+                Capability::EventReplay,
+                Capability::Idempotency,
+            ],
+        })
+        .await?;
+    anyhow::ensure!(
+        report.is_compatible(),
+        "daemon protocol incompatible; missing capabilities: {:?}",
+        report.missing_capabilities
+    );
+    Ok(client)
 }
 
 async fn session(
@@ -98,12 +122,20 @@ async fn session(
                     let response = match &action {
                         reducer::Action::Permission(choice)
                         | reducer::Action::PermissionReply(choice) => {
-                            Some(ClientResponse::Permission { choice: permission_choice(*choice).into() })
+                            Some(ClientResponse::Permission {
+                                request_id: state.permission_request_id.clone().unwrap_or_default(),
+                                choice: permission_choice(*choice),
+                            })
                         }
                         reducer::Action::QuestionReply(answer) => {
-                            Some(ClientResponse::Question { answer: answer.clone() })
+                            Some(ClientResponse::Question {
+                                question_id: state.question_id.clone().unwrap_or_default(),
+                                answer: QuestionAnswer(answer.clone()),
+                            })
                         }
                         reducer::Action::DiffReply(approved) => Some(ClientResponse::DiffHunk {
+                            request_id: state.diff_request_id.clone().unwrap_or_default(),
+                            path: state.diff_path.clone().unwrap_or_default(),
                             index: state.hunk_index as u32,
                             approved: *approved,
                         }),
@@ -136,7 +168,7 @@ async fn session(
                     }
                     if reconnect {
                         event_task.abort();
-                        match Client::connect(&socket).await {
+                        match connect_to_daemon(&socket).await {
                             Ok(new_client) => {
                                 client = new_client;
                                 event_task = tokio::spawn(adapter::persistent_events(
@@ -184,13 +216,13 @@ async fn session(
     Ok(())
 }
 
-fn permission_choice(choice: state::PermissionChoice) -> &'static str {
+fn permission_choice(choice: state::PermissionChoice) -> TurnPermissionChoice {
     match choice {
-        state::PermissionChoice::AllowOnce => "allow_once",
-        state::PermissionChoice::AllowAlways => "allow_always",
-        state::PermissionChoice::AllowSession => "allow_session",
-        state::PermissionChoice::DenyOnce => "deny_once",
-        state::PermissionChoice::Reject => "reject",
+        state::PermissionChoice::AllowOnce => TurnPermissionChoice::AllowOnce,
+        state::PermissionChoice::AllowAlways => TurnPermissionChoice::AllowAlways,
+        state::PermissionChoice::AllowSession => TurnPermissionChoice::AllowSession,
+        state::PermissionChoice::DenyOnce => TurnPermissionChoice::DenyOnce,
+        state::PermissionChoice::Reject => TurnPermissionChoice::Reject,
     }
 }
 

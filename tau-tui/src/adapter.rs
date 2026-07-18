@@ -34,14 +34,18 @@ impl ScriptedClient {
                     s.session_id = Some(session_id.clone());
                     s.turn_id = Some(turn_id.clone());
                 }
-                ClientEvent::Tool { name, output } => s.tools.push(crate::state::ToolCard {
-                    name: name.clone(),
-                    result: output.inline.clone(),
-                    input: serde_json::Value::Null,
-                    status: crate::state::ToolStatus::Complete,
-                    expanded: false,
-                }),
+                ClientEvent::Tool { name, output } => {
+                    s.tools.push(crate::state::ToolCard {
+                        name: name.clone(),
+                        result: output.inline.clone(),
+                        input: serde_json::Value::Null,
+                        status: crate::state::ToolStatus::Complete,
+                        expanded: false,
+                    });
+                    s.tool_call_ids.push(None);
+                }
                 ClientEvent::Permission { tool, summary } => {
+                    s.permission_request_id = None;
                     s.permission = Some(crate::state::Permission {
                         tool: tool.clone(),
                         summary: summary.clone(),
@@ -95,6 +99,7 @@ pub async fn complete(
     tx: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<()> {
     s.transcript.push("tau: ".into());
+    s.assistant_index = Some(s.transcript.len() - 1);
     let params = reducer::params(
         s,
         prompt,
@@ -190,25 +195,102 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
         return;
     }
     s.sequence = s.sequence.max(event.sequence);
+    s.raw_events.push(event.clone());
     match event.event {
-        TurnEvent::TurnStarted { turn_id } => s.turn_id = Some(turn_id),
-        TurnEvent::TextDelta { text, .. } => {
-            if let Some(last) = s.transcript.last_mut() {
-                last.push_str(&text);
-            } else {
-                s.transcript.push(text);
+        TurnEvent::TurnStarted { turn_id } => {
+            s.turn_id = Some(turn_id);
+            if s.assistant_index.is_none() {
+                s.transcript.push(String::new());
+                s.assistant_index = Some(s.transcript.len() - 1);
             }
         }
-        TurnEvent::ToolOutput { output, .. } => s.tools.push(crate::state::ToolCard {
-            name: "tool".into(),
-            result: output.inline,
-            input: serde_json::Value::Null,
-            status: crate::state::ToolStatus::Complete,
-            expanded: false,
-        }),
-        TurnEvent::PermissionRequested {
-            tool, description, ..
+        TurnEvent::TextDelta { text, .. } => {
+            let index = ensure_assistant(s);
+            s.transcript[index].push_str(&text);
+        }
+        TurnEvent::ReasoningDelta { text, .. } => {
+            s.transcript.push(format!("Reasoning: {text}"));
+        }
+        TurnEvent::ToolStarted {
+            tool_call_id,
+            tool,
+            input,
+            ..
         } => {
+            s.tools.push(crate::state::ToolCard {
+                name: tool,
+                result: String::new(),
+                input: input.unwrap_or(serde_json::Value::Null),
+                status: crate::state::ToolStatus::Running,
+                expanded: false,
+            });
+            s.tool_call_ids.push(Some(tool_call_id));
+        }
+        TurnEvent::ToolStatus {
+            tool_call_id,
+            status,
+            metadata,
+            ..
+        } => {
+            if let Some(index) = find_tool(s, &tool_call_id) {
+                s.tools[index].status = match status {
+                    tau_proto::prelude::ToolStatusValue::Pending
+                    | tau_proto::prelude::ToolStatusValue::Running => {
+                        crate::state::ToolStatus::Running
+                    }
+                    tau_proto::prelude::ToolStatusValue::Completed => {
+                        crate::state::ToolStatus::Complete
+                    }
+                    tau_proto::prelude::ToolStatusValue::Failed => crate::state::ToolStatus::Failed,
+                    tau_proto::prelude::ToolStatusValue::Cancelled => {
+                        crate::state::ToolStatus::Cancelled
+                    }
+                };
+                if let Some(metadata) = metadata {
+                    s.tools[index].input = metadata;
+                }
+            }
+        }
+        TurnEvent::ToolCompleted {
+            tool_call_id,
+            output,
+            ..
+        } => {
+            if let Some(index) = find_tool(s, &tool_call_id) {
+                s.tools[index].status = crate::state::ToolStatus::Complete;
+                if let Some(output) = output {
+                    s.tools[index].result = output.inline;
+                }
+            } else {
+                push_tool(s, tool_call_id, "tool".into(), output);
+            }
+        }
+        TurnEvent::ToolError {
+            tool_call_id,
+            error,
+            ..
+        } => {
+            if let Some(index) = find_tool(s, &tool_call_id) {
+                s.tools[index].status = crate::state::ToolStatus::Failed;
+                s.tools[index].result = error;
+            } else {
+                push_tool(s, tool_call_id, "tool".into(), None);
+                if let Some(index) = s.tools.len().checked_sub(1) {
+                    s.tools[index].status = crate::state::ToolStatus::Failed;
+                    s.tools[index].result = error;
+                }
+            }
+        }
+        TurnEvent::ToolOutput { output, .. } => {
+            push_tool(s, String::new(), "tool".into(), Some(output));
+        }
+        TurnEvent::PermissionRequested {
+            request_id,
+            tool,
+            description,
+            ..
+        } => {
+            s.permission_request_id = Some(request_id);
             s.permission = Some(crate::state::Permission {
                 tool,
                 summary: description,
@@ -216,22 +298,182 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
                 stage: crate::state::PermissionStage::Choose,
             });
         }
-        TurnEvent::QuestionAsked { question, .. } => {
+        TurnEvent::QuestionAsked {
+            question_id,
+            question,
+            ..
+        } => {
+            s.question_id = Some(question_id);
             s.question = Some(crate::state::Question {
                 prompt: question,
                 answer: None,
             });
         }
-        TurnEvent::DiffRequested { path, diff, .. } => {
+        TurnEvent::DiffRequested {
+            request_id,
+            path,
+            diff,
+            ..
+        } => {
+            s.diff_request_id = Some(request_id);
+            s.diff_path = Some(path.clone());
+            s.diff_reply = Some(crate::state::DiffReply { accepted: None });
             s.transcript
                 .push(format!("tau diff review: {path}\n{diff}"));
         }
         TurnEvent::ArtifactCreated { artifact, .. } => s.transcript.push(format!(
-            "artifact {} ({})",
-            artifact.artifact_id, artifact.media_type
+            "artifact {} ({}, {} bytes)",
+            artifact.artifact_id, artifact.media_type, artifact.size_bytes
         )),
-        TurnEvent::TurnCompleted { .. } => s.cancelling = false,
-        TurnEvent::TurnCancelled { .. } => s.cancelling = false,
-        TurnEvent::TurnFailed { message, .. } => s.transcript.push(format!("tau error: {message}")),
+        TurnEvent::CompactionStarted { .. } => s.transcript.push("Compaction started".into()),
+        TurnEvent::CompactionCompleted { summary, .. } => s
+            .transcript
+            .push(summary.unwrap_or_else(|| "Compaction completed".into())),
+        TurnEvent::SystemMessage { message, .. } => s.transcript.push(message),
+        TurnEvent::IntegrationEvent {
+            integration,
+            event,
+            data,
+            ..
+        } => s.transcript.push(format!(
+            "{integration}: {event}{}",
+            data.map(|value| format!("\n{value}")).unwrap_or_default()
+        )),
+        TurnEvent::PlanUpdated { plan, .. } => s.transcript.push(format!("plan: {plan}")),
+        TurnEvent::StatusChanged {
+            status, message, ..
+        } => {
+            if matches!(status.as_str(), "failed" | "error") {
+                s.transcript
+                    .push(format!("tau error: {}", message.unwrap_or(status)));
+            }
+        }
+        TurnEvent::Telemetry { .. } => {}
+        TurnEvent::TurnCompleted { .. } => {
+            s.cancelling = false;
+            s.assistant_index = None;
+        }
+        TurnEvent::TurnCancelled { .. } => {
+            s.cancelling = false;
+            s.assistant_index = None;
+        }
+        TurnEvent::TurnFailed { message, .. } => {
+            s.transcript.push(format!("tau error: {message}"));
+            s.assistant_index = None;
+        }
+    }
+}
+
+fn ensure_assistant(s: &mut AppState) -> usize {
+    if let Some(index) = s.assistant_index {
+        return index;
+    }
+    s.transcript.push(String::new());
+    let index = s.transcript.len() - 1;
+    s.assistant_index = Some(index);
+    index
+}
+
+fn find_tool(s: &AppState, call_id: &str) -> Option<usize> {
+    s.tool_call_ids
+        .iter()
+        .position(|value| value.as_deref() == Some(call_id))
+}
+
+fn push_tool(s: &mut AppState, call_id: String, name: String, output: Option<BoundedOutput>) {
+    s.tools.push(crate::state::ToolCard {
+        name,
+        result: output.map(|value| value.inline).unwrap_or_default(),
+        input: serde_json::Value::Null,
+        status: crate::state::ToolStatus::Complete,
+        expanded: false,
+    });
+    s.tool_call_ids
+        .push((!call_id.is_empty()).then_some(call_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(sequence: u64, event: TurnEvent) -> SequencedEvent {
+        SequencedEvent {
+            event_id: format!("e{sequence}"),
+            session_id: "s".into(),
+            sequence,
+            occurred_at: 0,
+            request_id: None,
+            event,
+        }
+    }
+
+    #[test]
+    fn typed_reducer_preserves_events_and_correlates_tool_lifecycle() {
+        let mut state = AppState::default();
+        reduce_event(
+            &mut state,
+            event(
+                1,
+                TurnEvent::TurnStarted {
+                    turn_id: "t".into(),
+                },
+            ),
+        );
+        reduce_event(
+            &mut state,
+            event(
+                2,
+                TurnEvent::TextDelta {
+                    turn_id: "t".into(),
+                    text: "answer".into(),
+                },
+            ),
+        );
+        reduce_event(
+            &mut state,
+            event(
+                3,
+                TurnEvent::ToolStarted {
+                    turn_id: "t".into(),
+                    tool_call_id: "call".into(),
+                    tool: "shell".into(),
+                    input: Some(serde_json::json!({"command": "pwd"})),
+                },
+            ),
+        );
+        reduce_event(
+            &mut state,
+            event(
+                4,
+                TurnEvent::ToolStatus {
+                    turn_id: "t".into(),
+                    tool_call_id: "call".into(),
+                    status: tau_proto::prelude::ToolStatusValue::Running,
+                    metadata: Some(serde_json::json!({"pid": 42})),
+                },
+            ),
+        );
+        reduce_event(
+            &mut state,
+            event(
+                5,
+                TurnEvent::ToolCompleted {
+                    turn_id: "t".into(),
+                    tool_call_id: "call".into(),
+                    output: Some(BoundedOutput {
+                        inline: "ok".into(),
+                        truncated: false,
+                        artifacts: vec![],
+                    }),
+                },
+            ),
+        );
+
+        assert_eq!(state.raw_events.len(), 5);
+        assert_eq!(state.transcript[state.assistant_index.unwrap()], "answer");
+        assert_eq!(state.tools.len(), 1);
+        assert_eq!(state.tools[0].status, crate::state::ToolStatus::Complete);
+        assert_eq!(state.tools[0].result, "ok");
+        assert_eq!(state.tool_call_ids, vec![Some("call".into())]);
     }
 }

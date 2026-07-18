@@ -1,80 +1,461 @@
 use gpui::{
-    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, Task, Window,
-    div, prelude::*, px, rgb,
+    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, ScrollHandle,
+    StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb,
 };
 use tau_client::TurnStreamEvent;
+use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
 
-use crate::backend::{Backend, DaemonAction};
-use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
-use crate::input::TextInput;
+use crate::backend::{Backend, DaemonAction, DaemonStatus};
+use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
+use crate::input::{TextInput, command_mode};
+use crate::picker::{
+    AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
+    next_agent, parse_command,
+};
 
-gpui::actions!(tau_view, [Submit, SwitchAgent, CycleModel]);
+gpui::actions!(
+    tau_view,
+    [
+        Submit,
+        SwitchAgent,
+        CycleModel,
+        DismissPicker,
+        PickerUp,
+        PickerDown,
+        PickItem,
+        ToggleSidebar,
+        ToggleFollow
+    ]
+);
+
+/// Stable, testable description of the information presented by the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TauViewDescription {
+    pub transcript: Vec<(String, String)>,
+    pub status: String,
+    pub loading: bool,
+    pub sidebar: Vec<(String, String)>,
+}
+
+pub fn next_sidebar_visibility(visible: bool) -> bool {
+    !visible
+}
+
+pub fn next_follow_state(following: bool) -> bool {
+    !following
+}
+
+/// Build presentation data without requiring a GPUI window.  Typed protocol
+/// events are included even when they do not have a legacy card.
+pub fn describe_chat(chat: &ChatState, agent: &str, model: &str, cwd: &str) -> TauViewDescription {
+    let mut transcript = chat.cards.iter().map(card_description).collect::<Vec<_>>();
+    for event in &chat.events {
+        let item = match &event.kind {
+            EventKind::Started => Some(("lifecycle".into(), "Turn started".into())),
+            EventKind::TextDelta { .. } => None,
+            EventKind::ReasoningDelta { text } => Some(("reasoning".into(), text.clone())),
+            EventKind::ToolOutput {
+                inline,
+                truncated,
+                artifacts,
+            } => Some((
+                "tool output".into(),
+                format!(
+                    "{}{}{}",
+                    inline,
+                    if *truncated { " (truncated)" } else { "" },
+                    if artifacts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{} artifacts]", artifacts.len())
+                    }
+                ),
+            )),
+            EventKind::PermissionRequested {
+                tool, description, ..
+            } => Some(("permission".into(), format!("{tool}: {description}"))),
+            EventKind::QuestionAsked { question, .. } => {
+                Some(("question".into(), question.clone()))
+            }
+            EventKind::DiffRequested { path, diff, .. } => {
+                Some(("diff".into(), format!("{path}\n{diff}")))
+            }
+            EventKind::ArtifactCreated {
+                artifact_id,
+                media_type,
+                size_bytes,
+                storage_ref,
+                ..
+            } => Some((
+                "artifact".into(),
+                format!("{artifact_id} ({media_type}, {size_bytes} bytes)\n{storage_ref}"),
+            )),
+            EventKind::Completed { message_id } => Some((
+                "lifecycle".into(),
+                format!(
+                    "Turn completed{}",
+                    message_id
+                        .map(|id| format!(" (message {id})"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::Cancelled => Some(("lifecycle".into(), "Turn cancelled".into())),
+            EventKind::Failed { message } => Some(("error".into(), message.clone())),
+            EventKind::ToolStarted {
+                call_id,
+                tool,
+                input,
+            } => Some((
+                "tool started".into(),
+                format!(
+                    "{tool} [{call_id}]{}",
+                    input
+                        .as_deref()
+                        .map(|value| format!("\ninput: {value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::ToolStatus {
+                call_id,
+                status,
+                metadata,
+            } => Some((
+                "tool status".into(),
+                format!(
+                    "{call_id}: {status:?}{}",
+                    metadata
+                        .as_deref()
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::ToolCompleted { call_id, output } => Some((
+                "tool completed".into(),
+                format!(
+                    "{call_id}{}",
+                    output
+                        .as_deref()
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::ToolError { call_id, error } => {
+                Some(("tool error".into(), format!("{call_id}: {error}")))
+            }
+            EventKind::CompactionStarted => {
+                Some(("compaction".into(), "Compaction started".into()))
+            }
+            EventKind::CompactionCompleted { summary } => Some((
+                "compaction".into(),
+                summary
+                    .clone()
+                    .unwrap_or_else(|| "Compaction completed".into()),
+            )),
+            EventKind::SystemMessage { message } => Some(("system".into(), message.clone())),
+            EventKind::IntegrationEvent {
+                integration,
+                event,
+                data,
+            } => Some((
+                "integration".into(),
+                format!(
+                    "{integration}: {event}{}",
+                    data.as_deref()
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::PlanUpdated { plan } => Some(("plan".into(), plan.clone())),
+            EventKind::StatusChanged { status, message } => Some((
+                "status".into(),
+                format!(
+                    "{status}{}",
+                    message
+                        .as_deref()
+                        .map(|value| format!(": {value}"))
+                        .unwrap_or_default()
+                ),
+            )),
+            EventKind::Telemetry { usage, context } => Some((
+                "telemetry".into(),
+                format!(
+                    "usage={} context={}",
+                    usage.as_deref().unwrap_or("unavailable"),
+                    context.as_deref().unwrap_or("unavailable")
+                ),
+            )),
+            EventKind::Other => Some(("event".into(), "Unknown typed event".into())),
+        };
+        if let Some(item) = item {
+            transcript.push(item);
+        }
+    }
+    let status = match &chat.status {
+        ChatStatus::Ready => "Ready".into(),
+        ChatStatus::Streaming => "Thinking...".into(),
+        ChatStatus::Failed(error) => format!("Error: {error}"),
+    };
+    let sidebar = &chat.sidebar;
+    let plan = match (&sidebar.plan, &sidebar.current_step, sidebar.airtight) {
+        (Some(plan), Some(step), Some(airtight)) => format!(
+            "{plan} · {step} ({})",
+            if airtight { "airtight" } else { "not airtight" }
+        ),
+        (Some(plan), _, _) => plan.clone(),
+        _ => "Unavailable".into(),
+    };
+    let tokens = match (
+        sidebar.input_tokens,
+        sidebar.output_tokens,
+        sidebar.context_tokens,
+    ) {
+        (Some(input), Some(output), Some(context)) => format!(
+            "in {input} · out {output}{} · ctx {context}{}",
+            sidebar
+                .cached_tokens
+                .map(|cached| format!(" · cached {cached}"))
+                .unwrap_or_default(),
+            sidebar
+                .context_percent
+                .map(|percent| format!(" ({percent}%)"))
+                .unwrap_or_default()
+        ),
+        _ => sidebar
+            .total_tokens
+            .or(chat.usage)
+            .map(|value| format!("{value} total"))
+            .unwrap_or_else(|| "Unavailable".into()),
+    };
+    TauViewDescription {
+        transcript,
+        status,
+        loading: chat.loading || chat.active_assistant.is_some(),
+        sidebar: vec![
+            (
+                "AGENT".into(),
+                sidebar.agent.as_deref().unwrap_or(agent).into(),
+            ),
+            (
+                "MODEL".into(),
+                sidebar.model.as_deref().unwrap_or(model).into(),
+            ),
+            ("PLAN".into(), plan),
+            (
+                "LSP".into(),
+                sidebar.lsp.as_deref().unwrap_or("Unavailable").into(),
+            ),
+            ("TOKENS".into(), tokens),
+            (
+                "MCP".into(),
+                sidebar.mcp.as_deref().unwrap_or("Unavailable").into(),
+            ),
+            (
+                "TASK".into(),
+                sidebar
+                    .task_tier
+                    .map(|tier| format!("Tier {tier}"))
+                    .unwrap_or_else(|| "Unavailable".into()),
+            ),
+            (
+                "AUTONOMY".into(),
+                sidebar
+                    .autonomous
+                    .map(|enabled| if enabled { "Enabled" } else { "Disabled" })
+                    .unwrap_or("Unavailable")
+                    .into(),
+            ),
+            (
+                "SESSION".into(),
+                sidebar
+                    .session_id
+                    .clone()
+                    .or_else(|| chat.session_id.clone())
+                    .clone()
+                    .unwrap_or_else(|| "Unavailable".into()),
+            ),
+            (
+                "DIRECTORY".into(),
+                if let Some(value) = sidebar.cwd.as_deref() {
+                    value.into()
+                } else if cwd.is_empty() {
+                    "Unavailable".into()
+                } else {
+                    cwd.into()
+                },
+            ),
+            (
+                "ROOTS".into(),
+                if sidebar.roots.is_empty() {
+                    "Unavailable".into()
+                } else {
+                    sidebar.roots.join("\n")
+                },
+            ),
+        ],
+    }
+}
+
+fn card_description(card: &Card) -> (String, String) {
+    match card {
+        Card::Message { role, text } => (
+            match role {
+                Role::User => "You",
+                Role::Assistant => "tau",
+                Role::System => "system",
+                Role::Tool => "tool",
+            }
+            .into(),
+            text.clone(),
+        ),
+        Card::Tool {
+            name,
+            input,
+            output,
+            expanded,
+        } => (
+            "tool".into(),
+            if *expanded {
+                format!("{name}\ninput: {input}\noutput: {output}")
+            } else {
+                format!("{name} (click to inspect)")
+            },
+        ),
+        Card::Diff {
+            path,
+            patch,
+            approved,
+            ..
+        } => (
+            "diff".into(),
+            format!(
+                "{path} ({})\n{patch}",
+                if *approved { "approved" } else { "pending" }
+            ),
+        ),
+        Card::Permission {
+            tool, description, ..
+        } => ("permission".into(), format!("{tool}: {description}")),
+        Card::Question {
+            question, answer, ..
+        } => (
+            "question".into(),
+            format!(
+                "{question}\n{}",
+                answer.as_deref().unwrap_or("awaiting answer")
+            ),
+        ),
+    }
+}
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("enter", Submit, None),
         KeyBinding::new("tab", SwitchAgent, None),
+        KeyBinding::new("escape", DismissPicker, None),
+        KeyBinding::new("up", PickerUp, None),
+        KeyBinding::new("down", PickerDown, None),
+        KeyBinding::new("enter", PickItem, Some("Picker")),
     ]);
 }
 
-#[derive(Clone, Copy)]
-enum AgentMode {
-    Plan,
-    Code,
-}
-
-impl AgentMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Plan => "Plan",
-            Self::Code => "Code",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Plan => Self::Code,
-            Self::Code => Self::Plan,
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimeState {
+    NotNegotiated,
+    Negotiating,
+    Ready,
+    Failed(String),
 }
 
 pub struct TauView {
     input: Entity<TextInput>,
+    picker_input: Entity<TextInput>,
     backend: Backend,
     chat: ChatState,
     task: Option<Task<()>>,
-    agent: AgentMode,
+    ack_tasks: Vec<Task<()>>,
+    agent: String,
     toast_visible: bool,
     model_index: usize,
     models: Vec<String>,
     sidebar_visible: bool,
+    runtime: RuntimeState,
+    picker: Option<PickerKind>,
+    picker_index: usize,
+    agents: Vec<AgentOption>,
+    preferences: crate::preferences::GuiPreferences,
+    transcript_scroll: ScrollHandle,
+    follow_output: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    Model,
+    Agent,
+    Command,
 }
 
 impl TauView {
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
+        let picker_input = cx.new(TextInput::new);
         let toast_visible = backend.auto_started();
         let preferences = crate::preferences::path()
             .ok()
             .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
             .unwrap_or_default();
-        let models = preferences
+        // Preferences annotate the catalog; they are not the catalog.  Always
+        // retain the configured backend model and every configured preference
+        // entry so a recent/favorite flag cannot hide otherwise valid models.
+        let mut models = vec![backend.model().to_owned()];
+        for model in preferences
             .favorites
             .iter()
             .chain(preferences.recent_models.iter())
-            .cloned()
-            .collect();
+            .chain(preferences.selected_model.iter())
+        {
+            if !models.iter().any(|candidate| candidate == model) {
+                models.push(model.clone());
+            }
+        }
+        let selected_model = preferences.selected_model.clone();
+        let selected_agent = preferences.selected_agent.clone();
+        let default_model = backend.model().to_owned();
+        let models = models;
+        let model_index = selected_model
+            .as_ref()
+            .and_then(|model| models.iter().position(|candidate| candidate == model))
+            .unwrap_or(0);
+        let agent = selected_agent.unwrap_or_default();
+        let mut agents = Backend::configured_agents();
+        if !agent.is_empty() && !agents.iter().any(|candidate| candidate.name == agent) {
+            agents.push(AgentOption {
+                name: agent.clone(),
+                in_tab_cycle: true,
+            });
+        }
         Self {
             input,
+            picker_input,
             backend,
             chat: ChatState::default(),
             task: None,
-            agent: AgentMode::Code,
+            ack_tasks: Vec::new(),
+            agent: agent.clone(),
             toast_visible,
-            model_index: 0,
-            models,
+            model_index,
+            models: if models.is_empty() {
+                vec![selected_model.unwrap_or(default_model)]
+            } else {
+                models
+            },
             sidebar_visible: preferences.sidebar,
+            runtime: RuntimeState::NotNegotiated,
+            picker: None,
+            picker_index: 0,
+            agents,
+            preferences,
+            transcript_scroll: ScrollHandle::new(),
+            follow_output: true,
         }
     }
 
@@ -87,14 +468,146 @@ impl TauView {
     }
 
     fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
-        self.agent = self.agent.next();
+        if let Some(next) = next_agent(&self.agents, Some(&self.agent), false) {
+            self.select_agent(next);
+        }
         self.chat.status = ChatStatus::Ready;
         cx.notify();
     }
 
-    fn cycle_model(&mut self, _: &CycleModel, _: &mut Window, cx: &mut Context<Self>) {
+    fn cycle_model(&mut self, _: &CycleModel, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerKind::Model, window, cx);
         if !self.models.is_empty() {
             self.model_index = (self.model_index + 1) % self.models.len();
+        }
+        cx.notify();
+    }
+
+    fn open_picker(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = Some(kind);
+        self.picker_index = 0;
+        self.picker_input.update(cx, |input, _| input.reset());
+        if kind != PickerKind::Command {
+            window.focus(&self.picker_input.focus_handle(cx));
+        }
+    }
+    fn dismiss_picker(&mut self, _: &DismissPicker, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            self.picker = None;
+            self.picker_input.update(cx, |input, _| input.reset());
+        } else if command_mode(&self.input.read(cx).content()) {
+            self.input.update(cx, |input, _| input.reset());
+        }
+        cx.notify();
+    }
+    fn picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let query = if self.picker == Some(PickerKind::Command) || self.picker.is_none() {
+            self.input.read(cx).content()
+        } else {
+            self.picker_input.read(cx).content()
+        };
+        let count = self.picker_items(&query).len();
+        if count > 0 {
+            self.picker_index =
+                (self.picker_index as isize + delta).rem_euclid(count as isize) as usize;
+            cx.notify();
+        }
+    }
+    fn picker_up(&mut self, _: &PickerUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.picker_move(-1, cx);
+    }
+    fn picker_down(&mut self, _: &PickerDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.picker_move(1, cx);
+    }
+    fn picker_items(&self, query: &str) -> Vec<String> {
+        self.picker_items_for(self.picker.unwrap_or(PickerKind::Command), query)
+    }
+
+    fn picker_items_for(&self, kind: PickerKind, query: &str) -> Vec<String> {
+        match kind {
+            PickerKind::Model => {
+                let options = self.model_options();
+                crate::picker::fuzzy_models(&options, query)
+                    .into_iter()
+                    .map(|model| model.id)
+                    .collect()
+            }
+            PickerKind::Agent => self
+                .agents
+                .iter()
+                .filter(|a| {
+                    query.is_empty() || a.name.to_lowercase().contains(&query.to_lowercase())
+                })
+                .map(|a| a.name.clone())
+                .collect(),
+            PickerKind::Command => command_suggestions(query, &self.agents, &self.model_options()),
+        }
+    }
+    fn pick_item(&mut self, _: &PickItem, _: &mut Window, cx: &mut Context<Self>) {
+        let kind = self.picker.unwrap_or(PickerKind::Command);
+        let query = if kind == PickerKind::Command {
+            self.input.read(cx).content()
+        } else {
+            self.picker_input.read(cx).content()
+        };
+        let items = self.picker_items_for(kind, &query);
+        if let Some(item) = items.get(self.picker_index).cloned() {
+            match kind {
+                PickerKind::Model => self.select_model(item),
+                PickerKind::Agent => self.select_agent(item),
+                PickerKind::Command => self.accept_command(item, &query, cx),
+            }
+        }
+        self.picker = None;
+        self.picker_input.update(cx, |input, _| input.reset());
+        cx.notify();
+    }
+    fn click_model(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerKind::Model, window, cx);
+        cx.notify();
+    }
+    fn click_agent(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerKind::Agent, window, cx);
+        cx.notify();
+    }
+
+    fn model_options(&self) -> Vec<ModelOption> {
+        self.models
+            .iter()
+            .map(|id| {
+                ModelOption::from_id(
+                    id,
+                    self.preferences.recent_models.contains(id),
+                    self.preferences.favorites.contains(id),
+                )
+            })
+            .collect()
+    }
+
+    fn accept_command(&mut self, item: String, query: &str, cx: &mut Context<Self>) {
+        let value = if item.starts_with('/') {
+            format!("{item} ")
+        } else if query.trim_end() == query {
+            let start = query
+                .rfind(char::is_whitespace)
+                .map_or(0, |index| index + 1);
+            format!("{}{}", &query[..start], item)
+        } else {
+            format!("{query}{item}")
+        };
+        self.input.update(cx, |input, _| input.set_content(value));
+        self.picker = None;
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = next_sidebar_visibility(self.sidebar_visible);
+        cx.notify();
+    }
+
+    fn toggle_follow(&mut self, _: &ToggleFollow, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow_output = next_follow_state(self.follow_output);
+        if self.follow_output {
+            self.transcript_scroll.scroll_to_bottom();
         }
         cx.notify();
     }
@@ -118,7 +631,25 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (request_id, path) = self
+            .chat
+            .cards
+            .get(index)
+            .and_then(|card| match card {
+                Card::Diff {
+                    request_id, path, ..
+                } => Some((request_id.clone(), path.clone())),
+                _ => None,
+            })
+            .unwrap_or_default();
         self.chat.reduce(ChatAction::ApproveDiff(index, approved));
+        let receiver = self.backend.respond(ClientResponse::DiffHunk {
+            request_id: request_id.clone(),
+            path,
+            index: index as u32,
+            approved,
+        });
+        self.watch_policy_ack(request_id, receiver, cx);
         cx.notify();
     }
 
@@ -130,7 +661,28 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let request_id = self.chat.cards.get(index).and_then(|card| match card {
+            Card::Permission { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        });
         self.chat.reduce(ChatAction::Permission(index, choice));
+        if matches!(choice, PermissionChoice::Inspect) {
+            cx.notify();
+            return;
+        }
+        let choice = match choice {
+            PermissionChoice::AllowOnce => TurnPermissionChoice::AllowOnce,
+            PermissionChoice::AllowAlways => TurnPermissionChoice::AllowAlways,
+            PermissionChoice::Reject => TurnPermissionChoice::Reject,
+            PermissionChoice::Inspect => TurnPermissionChoice::Inspect,
+            PermissionChoice::Cancel => TurnPermissionChoice::Cancel,
+        };
+        let request_id = request_id.unwrap_or_default();
+        let receiver = self.backend.respond(ClientResponse::Permission {
+            request_id: request_id.clone(),
+            choice,
+        });
+        self.watch_policy_ack(request_id, receiver, cx);
         cx.notify();
     }
 
@@ -142,9 +694,47 @@ impl TauView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let question_id = self.chat.cards.get(index).and_then(|card| match card {
+            Card::Question { question_id, .. } => Some(question_id.clone()),
+            _ => None,
+        });
         self.chat
             .reduce(ChatAction::AnswerQuestion(index, answer.into()));
+        let question_id = question_id.unwrap_or_default();
+        let receiver = self.backend.respond(ClientResponse::Question {
+            question_id: question_id.clone(),
+            answer: QuestionAnswer(answer.into()),
+        });
+        self.watch_policy_ack(question_id, receiver, cx);
         cx.notify();
+    }
+
+    fn watch_policy_ack(
+        &mut self,
+        request_id: String,
+        receiver: tokio::sync::oneshot::Receiver<Result<(), String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|_| Err("interactive response task ended".into()));
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(()) => {
+                        view.chat.reduce(ChatAction::PolicyAck { request_id });
+                    }
+                    Err(message) => {
+                        view.chat.reduce(ChatAction::PolicyError {
+                            request_id,
+                            message,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.ack_tasks.push(task);
     }
 
     fn hide_toast(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -181,6 +771,21 @@ impl TauView {
         self.chat.active_assistant = None;
         self.chat.status = ChatStatus::Ready;
         self.task = None;
+        self.input.update(cx, |input, _| input.set_disabled(false));
+        cx.notify();
+    }
+
+    fn retry_runtime(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::Retry);
+        self.runtime = RuntimeState::NotNegotiated;
+        self.chat.status = ChatStatus::Ready;
+        cx.notify();
+    }
+
+    fn restart_runtime(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.backend.daemon_action(DaemonAction::Restart);
+        self.runtime = RuntimeState::NotNegotiated;
+        self.chat.status = ChatStatus::Ready;
         cx.notify();
     }
 
@@ -192,8 +797,35 @@ impl TauView {
         if prompt.trim().is_empty() {
             return;
         }
-        self.input.update(cx, |input, _| input.reset());
+        if let Some(command) = parse_command(&prompt) {
+            if let Some(action) = command_action(command) {
+                match action {
+                    PickerAction::OpenModels => self.open_picker(PickerKind::Model, window, cx),
+                    PickerAction::OpenAgents => self.open_picker(PickerKind::Agent, window, cx),
+                    PickerAction::SelectModel(model) => self.select_model(model),
+                    PickerAction::SelectAgent(agent) => self.select_agent(agent),
+                    PickerAction::ToggleFavorite(model) => {
+                        let _ = self.backend.toggle_favorite(model.clone());
+                        self.preferences.toggle_favorite(model);
+                    }
+                    PickerAction::RecordRecentModel(model) => {
+                        let _ = self.backend.record_recent_model(model.clone());
+                        self.preferences.record_recent_model(model);
+                    }
+                    PickerAction::Dismiss => self.picker = None,
+                }
+                self.input.update(cx, |input, _| input.reset());
+                cx.notify();
+                return;
+            }
+        }
+        self.input.update(cx, |input, _| {
+            input.record_submission(prompt.clone());
+            input.reset();
+            input.set_disabled(true);
+        });
         self.chat.reduce(ChatAction::Submit(prompt.clone()));
+        self.runtime = RuntimeState::Negotiating;
         cx.notify();
         window.focus(&self.input.focus_handle(cx));
 
@@ -201,7 +833,7 @@ impl TauView {
         let receiver = self.backend.turn_with_options(
             prompt,
             self.chat.session_id.clone(),
-            Some(self.agent.label().into()),
+            (!self.agent.is_empty()).then(|| self.agent.clone()),
             selected_model,
         );
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -218,19 +850,193 @@ impl TauView {
         }));
     }
 
+    fn select_model(&mut self, model: String) {
+        if let Some(index) = self.models.iter().position(|value| value == &model) {
+            self.model_index = index;
+        }
+        self.preferences.selected_model = Some(model.clone());
+        self.preferences.record_recent_model(model);
+        let _ = self
+            .backend
+            .select_model(self.preferences.selected_model.clone().unwrap_or_default());
+        let _ = self.preferences.save();
+    }
+
+    fn select_agent(&mut self, agent: String) {
+        self.agent = agent.clone();
+        self.preferences.selected_agent = Some(agent);
+        if let Some(selected) = self.preferences.selected_agent.clone() {
+            let _ = self.backend.select_agent(selected);
+        }
+        let _ = self.preferences.save();
+    }
+
+    fn picker_overlay(&self, cx: &mut Context<Self>, kind: PickerKind) -> impl IntoElement {
+        let title = match kind {
+            PickerKind::Model => "Select model",
+            PickerKind::Agent => "Select agent",
+            PickerKind::Command => "Commands",
+        };
+        let query = if kind == PickerKind::Command {
+            self.input.read(cx).content()
+        } else {
+            self.picker_input.read(cx).content()
+        };
+        let items = self.picker_items_for(kind, &query);
+        let rows: Vec<(String, Option<usize>)> = match kind {
+            PickerKind::Model => {
+                let mut rows = Vec::new();
+                for (provider, entries) in model_groups(&self.model_options(), &query) {
+                    rows.push((format!("{provider} · provider"), None));
+                    for model in entries {
+                        let index = items.iter().position(|item| item == &model.id);
+                        rows.push((
+                            format!(
+                                "{}{}",
+                                if model.favorite {
+                                    "★ "
+                                } else if model.recent {
+                                    "↻ "
+                                } else {
+                                    ""
+                                },
+                                model.id
+                            ),
+                            index,
+                        ));
+                    }
+                }
+                rows
+            }
+            PickerKind::Agent => self
+                .agents
+                .iter()
+                .filter(|a| {
+                    query.is_empty() || a.name.to_lowercase().contains(&query.to_lowercase())
+                })
+                .enumerate()
+                .map(|(index, a)| {
+                    (
+                        format!(
+                            "{}{}",
+                            a.name,
+                            if a.in_tab_cycle { "  · Tab cycle" } else { "" }
+                        ),
+                        Some(index),
+                    )
+                })
+                .collect(),
+            PickerKind::Command => items
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, item)| (item, Some(index)))
+                .collect(),
+        };
+        let search = if kind == PickerKind::Command {
+            div()
+                .mt_2()
+                .p_2()
+                .bg(rgb(0x11151b))
+                .child(format!("Command: {}", query))
+        } else {
+            div().mt_2().child(self.picker_input.clone())
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(0x66000000))
+            .child(
+                div()
+                    .key_context("Picker")
+                    .w(px(560.))
+                    .max_h(px(520.))
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(0x202630))
+                    .border_1()
+                    .border_color(rgb(0x52627a))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(title),
+                    )
+                    .child(search)
+                    .children(rows.into_iter().enumerate().map(
+                        |(display_index, (row, item_index))| {
+                            let selected = item_index == Some(self.picker_index);
+                            let favorite_model = (kind == PickerKind::Model)
+                                .then(|| item_index.and_then(|index| items.get(index).cloned()))
+                                .flatten();
+                            let mut row_view = div()
+                                .id(("picker-row", display_index))
+                                .mt_1()
+                                .p_2()
+                                .rounded_md()
+                                .when(selected, |d| d.bg(rgb(0x34506f)))
+                                .when(item_index.is_some(), |d| {
+                                    d.cursor_pointer().on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |view, _, window, cx| {
+                                            view.picker_index = item_index.unwrap_or(0);
+                                            view.pick_item(&PickItem, window, cx);
+                                        }),
+                                    )
+                                })
+                                .child(row);
+                            if let Some(model) = favorite_model {
+                                let favorite = self.preferences.favorites.contains(&model);
+                                row_view = row_view.child(
+                                    div()
+                                        .ml_auto()
+                                        .cursor_pointer()
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |view, _, _, cx| {
+                                                let _ = view.backend.toggle_favorite(model.clone());
+                                                view.preferences.toggle_favorite(model.clone());
+                                                let _ = view.preferences.save();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if favorite { "★" } else { "☆" }),
+                                );
+                            }
+                            row_view
+                        },
+                    ))
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_xs()
+                            .text_color(rgb(0x8994a8))
+                            .child("↑↓ navigate  Enter select  Esc close"),
+                    ),
+            )
+    }
+
     fn apply_event(&mut self, event: Result<TurnStreamEvent, String>, cx: &mut Context<Self>) {
         match event {
             Ok(TurnStreamEvent::Event(event)) => {
+                self.runtime = RuntimeState::Ready;
                 self.chat.reduce(ChatAction::SessionEvent(event));
                 cx.notify();
             }
             Ok(TurnStreamEvent::Complete(_)) => {
+                self.runtime = RuntimeState::Ready;
                 self.chat.active_assistant = None;
                 self.chat.status = ChatStatus::Ready;
+                self.input.update(cx, |input, _| input.set_disabled(false));
                 cx.notify();
             }
             Err(error) => {
+                self.runtime = RuntimeState::Failed(error.clone());
                 self.chat.reduce(ChatAction::Error(error));
+                self.input.update(cx, |input, _| input.set_disabled(false));
                 cx.notify();
             }
         }
@@ -250,6 +1056,10 @@ impl Render for TauView {
             .get(self.model_index)
             .map(String::as_str)
             .unwrap_or(self.backend.model());
+        let description = describe_chat(&self.chat, &self.agent, current_model, self.backend.cwd());
+        if self.follow_output {
+            self.transcript_scroll.scroll_to_bottom();
+        }
         let header = div()
             .flex()
             .items_center()
@@ -263,15 +1073,113 @@ impl Render for TauView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("tau"),
             )
-            .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
-                "{}  ·  {}",
-                current_model,
-                match &self.chat.status {
-                    ChatStatus::Ready => "Ready",
-                    ChatStatus::Streaming => "Thinking...",
-                    ChatStatus::Failed(_) => "Request failed",
-                }
-            )));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(toast_button(
+                        if self.sidebar_visible {
+                            "Hide sidebar"
+                        } else {
+                            "Show sidebar"
+                        },
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.sidebar_visible = next_sidebar_visibility(view.sidebar_visible);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(toast_button(
+                        if self.follow_output {
+                            "Following"
+                        } else {
+                            "Follow output"
+                        },
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.follow_output = next_follow_state(view.follow_output);
+                            if view.follow_output {
+                                view.transcript_scroll.scroll_to_bottom();
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8c96a8))
+                            .cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::click_model))
+                            .child(format!(
+                                "{}  ·  {}",
+                                current_model,
+                                match self.backend.daemon_status() {
+                                    DaemonStatus::Absent => "Absent",
+                                    DaemonStatus::Spawning => "Spawning",
+                                    DaemonStatus::Connecting => "Connecting",
+                                    DaemonStatus::Negotiating => "Negotiating",
+                                    DaemonStatus::Incompatible => "Incompatible",
+                                    DaemonStatus::Degraded => "Degraded",
+                                    DaemonStatus::Ready => match &self.chat.status {
+                                        ChatStatus::Ready => "Ready",
+                                        ChatStatus::Streaming => "Thinking...",
+                                        ChatStatus::Failed(_) => "Request failed",
+                                    },
+                                    DaemonStatus::Failed => "Failed",
+                                }
+                            )),
+                    ),
+            );
+        let runtime_banner = match &self.runtime {
+            RuntimeState::NotNegotiated => Some((
+                "Runtime is not negotiated. Send a message to begin protocol negotiation.",
+                false,
+            )),
+            RuntimeState::Negotiating => Some((
+                "Negotiating runtime capabilities and protocol; tau is not ready yet.",
+                false,
+            )),
+            RuntimeState::Ready => None,
+            RuntimeState::Failed(error) => Some((
+                if error.is_empty() {
+                    "Runtime negotiation failed."
+                } else {
+                    error.as_str()
+                },
+                true,
+            )),
+        };
+        let runtime_banner_view = runtime_banner.map(|(message, failed)| {
+            let mut banner = div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .p_3()
+                .bg(rgb(if failed { 0x4a2929 } else { 0x202b38 }))
+                .text_color(rgb(if failed { 0xffb4a8 } else { 0xb9d7ff }))
+                .child(div().flex_1().child(message.to_string()));
+            if failed {
+                banner = banner.child(toast_button(
+                    "Retry",
+                    0x52627a,
+                    cx.listener(Self::retry_runtime),
+                ));
+                banner = banner.child(toast_button(
+                    "Restart owned daemon",
+                    0x6a5834,
+                    cx.listener(Self::restart_runtime),
+                ));
+            }
+            banner
+                .child(toast_button(
+                    "Disown safely",
+                    0x6a5834,
+                    cx.listener(Self::disown_daemon),
+                ))
+                .child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui)))
+        });
         let toast = div()
             .flex()
             .items_center()
@@ -280,10 +1188,22 @@ impl Render for TauView {
             .p_3()
             .bg(rgb(0x463b24))
             .text_color(rgb(0xf3d28a))
-            .child("tau started the daemon automatically for this GUI session")
             .child(
                 div()
                     .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("tau started the daemon automatically for this GUI session")
+                    .child(div().text_xs().child(
+                        "The daemon will remain owned by this window unless you disown it.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .id("startup-actions")
+                    .max_h(px(420.))
+                    .overflow_y_scroll()
                     .gap_2()
                     .child(toast_button(
                         "Okay",
@@ -309,12 +1229,23 @@ impl Render for TauView {
             );
         let transcript = div()
             .id("transcript")
+            .track_scroll(&self.transcript_scroll)
             .flex_1()
+            .min_h(px(0.))
             .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_3()
             .p_5()
+            .when(self.chat.cards.is_empty(), |view| {
+                view.child(div().text_sm().text_color(rgb(0x8994a8)).child(
+                    if self.chat.active_assistant.is_some() {
+                        "Loading transcript…"
+                    } else {
+                        "No transcript yet"
+                    },
+                ))
+            })
             .children(self.chat.cards.iter().enumerate().map(|(index, card)| {
                 let (background, label, align_end, text) = match card {
                     Card::Message {
@@ -352,6 +1283,7 @@ impl Render for TauView {
                         path,
                         patch,
                         approved,
+                        ..
                     } => (
                         0x293b32,
                         "diff",
@@ -382,14 +1314,20 @@ impl Render for TauView {
                     ),
                 };
                 let mut card_view = div()
+                    .id(("card", index))
+                    .focusable()
+                    .hover(|style| style.bg(rgb(0x171d26)))
                     .flex()
                     .flex_col()
                     .when(align_end, |element| element.items_end())
                     .child(div().text_xs().text_color(rgb(0x8994a8)).child(label))
                     .child(
                         div()
+                            .id(("card-content", index))
                             .flex()
                             .max_w(px(820.))
+                            .max_h(px(360.))
+                            .overflow_y_scroll()
                             .p_3()
                             .rounded_lg()
                             .bg(rgb(background))
@@ -475,38 +1413,62 @@ impl Render for TauView {
                     );
                 }
                 card_view
-            }));
+            }))
+            .children(
+                description
+                    .transcript
+                    .iter()
+                    .skip(self.chat.cards.len())
+                    .map(|(label, text)| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_3()
+                            .rounded_md()
+                            // The event kind already selected this projection;
+                            // presentation never reparses the label text to
+                            // recover protocol semantics.
+                            .bg(rgb(0x202630))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8994a8))
+                                    .child(label.clone()),
+                            )
+                            .child(text.clone())
+                    }),
+            );
         let sidebar = div()
             .w(px(260.))
             .flex()
             .flex_col()
             .gap_3()
             .p_4()
+            .flex_none()
             .border_l_1()
             .border_color(rgb(0x2c3340))
-            .child(sidebar_card("AGENT", self.agent.label()))
-            .child(sidebar_card(
-                "PLAN",
-                if self.chat.status == ChatStatus::Streaming {
-                    "Active"
-                } else {
-                    "No active plan"
-                },
-            ))
-            .child(sidebar_card("LSP", "Connected"))
-            .child(sidebar_card(
-                "TOKENS",
-                &self
-                    .chat
-                    .usage
-                    .map(|v| format!("{v} tokens"))
-                    .unwrap_or_else(|| "No usage yet".into()),
-            ))
-            .child(sidebar_card(
-                "SESSION",
-                self.chat.session_id.as_deref().unwrap_or("Not started"),
-            ))
-            .child(sidebar_card("DIRECTORY", self.backend.cwd()));
+            .child(
+                div()
+                    .cursor_pointer()
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_agent))
+                    .child(sidebar_card(
+                        "AGENT",
+                        description
+                            .sidebar
+                            .iter()
+                            .find(|(title, _)| title == "AGENT")
+                            .map(|(_, value)| value.as_str())
+                            .unwrap_or(&self.agent),
+                    )),
+            )
+            .children(
+                description
+                    .sidebar
+                    .iter()
+                    .filter(|(title, _)| title != "AGENT")
+                    .map(|(title, value)| sidebar_card(title, value)),
+            );
         let footer = div()
             .p_4()
             .border_t_1()
@@ -519,9 +1481,12 @@ impl Render for TauView {
                     .child(self.input.clone())
                     .child(
                         div()
+                            .id("send-button")
                             .px_4()
                             .py_3()
                             .bg(rgb(0x85b8ff))
+                            .hover(|style| style.bg(rgb(0xa8ccff)))
+                            .focusable()
                             .text_color(rgb(0x10151e))
                             .rounded_lg()
                             .cursor_pointer()
@@ -532,9 +1497,12 @@ impl Render for TauView {
             .when(self.chat.active_assistant.is_some(), |footer| {
                 footer.child(
                     div()
+                        .id("cancel-button")
                         .px_3()
                         .py_2()
                         .bg(rgb(0x7d3b3b))
+                        .hover(|style| style.bg(rgb(0xa34c4c)))
+                        .focusable()
                         .rounded_lg()
                         .cursor_pointer()
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_turn))
@@ -547,22 +1515,38 @@ impl Render for TauView {
             .text_color(rgb(0xe8edf5))
             .flex()
             .flex_col()
+            .min_h(px(0.))
+            .relative()
             .key_context("TauView")
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::switch_agent));
         root = root.on_action(cx.listener(Self::cycle_model));
-        if self.toast_visible {
-            root = root.child(toast);
+        root = root.on_action(cx.listener(Self::dismiss_picker));
+        root = root.on_action(cx.listener(Self::picker_up));
+        root = root.on_action(cx.listener(Self::picker_down));
+        root = root.on_action(cx.listener(Self::pick_item));
+        let command_active = self.picker.is_none() && command_mode(&self.input.read(cx).content());
+        if let Some(kind) = self.picker {
+            root = root.child(self.picker_overlay(cx, kind));
+        } else if command_active {
+            root = root.child(self.picker_overlay(cx, PickerKind::Command));
         }
+        root = root.on_action(cx.listener(Self::toggle_sidebar));
+        root = root.on_action(cx.listener(Self::toggle_follow));
         root.child(header)
+            .children(runtime_banner_view)
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .min_h(px(0.))
                     .child(transcript)
                     .when(self.sidebar_visible, |view| view.child(sidebar)),
             )
             .child(footer)
+            .when(self.toast_visible, |root| {
+                root.child(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
+            })
     }
 }
 
@@ -596,4 +1580,90 @@ fn toast_button(
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
         .child(label.to_string())
+}
+
+#[cfg(test)]
+mod view_model_tests {
+    use super::*;
+
+    #[test]
+    fn description_exposes_empty_and_operational_states() {
+        let state = ChatState::default();
+        let view = describe_chat(&state, "Code", "model", "/tmp");
+        assert!(!view.loading);
+        assert!(view.transcript.is_empty());
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "LSP" && value == "Unavailable")
+        );
+    }
+
+    #[test]
+    fn description_keeps_lifecycle_and_error_events() {
+        let mut state = ChatState::default();
+        state.events.push(crate::chat::TypedEvent {
+            event_id: "e".into(),
+            session_id: "s".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: None,
+            turn_id: "t".into(),
+            kind: EventKind::Failed {
+                message: "boom".into(),
+            },
+            raw: tau_proto::prelude::TurnEvent::TurnFailed {
+                turn_id: "t".into(),
+                message: "boom".into(),
+            },
+        });
+        let view = describe_chat(&state, "Plan", "model", "/tmp");
+        assert!(
+            view.transcript
+                .iter()
+                .any(|(label, text)| label == "error" && text == "boom")
+        );
+    }
+
+    #[test]
+    fn action_helpers_toggle_sidebar_and_follow_state() {
+        assert!(next_sidebar_visibility(false));
+        assert!(!next_sidebar_visibility(true));
+        assert!(next_follow_state(false));
+        assert!(!next_follow_state(true));
+    }
+
+    #[test]
+    fn description_renders_typed_operational_fields_without_fabrication() {
+        let mut state = ChatState::default();
+        state.sidebar.plan = Some("release".into());
+        state.sidebar.current_step = Some("render".into());
+        state.sidebar.airtight = Some(false);
+        state.sidebar.input_tokens = Some(10);
+        state.sidebar.output_tokens = Some(4);
+        state.sidebar.context_tokens = Some(20);
+        state.sidebar.context_percent = Some(25);
+        state.sidebar.lsp = Some("2 diagnostics".into());
+        let view = describe_chat(&state, "Code", "model", "");
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "PLAN" && value.contains("not airtight"))
+        );
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "TOKENS" && value.contains("25%"))
+        );
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "LSP" && value == "2 diagnostics")
+        );
+        assert!(
+            view.sidebar
+                .iter()
+                .any(|(key, value)| key == "DIRECTORY" && value == "Unavailable")
+        );
+    }
 }

@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::collections::VecDeque;
+use tau_proto::prelude::SequencedEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Connection {
@@ -38,6 +39,7 @@ pub enum ToolStatus {
     Complete,
     Failed,
     Denied,
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,10 @@ pub struct AppState {
     pub selection: Option<usize>,
     pub clipboard: String,
     pub transcript: Vec<String>,
+    /// The display transcript is a projection; retain every typed event so
+    /// replay and inspection never need to recover semantics from strings.
+    pub raw_events: Vec<SequencedEvent>,
+    pub assistant_index: Option<usize>,
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
     pub sequence: u64,
@@ -101,9 +107,16 @@ pub struct AppState {
     pub recent_models: Vec<String>,
     pub agents: Vec<String>,
     pub tools: Vec<ToolCard>,
+    /// Correlates tool cards with protocol lifecycle events without changing
+    /// the legacy card shape used by renderers.
+    pub tool_call_ids: Vec<Option<String>>,
     pub permission: Option<Permission>,
+    pub permission_request_id: Option<String>,
     pub question: Option<Question>,
+    pub question_id: Option<String>,
     pub diff_reply: Option<DiffReply>,
+    pub diff_request_id: Option<String>,
+    pub diff_path: Option<String>,
     pub task_tier: u8,
     pub autonomous: bool,
     pub hunks: Vec<Hunk>,
@@ -149,6 +162,8 @@ impl Default for AppState {
             selection: None,
             clipboard: String::new(),
             transcript: vec!["Welcome to tau. Select a model and type a prompt.".into()],
+            raw_events: vec![],
+            assistant_index: None,
             session_id: None,
             turn_id: None,
             sequence: 0,
@@ -172,9 +187,14 @@ impl Default for AppState {
             recent_models: vec![],
             agents: vec!["default".into(), "explore".into(), "general".into()],
             tools: vec![],
+            tool_call_ids: vec![],
             permission: None,
+            permission_request_id: None,
             question: None,
+            question_id: None,
             diff_reply: None,
+            diff_request_id: None,
+            diff_path: None,
             task_tier: 1,
             autonomous: false,
             hunks: vec![],

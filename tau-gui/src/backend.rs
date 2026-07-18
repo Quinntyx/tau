@@ -7,9 +7,12 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{
-    IdempotencyKey, RequestAction, TurnCancelParams, TurnReplayParams, TurnStartParams,
+    Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
+    RequestAction, TurnCancelParams, TurnReplayParams, TurnResponseParams, TurnStartParams,
 };
 use tokio::sync::mpsc;
+
+use crate::picker::PickerAction;
 
 #[derive(Clone)]
 pub struct Backend {
@@ -20,8 +23,10 @@ pub struct Backend {
     session: Arc<tokio::sync::Mutex<Option<tau_client::Client>>>,
     active: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     active_turn: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
+    response_context: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
     _daemon: Arc<Mutex<Option<Child>>>,
     auto_started: bool,
+    status: Arc<Mutex<DaemonStatus>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,136 @@ pub enum DaemonAction {
     AlwaysDisown,
     /// Persist hiding this warning, while retaining current ownership policy.
     NeverShowAgain,
+    /// Retry connection and protocol negotiation without stopping a daemon.
+    Retry,
+    /// Stop and restart only the daemon owned by this backend.
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStatus {
+    Absent,
+    Spawning,
+    Connecting,
+    Negotiating,
+    Incompatible,
+    Degraded,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnRequest {
+    pub prompt: String,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl TurnRequest {
+    pub fn new(prompt: String, session_id: Option<String>) -> Self {
+        Self {
+            prompt,
+            session_id,
+            ..Self::default()
+        }
+    }
+
+    pub fn apply(&mut self, action: PickerAction) {
+        match action {
+            PickerAction::SelectModel(model) => self.model = Some(model),
+            PickerAction::SelectAgent(agent) => self.agent = Some(agent),
+            PickerAction::ToggleFavorite(_)
+            | PickerAction::RecordRecentModel(_)
+            | PickerAction::OpenAgents
+            | PickerAction::OpenModels
+            | PickerAction::Dismiss => {}
+        }
+    }
+
+    pub fn into_params(self, cwd: String, default_model: String) -> TurnStartParams {
+        TurnStartParams {
+            model: self.model.unwrap_or(default_model),
+            prompt: self.prompt,
+            session_id: self.session_id,
+            cwd: Some(cwd),
+            agent: self.agent,
+            task_tier: None,
+            autonomous: None,
+            action: Some(RequestAction::Submit),
+            idempotency_key: IdempotencyKey::new(format!(
+                "gui-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            )),
+        }
+    }
+}
+
+/// Facts currently known by the backend for sidebar/view-model consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackendSnapshot {
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub session: SessionSnapshot,
+    pub cwd: Option<String>,
+    pub plan: PlanSnapshot,
+    pub lsp: ServiceSnapshot,
+    pub usage: UsageSnapshot,
+    pub mcp: ServiceSnapshot,
+    pub task: TaskSnapshot,
+    pub startup: StartupSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionSnapshot {
+    pub id: Option<String>,
+    pub state: SessionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionState {
+    #[default]
+    Unavailable,
+    Connected,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanSnapshot {
+    pub name: Option<String>,
+    pub current_step: Option<String>,
+    pub airtight: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceSnapshot {
+    pub available: Option<bool>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageSnapshot {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskSnapshot {
+    pub tier: Option<u8>,
+    pub autonomous: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StartupSnapshot {
+    #[default]
+    Loading,
+    Ready,
+    Unavailable,
+    Error(String),
 }
 
 /// Ownership is explicit: a daemon found before connection is never stopped;
@@ -69,6 +204,16 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    /// Return configured agent identifiers from the daemon's shared config
+    /// schema. The current protocol has no catalog/list RPC, so this explicit
+    /// typed boundary avoids inferring agents from rendered labels while
+    /// selections still cross `TurnStartParams.agent` unchanged.
+    pub fn configured_agents() -> Vec<crate::picker::AgentOption> {
+        tau_core::config::Config::load()
+            .map(configured_agent_options)
+            .unwrap_or_default()
+    }
+
     pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, bool, String, String)> {
         let daemon = ensure_daemon(socket).await?;
         let auto_started = daemon.is_some();
@@ -92,6 +237,11 @@ impl Backend {
             .ok()
             .and_then(|config| config.model)
             .unwrap_or_else(|| "openai/gpt-4o".into());
+        let model = crate::preferences::path()
+            .ok()
+            .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
+            .and_then(|preferences| preferences.selected_model)
+            .unwrap_or(model);
         Ok((
             daemon,
             auto_started,
@@ -119,6 +269,11 @@ impl Backend {
         cwd: String,
         model: String,
     ) -> Self {
+        let initial_status = if daemon.is_some() {
+            DaemonStatus::Spawning
+        } else {
+            DaemonStatus::Absent
+        };
         Self {
             socket,
             cwd,
@@ -127,13 +282,51 @@ impl Backend {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             active: Arc::new(Mutex::new(None)),
             active_turn: Arc::new(Mutex::new(None)),
+            response_context: Arc::new(Mutex::new(None)),
             _daemon: Arc::new(Mutex::new(daemon)),
             auto_started,
+            status: Arc::new(Mutex::new(initial_status)),
         }
     }
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Apply a picker event using its stable identifier, and persist GUI-only
+    /// state.  Presentation labels are deliberately not interpreted here.
+    pub fn apply_picker_action(&mut self, action: PickerAction) -> Result<()> {
+        let path = crate::preferences::path()?;
+        let mut preferences = crate::preferences::GuiPreferences::load_from(&path)?;
+        match action {
+            PickerAction::SelectModel(model) => {
+                self.model = model.clone();
+                preferences.select_model(model);
+            }
+            PickerAction::SelectAgent(agent) => preferences.select_agent(agent),
+            PickerAction::ToggleFavorite(model) => preferences.toggle_favorite(model),
+            PickerAction::RecordRecentModel(model) => preferences.record_recent_model(model),
+            PickerAction::OpenAgents | PickerAction::OpenModels | PickerAction::Dismiss => {
+                anyhow::bail!("non-persistent picker action passed to backend")
+            }
+        }
+        preferences.save_to(&path)
+    }
+
+    pub fn select_model(&mut self, model: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::SelectModel(model.into()))
+    }
+
+    pub fn select_agent(&mut self, agent: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::SelectAgent(agent.into()))
+    }
+
+    pub fn toggle_favorite(&mut self, model: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::ToggleFavorite(model.into()))
+    }
+
+    pub fn record_recent_model(&mut self, model: impl Into<String>) -> Result<()> {
+        self.apply_picker_action(PickerAction::RecordRecentModel(model.into()))
     }
 
     pub fn cwd(&self) -> &str {
@@ -147,6 +340,48 @@ impl Backend {
                 .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
                 .map(|preferences| preferences.daemon_warning)
                 .unwrap_or(true)
+    }
+
+    pub fn daemon_status(&self) -> DaemonStatus {
+        self.status
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(DaemonStatus::Failed)
+    }
+
+    /// Return known backend facts without probing or inventing server state.
+    pub fn operational_snapshot(&self) -> BackendSnapshot {
+        let active = self
+            .active_turn
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|(_, session_id, _)| session_id.clone()));
+        let session = self.session.try_lock().ok();
+        let connected = session.as_ref().is_some_and(|guard| guard.is_some());
+        BackendSnapshot {
+            model: Some(self.model.clone()),
+            session: SessionSnapshot {
+                id: active.clone(),
+                state: if active.is_some() {
+                    SessionState::Active
+                } else if connected {
+                    SessionState::Connected
+                } else {
+                    SessionState::Unavailable
+                },
+            },
+            cwd: Some(self.cwd.clone()),
+            startup: if connected {
+                StartupSnapshot::Ready
+            } else {
+                StartupSnapshot::Unavailable
+            },
+            ..BackendSnapshot::default()
+        }
+    }
+
+    pub fn snapshot(&self) -> BackendSnapshot {
+        self.operational_snapshot()
     }
 
     /// Apply one of the five ownership decisions. Existing daemons are never
@@ -166,6 +401,31 @@ impl Backend {
             if let Ok(mut daemon) = self._daemon.lock() {
                 daemon.take();
             }
+        }
+        if matches!(action, DaemonAction::Retry) {
+            let session = self.session.clone();
+            self.runtime.spawn(async move {
+                *session.lock().await = None;
+            });
+            self.status
+                .lock()
+                .map(|mut s| *s = DaemonStatus::Connecting)
+                .ok();
+        }
+        if matches!(action, DaemonAction::Restart) {
+            if let Ok(mut daemon) = self._daemon.lock() {
+                if let Some(mut child) = daemon.take() {
+                    stop_child(&mut child);
+                }
+            }
+            let session = self.session.clone();
+            self.runtime.spawn(async move {
+                *session.lock().await = None;
+            });
+            self.status
+                .lock()
+                .map(|mut s| *s = DaemonStatus::Absent)
+                .ok();
         }
     }
 
@@ -201,30 +461,84 @@ impl Backend {
         let model = model.unwrap_or_else(|| self.model.clone());
         let session = self.session.clone();
         let active_turn = self.active_turn.clone();
+        let response_context = self.response_context.clone();
+        let status = self.status.clone();
+        let failed_session = session.clone();
+        let daemon = self._daemon.clone();
         self.cancel();
         let task = self.runtime.spawn(async move {
             let result = async {
                 let mut guard = session.lock().await;
                 if guard.is_none() {
-                    *guard = Some(tau_client::Client::connect(&socket).await?);
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Connecting)
+                        .ok();
+                    *guard = Some(connect_or_start(&socket, &daemon).await?);
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Negotiating)
+                        .ok();
+                    let report = match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        guard
+                            .as_ref()
+                            .expect("session initialized")
+                            .negotiate_checked(ProtocolNegotiateParams {
+                                version: ProtocolVersion { major: 1, minor: 0 },
+                                capabilities: vec![
+                                    Capability::TurnStreaming,
+                                    Capability::TurnCancellation,
+                                    Capability::Idempotency,
+                                    Capability::EventReplay,
+                                ],
+                            }),
+                    )
+                    .await
+                    .context("protocol negotiation timed out")?
+                    {
+                        Ok(report) => report,
+                        Err(error) => {
+                            status
+                                .lock()
+                                .map(|mut s| *s = DaemonStatus::Incompatible)
+                                .ok();
+                            guard.take();
+                            return Err(error);
+                        }
+                    };
+                    if report.compatibility == tau_client::ProtocolCompatibility::Incompatible {
+                        status
+                            .lock()
+                            .map(|mut s| *s = DaemonStatus::Incompatible)
+                            .ok();
+                        guard.take();
+                        anyhow::bail!(
+                            "daemon protocol incompatible; missing {:?}",
+                            report.missing_capabilities
+                        );
+                    }
+                    status
+                        .lock()
+                        .map(|mut s| {
+                            *s = if report.compatibility
+                                == tau_client::ProtocolCompatibility::Degraded
+                            {
+                                DaemonStatus::Degraded
+                            } else {
+                                DaemonStatus::Ready
+                            }
+                        })
+                        .ok();
                 }
                 let client = guard.as_mut().expect("session initialized");
-                let params = TurnStartParams {
-                    model,
+                let params = TurnRequest {
                     prompt,
                     session_id,
-                    cwd: Some(cwd),
+                    model: Some(model),
                     agent,
-                    task_tier: None,
-                    autonomous: None,
-                    action: Some(RequestAction::Submit),
-                    idempotency_key: IdempotencyKey::new(format!(
-                        "gui-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_nanos())
-                    )),
-                };
+                }
+                .into_params(cwd, String::new());
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
@@ -233,11 +547,15 @@ impl Backend {
                             &sequenced.event
                         {
                             if let Ok(mut active) = active_turn.lock() {
-                                *active = Some((
+                                let context = (
                                     client.clone(),
                                     sequenced.session_id.clone(),
                                     turn_id.clone(),
-                                ));
+                                );
+                                *active = Some(context.clone());
+                                if let Ok(mut response) = response_context.lock() {
+                                    *response = Some(context);
+                                }
                             }
                         }
                     }
@@ -256,6 +574,14 @@ impl Backend {
             }
             .await;
             if let Err(error) = result {
+                *failed_session.lock().await = None;
+                if status
+                    .lock()
+                    .map(|s| *s != DaemonStatus::Incompatible)
+                    .unwrap_or(true)
+                {
+                    status.lock().map(|mut s| *s = DaemonStatus::Failed).ok();
+                }
                 let _ = sender.send(Err(error.to_string()));
             }
         });
@@ -293,6 +619,49 @@ impl Backend {
         }
     }
 
+    /// Submit an interactive decision on the typed response channel. The
+    /// transcript card is only a projection; acknowledgement belongs to the
+    /// daemon and is not faked by the view.
+    pub fn respond(
+        &self,
+        response: ClientResponse,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let response_context = self.response_context.clone();
+        self.runtime.spawn(async move {
+            let (kind, request_id) = match &response {
+                ClientResponse::Permission { request_id, .. } => {
+                    ("permission", request_id.as_str())
+                }
+                ClientResponse::Question { question_id, .. } => ("question", question_id.as_str()),
+                ClientResponse::DiffHunk { request_id, .. } => ("diff", request_id.as_str()),
+            };
+            let active = response_context.lock().ok().and_then(|value| value.clone());
+            let result = if let Some((client, session_id, turn_id)) = active {
+                client
+                    .turn_response(TurnResponseParams {
+                        session_id,
+                        turn_id,
+                        idempotency_key: IdempotencyKey::new(format!(
+                            "gui-response-{kind}-{request_id}"
+                        )),
+                        response,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|ack| {
+                        ack.accepted
+                            .then_some(())
+                            .ok_or_else(|| "daemon rejected interactive response".to_string())
+                    })
+            } else {
+                Err("no active turn for interactive response".to_string())
+            };
+            let _ = sender.send(result);
+        });
+        receiver
+    }
+
     pub fn replay(
         &self,
         session_id: String,
@@ -300,9 +669,63 @@ impl Backend {
     ) -> tokio::sync::oneshot::Receiver<Result<tau_proto::prelude::TurnReplayResult, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let socket = self.socket.clone();
+        let session = self.session.clone();
+        let status = self.status.clone();
+        let daemon = self._daemon.clone();
         self.runtime.spawn(async move {
             let result = async {
-                let client = tau_client::Client::connect(socket).await?;
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Connecting)
+                        .ok();
+                    *guard = Some(connect_or_start(&socket, &daemon).await?);
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Negotiating)
+                        .ok();
+                    let report = match guard
+                        .as_ref()
+                        .unwrap()
+                        .negotiate_checked(ProtocolNegotiateParams {
+                            version: ProtocolVersion { major: 1, minor: 0 },
+                            capabilities: vec![Capability::EventReplay],
+                        })
+                        .await
+                    {
+                        Ok(report) => report,
+                        Err(error) => {
+                            status
+                                .lock()
+                                .map(|mut s| *s = DaemonStatus::Incompatible)
+                                .ok();
+                            guard.take();
+                            return Err(error);
+                        }
+                    };
+                    if !report.is_usable() {
+                        status
+                            .lock()
+                            .map(|mut s| *s = DaemonStatus::Incompatible)
+                            .ok();
+                        guard.take();
+                        anyhow::bail!("daemon protocol incompatible")
+                    }
+                    status
+                        .lock()
+                        .map(|mut s| {
+                            *s = if report.compatibility
+                                == tau_client::ProtocolCompatibility::Degraded
+                            {
+                                DaemonStatus::Degraded
+                            } else {
+                                DaemonStatus::Ready
+                            }
+                        })
+                        .ok();
+                }
+                let client = guard.as_ref().unwrap();
                 client
                     .turn_replay(TurnReplayParams {
                         session_id,
@@ -317,6 +740,17 @@ impl Backend {
         });
         rx
     }
+}
+
+fn configured_agent_options(config: tau_core::config::Config) -> Vec<crate::picker::AgentOption> {
+    config
+        .agents
+        .into_iter()
+        .map(|(name, agent)| crate::picker::AgentOption {
+            name,
+            in_tab_cycle: agent.cycle,
+        })
+        .collect()
 }
 
 async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
@@ -339,6 +773,26 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
     }
     stop_child(&mut child);
     anyhow::bail!("daemon did not become ready at {}", socket.display())
+}
+
+async fn connect_or_start(
+    socket: &PathBuf,
+    owned_daemon: &Arc<Mutex<Option<Child>>>,
+) -> Result<tau_client::Client> {
+    match tau_client::Client::connect(socket).await {
+        Ok(client) => Ok(client),
+        Err(connect_error) => match ensure_daemon(socket).await? {
+            Some(child) => {
+                if let Ok(mut daemon) = owned_daemon.lock() {
+                    *daemon = Some(child);
+                }
+                tau_client::Client::connect(socket)
+                    .await
+                    .context("connecting to newly started tau daemon")
+            }
+            None => Err(connect_error),
+        },
+    }
 }
 
 async fn daemon_reachable(socket: &PathBuf) -> bool {
@@ -366,6 +820,28 @@ fn daemon_executable() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn snapshot_defaults_are_explicitly_unavailable() {
+        let snapshot = BackendSnapshot::default();
+        assert_eq!(snapshot.session.state, SessionState::Unavailable);
+        assert_eq!(snapshot.lsp.available, None);
+        assert_eq!(snapshot.usage.total_tokens, None);
+        assert!(matches!(snapshot.startup, StartupSnapshot::Loading));
+    }
+
+    #[test]
+    fn snapshot_preserves_unavailable_server_facts() {
+        let snapshot = BackendSnapshot {
+            model: None,
+            cwd: None,
+            startup: StartupSnapshot::Unavailable,
+            ..Default::default()
+        };
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.session.id, None);
+        assert_eq!(snapshot.plan.airtight, None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn owned_child_is_stopped_gracefully_before_force_fallback() {
@@ -389,5 +865,65 @@ mod tests {
             "test/model".into(),
         );
         drop(backend);
+    }
+
+    #[test]
+    fn fresh_backend_reports_absent_until_connection_is_negotiated() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let backend = Backend::from_parts(
+            PathBuf::from("/tmp/does-not-exist"),
+            runtime.handle().clone(),
+            None,
+            "/tmp".into(),
+            "test/model".into(),
+        );
+        assert_eq!(backend.daemon_status(), DaemonStatus::Absent);
+    }
+
+    #[test]
+    fn picker_actions_build_typed_turn_values() {
+        let mut request = TurnRequest::new("hello".into(), Some("session-1".into()));
+        request.apply(PickerAction::SelectModel("provider/model".into()));
+        request.apply(PickerAction::SelectAgent("build".into()));
+
+        let params = request.into_params("/tmp/project".into(), "fallback/model".into());
+        assert_eq!(params.model, "provider/model");
+        assert_eq!(params.agent.as_deref(), Some("build"));
+        assert_eq!(params.prompt, "hello");
+        assert_eq!(params.session_id.as_deref(), Some("session-1"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(params.action, Some(RequestAction::Submit));
+    }
+
+    #[test]
+    fn turn_request_uses_default_model_without_label_parsing() {
+        let params = TurnRequest::new("hello".into(), None)
+            .into_params("/tmp".into(), "default/model".into());
+        assert_eq!(params.model, "default/model");
+        assert_eq!(params.agent, None);
+    }
+
+    #[test]
+    fn configured_agent_boundary_preserves_server_configured_names_and_cycle_flags() {
+        let mut config = tau_core::config::Config::default();
+        config.agents.insert(
+            "reviewer".into(),
+            tau_core::config::AgentConfig {
+                cycle: true,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "archive".into(),
+            tau_core::config::AgentConfig {
+                cycle: false,
+                ..Default::default()
+            },
+        );
+        let agents = configured_agent_options(config);
+        assert_eq!(agents[0].name, "archive");
+        assert!(!agents[0].in_tab_cycle);
+        assert_eq!(agents[1].name, "reviewer");
+        assert!(agents[1].in_tab_cycle);
     }
 }

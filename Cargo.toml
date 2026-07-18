@@ -50,6 +50,7 @@ kdl = "6"
 ignore = "0.4"
 mime_guess = "2"
 regex = "1"
+unicode-segmentation = "1"
 sha1 = "0.10"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
@@ -57,8 +58,8 @@ fd-lock = "4"
 tempfile = "3"
 toml = "0.8"
 keyring = "3"
-rusqlite = { version = "0.40", features = ["bundled"] }
-rusqlite_migration = "2.6"
+rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite_migration = "2.5"
 uuid = { version = "1", features = ["v4"] }
 strum = { version = "0.28", features = ["derive"] }
 rig-core = { version = "0.40", features = ["test-utils"] }
