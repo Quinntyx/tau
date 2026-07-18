@@ -278,6 +278,135 @@ async fn websocket_protocol_negotiation_and_scripted_provider_round_trip() -> Re
 }
 
 #[tokio::test]
+async fn typed_git_operations_are_contained_and_safe() -> Result<()> {
+    let git = fixtures::GitFixture::new()?;
+    let fixture = fixtures::ServerFixture::start().await?;
+    let client = fixtures::client(&fixture).await?;
+    let project = git.root.to_string_lossy().into_owned();
+
+    let status = client
+        .git_status(GitStatusParams {
+            project: project.clone(),
+        })
+        .await?;
+    assert_eq!(status.branch, "master");
+    assert!(status.files.is_empty());
+
+    std::fs::write(git.root.join("tracked.txt"), "changed\n")?;
+    let file = client
+        .git_file(GitFileParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+        })
+        .await?;
+    assert_eq!(file.content, "changed\n");
+    assert!(file.diff.contains("-base"));
+    assert!(
+        client
+            .git_stage(GitPathParams {
+                project: project.clone(),
+                path: "tracked.txt".into(),
+            })
+            .await?
+            .acknowledged
+    );
+    assert!(
+        client
+            .git_status(GitStatusParams {
+                project: project.clone(),
+            })
+            .await?
+            .files[0]
+            .staged
+    );
+    client
+        .git_unstage(GitPathParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+        })
+        .await?;
+
+    client
+        .git_revert(GitRevertParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+            confirmed: true,
+        })
+        .await?;
+    assert_eq!(
+        std::fs::read_to_string(git.root.join("tracked.txt"))?,
+        "base\n"
+    );
+
+    client
+        .git_branch_create(GitBranchCreateParams {
+            project: project.clone(),
+            name: "feature".into(),
+        })
+        .await?;
+    assert!(
+        client
+            .git_branches(GitBranchesParams {
+                project: project.clone(),
+            })
+            .await?
+            .branches
+            .iter()
+            .any(|branch| branch.name == "feature")
+    );
+    std::fs::write(git.root.join("tracked.txt"), "dirty\n")?;
+    assert!(
+        client
+            .git_branch_switch(GitBranchSwitchParams {
+                project: project.clone(),
+                name: "feature".into(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .git_revert(GitRevertParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+            confirmed: true,
+        })
+        .await?;
+    client
+        .git_branch_switch(GitBranchSwitchParams {
+            project: project.clone(),
+            name: "feature".into(),
+        })
+        .await?;
+
+    assert!(
+        client
+            .git_file(GitFileParams {
+                project: project.clone(),
+                path: "../outside".into(),
+            })
+            .await
+            .is_err()
+    );
+    let first = client
+        .git_ack(GitAckParams {
+            project: project.clone(),
+            operation: "revert".into(),
+            acknowledged: false,
+        })
+        .await?;
+    let second = client
+        .git_ack(GitAckParams {
+            project,
+            operation: "revert".into(),
+            acknowledged: true,
+        })
+        .await?;
+    assert_eq!(first, second);
+    fixture.task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_and_lsp_scripted_processes_support_discovery_restart_and_queries() -> Result<()> {
     let script = fixtures::StdioScript::new()?;
     let mut mcp = tau_core::integrations::McpClient::connect(script.mcp_config()).await?;

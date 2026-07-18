@@ -2,6 +2,7 @@
 //! thin; all interesting behaviour lives in typed state and renderable components.
 mod adapter;
 pub mod components;
+pub mod operations;
 pub mod reducer;
 pub mod state;
 

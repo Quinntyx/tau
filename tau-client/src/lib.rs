@@ -347,6 +347,58 @@ impl Client {
     pub async fn health(&self) -> Result<HealthResult> {
         serde_json::from_value(self.call0(METHOD_HEALTH).await?).context("decoding health result")
     }
+
+    /// Return the working-tree status for a project.
+    pub async fn git_status(&self, params: GitStatusParams) -> Result<GitStatusResult> {
+        serde_json::from_value(self.call(METHOD_GIT_STATUS, Some(params)).await?)
+            .context("decoding git status result")
+    }
+
+    /// Fetch both the complete file contents and its current diff.
+    pub async fn git_file(&self, params: GitFileParams) -> Result<GitFileResult> {
+        serde_json::from_value(self.call(METHOD_GIT_FILE, Some(params)).await?)
+            .context("decoding git file result")
+    }
+
+    pub async fn git_stage(&self, params: GitPathParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_STAGE, Some(params)).await?)
+            .context("decoding git stage acknowledgement")
+    }
+
+    pub async fn git_unstage(&self, params: GitPathParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_UNSTAGE, Some(params)).await?)
+            .context("decoding git unstage acknowledgement")
+    }
+
+    /// Revert a file only when the caller explicitly confirms the operation.
+    pub async fn git_revert(&self, params: GitRevertParams) -> Result<GitAckResult> {
+        if !params.validate() {
+            anyhow::bail!("git revert requires explicit confirmation and a safe project path");
+        }
+        serde_json::from_value(self.call(METHOD_GIT_REVERT, Some(params)).await?)
+            .context("decoding git revert acknowledgement")
+    }
+
+    pub async fn git_ack(&self, params: GitAckParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_ACK, Some(params)).await?)
+            .context("decoding git acknowledgement")
+    }
+
+    pub async fn git_branches(&self, params: GitBranchesParams) -> Result<GitBranchesResult> {
+        serde_json::from_value(self.call(METHOD_GIT_BRANCHES, Some(params)).await?)
+            .context("decoding git branches result")
+    }
+
+    pub async fn git_branch_create(&self, params: GitBranchCreateParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_BRANCH_CREATE, Some(params)).await?)
+            .context("decoding git branch create acknowledgement")
+    }
+
+    pub async fn git_branch_switch(&self, params: GitBranchSwitchParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_BRANCH_SWITCH, Some(params)).await?)
+            .context("decoding git branch switch acknowledgement")
+    }
+
     pub async fn permission_reply(&self, params: PermissionReply) -> Result<serde_json::Value> {
         self.call(METHOD_PERMISSION_REPLY, Some(params)).await
     }

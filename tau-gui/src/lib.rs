@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod chat;
 pub mod input;
+pub mod operations;
 pub mod picker;
 pub mod preferences;
 pub mod view;

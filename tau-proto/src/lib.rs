@@ -11,6 +11,7 @@
 pub mod completion;
 pub mod constants;
 pub mod envelope;
+pub mod git;
 pub mod health;
 pub mod ping;
 pub mod policy;

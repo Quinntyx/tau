@@ -36,7 +36,51 @@ pub struct IntegrationPreview {
 pub struct GitWorkspace {
     pub manifest: RepositoryManifest,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitFileStatus {
+    pub path: String,
+    pub staged: bool,
+    pub modified: bool,
+    pub untracked: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitStatus {
+    pub branch: String,
+    pub revision: String,
+    pub files: Vec<GitFileStatus>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitFile {
+    pub path: String,
+    pub content: String,
+    pub diff: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBranch {
+    pub name: String,
+    pub current: bool,
+}
 impl GitWorkspace {
+    /// Open an existing project without creating metadata or changing it.
+    ///
+    /// Daemon requests use this constructor so repository operations remain in
+    /// the core service rather than leaking filesystem/Git access into a UI or
+    /// transport crate.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = std::fs::canonicalize(root.into()).context("canonicalizing project root")?;
+        if !root.is_dir() {
+            bail!("project root is not a directory")
+        }
+        Ok(Self {
+            manifest: RepositoryManifest {
+                root: root.clone(),
+                topology: GitTopology::Direct,
+                children: Vec::new(),
+                tau_metadata: root.join(".tau/metadata.git"),
+            },
+        })
+    }
+
     pub fn initialize(
         root: impl Into<PathBuf>,
         topology: GitTopology,
@@ -112,6 +156,155 @@ impl GitWorkspace {
             path: folder,
             repository: repository.to_path_buf(),
         })
+    }
+    fn project(&self, project: &Path) -> Result<PathBuf> {
+        let root = std::fs::canonicalize(&self.manifest.root).with_context(|| {
+            format!(
+                "canonicalizing project root {}",
+                self.manifest.root.display()
+            )
+        })?;
+        let path = if project.is_absolute() {
+            project.to_path_buf()
+        } else {
+            root.join(project)
+        };
+        let resolved = std::fs::canonicalize(&path)
+            .with_context(|| format!("canonicalizing project path {}", path.display()))?;
+        if resolved != root && !resolved.starts_with(&root) {
+            bail!("project path is outside workspace")
+        }
+        Ok(resolved)
+    }
+    fn file_path(&self, project: &Path, path: &Path) -> Result<(PathBuf, String)> {
+        if path.is_absolute() {
+            bail!("file path must be relative")
+        }
+        let project = self.project(project)?;
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            bail!("file path traversal is not allowed")
+        }
+        let full = project.join(path);
+        let canonical = if full.exists() {
+            std::fs::canonicalize(&full)?
+        } else {
+            let parent = full.parent().context("file has no parent")?;
+            std::fs::canonicalize(parent)?.join(full.file_name().context("empty file path")?)
+        };
+        if canonical != project && !canonical.starts_with(&project) {
+            bail!("file path is outside project")
+        }
+        Ok((canonical, path.to_string_lossy().into_owned()))
+    }
+    pub fn status(&self, project: &Path) -> Result<GitStatus> {
+        let project = self.project(project)?;
+        let branch =
+            String::from_utf8_lossy(&git_output(&project, &["branch", "--show-current"])?.stdout)
+                .trim()
+                .into();
+        let revision =
+            String::from_utf8_lossy(&git_output(&project, &["rev-parse", "HEAD"])?.stdout)
+                .trim()
+                .into();
+        let raw = git_output(&project, &["status", "--porcelain=v1", "-z"])?.stdout;
+        let files = raw
+            .split(|b| *b == 0)
+            .filter(|x| !x.is_empty())
+            .filter_map(|x| {
+                let text = String::from_utf8_lossy(x);
+                let mut chars = text.chars();
+                let staged = chars.next().map(|c| c != ' ' && c != '?').unwrap_or(false);
+                let modified = chars.next().map(|c| c != ' ' && c != '?').unwrap_or(false);
+                let untracked = text.starts_with("??");
+                let path = text.get(3..).unwrap_or("").to_owned();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(GitFileStatus {
+                        path,
+                        staged,
+                        modified,
+                        untracked,
+                    })
+                }
+            })
+            .collect();
+        Ok(GitStatus {
+            branch,
+            revision,
+            files,
+        })
+    }
+    pub fn file(&self, project: &Path, path: &Path) -> Result<GitFile> {
+        let (full, display) = self.file_path(project, path)?;
+        let repo = self.project(project)?;
+        let content = std::fs::read_to_string(&full)
+            .with_context(|| format!("reading {}", full.display()))?;
+        let diff =
+            String::from_utf8_lossy(&git_output(&repo, &["diff", "HEAD", "--", &display])?.stdout)
+                .into_owned();
+        Ok(GitFile {
+            path: display,
+            content,
+            diff,
+        })
+    }
+    pub fn stage(&self, project: &Path, path: &Path) -> Result<()> {
+        let (_, p) = self.file_path(project, path)?;
+        let repo = self.project(project)?;
+        git(&repo, &["add", "--", &p])?;
+        Ok(())
+    }
+    pub fn unstage(&self, project: &Path, path: &Path) -> Result<()> {
+        let (_, p) = self.file_path(project, path)?;
+        let repo = self.project(project)?;
+        git(&repo, &["restore", "--staged", "--", &p])?;
+        Ok(())
+    }
+    pub fn revert(&self, project: &Path, path: &Path, confirmed: bool) -> Result<()> {
+        if !confirmed {
+            bail!("revert requires explicit confirmation")
+        }
+        let (_, p) = self.file_path(project, path)?;
+        let repo = self.project(project)?;
+        git(&repo, &["restore", "--source=HEAD", "--staged", "--", &p])?;
+        git(&repo, &["restore", "--", &p])?;
+        Ok(())
+    }
+    pub fn branches(&self, project: &Path) -> Result<Vec<GitBranch>> {
+        let repo = self.project(project)?;
+        let current =
+            String::from_utf8_lossy(&git_output(&repo, &["branch", "--show-current"])?.stdout)
+                .trim()
+                .to_owned();
+        let output = git_output(
+            &repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        )?;
+        let names = String::from_utf8_lossy(&output.stdout);
+        Ok(names
+            .lines()
+            .map(|name| GitBranch {
+                name: name.into(),
+                current: name == current,
+            })
+            .collect())
+    }
+    pub fn create_branch(&self, project: &Path, name: &str) -> Result<()> {
+        validate_branch(name)?;
+        let repo = self.project(project)?;
+        git(&repo, &["branch", name])?;
+        Ok(())
+    }
+    pub fn switch_branch(&self, project: &Path, name: &str) -> Result<()> {
+        validate_branch(name)?;
+        let repo = self.project(project)?;
+        ensure_clean(&repo, "switching branch")?;
+        git(&repo, &["switch", name])?;
+        Ok(())
     }
     pub fn stage_tau_touched(&self, repository: &Path, paths: &[PathBuf]) -> Result<()> {
         for p in paths {
@@ -241,6 +434,21 @@ fn branch_exists(path: &Path, branch: &str) -> bool {
     )
     .is_ok()
 }
+fn validate_branch(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.contains("..")
+        || name.contains(' ')
+        || name.contains('~')
+        || name.contains('^')
+        || name.contains(':')
+        || name.contains('\\')
+        || name.ends_with('/')
+    {
+        bail!("invalid branch name")
+    }
+    Ok(())
+}
 fn git(path: &Path, args: &[&str]) -> Result<std::process::Output> {
     let out = Command::new("git")
         .arg("-C")
@@ -269,6 +477,13 @@ mod tests {
         assert_eq!(managed_name("Claude Sonnet/4"), "tau/claude-sonnet-4");
         assert_eq!(managed_name("!!!"), "tau/model");
         assert!(managed_name(&"x".repeat(200)).len() <= 68);
+    }
+    #[test]
+    fn branch_names_reject_git_argument_injection_and_ambiguous_names() {
+        assert!(validate_branch("feature/topic").is_ok());
+        assert!(validate_branch("-c").is_err());
+        assert!(validate_branch("feature..topic").is_err());
+        assert!(validate_branch("feature\\topic").is_err());
     }
     #[test]
     fn topologies_initialize_without_touching_user_branches() {
