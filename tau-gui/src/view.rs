@@ -6,21 +6,34 @@ use tau_client::TurnStreamEvent;
 
 use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
-use crate::input::TextInput;
+use crate::input::{TextInput, command_mode};
+use crate::picker::{
+    AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
+    next_agent, parse_command,
+};
 
-gpui::actions!(tau_view, [Submit, SwitchAgent, CycleModel]);
+gpui::actions!(
+    tau_view,
+    [
+        Submit,
+        SwitchAgent,
+        CycleModel,
+        DismissPicker,
+        PickerUp,
+        PickerDown,
+        PickItem
+    ]
+);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("enter", Submit, None),
         KeyBinding::new("tab", SwitchAgent, None),
+        KeyBinding::new("escape", DismissPicker, None),
+        KeyBinding::new("up", PickerUp, None),
+        KeyBinding::new("down", PickerDown, None),
+        KeyBinding::new("enter", PickItem, Some("Picker")),
     ]);
-}
-
-#[derive(Clone, Copy)]
-enum AgentMode {
-    Plan,
-    Code,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,60 +44,90 @@ enum RuntimeState {
     Failed(String),
 }
 
-impl AgentMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Plan => "Plan",
-            Self::Code => "Code",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Plan => Self::Code,
-            Self::Code => Self::Plan,
-        }
-    }
-}
-
 pub struct TauView {
     input: Entity<TextInput>,
+    picker_input: Entity<TextInput>,
     backend: Backend,
     chat: ChatState,
     task: Option<Task<()>>,
-    agent: AgentMode,
+    agent: String,
     toast_visible: bool,
     model_index: usize,
     models: Vec<String>,
     sidebar_visible: bool,
     runtime: RuntimeState,
+    picker: Option<PickerKind>,
+    picker_index: usize,
+    agents: Vec<AgentOption>,
+    preferences: crate::preferences::GuiPreferences,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    Model,
+    Agent,
+    Command,
 }
 
 impl TauView {
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
+        let picker_input = cx.new(TextInput::new);
         let toast_visible = backend.auto_started();
         let preferences = crate::preferences::path()
             .ok()
             .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
             .unwrap_or_default();
-        let models = preferences
+        // Preferences annotate the catalog; they are not the catalog.  Always
+        // retain the configured backend model and every configured preference
+        // entry so a recent/favorite flag cannot hide otherwise valid models.
+        let mut models = vec![backend.model().to_owned()];
+        for model in preferences
             .favorites
             .iter()
             .chain(preferences.recent_models.iter())
-            .cloned()
-            .collect();
+            .chain(preferences.selected_model.iter())
+        {
+            if !models.iter().any(|candidate| candidate == model) {
+                models.push(model.clone());
+            }
+        }
+        let selected_model = preferences.selected_model.clone();
+        let selected_agent = preferences.selected_agent.clone();
+        let default_model = backend.model().to_owned();
+        let models = models;
+        let model_index = selected_model
+            .as_ref()
+            .and_then(|model| models.iter().position(|candidate| candidate == model))
+            .unwrap_or(0);
+        let agent = selected_agent.unwrap_or_default();
+        let mut agents = Backend::configured_agents();
+        if !agent.is_empty() && !agents.iter().any(|candidate| candidate.name == agent) {
+            agents.push(AgentOption {
+                name: agent.clone(),
+                in_tab_cycle: true,
+            });
+        }
         Self {
             input,
+            picker_input,
             backend,
             chat: ChatState::default(),
             task: None,
-            agent: AgentMode::Code,
+            agent: agent.clone(),
             toast_visible,
-            model_index: 0,
-            models,
+            model_index,
+            models: if models.is_empty() {
+                vec![selected_model.unwrap_or(default_model)]
+            } else {
+                models
+            },
             sidebar_visible: preferences.sidebar,
             runtime: RuntimeState::NotNegotiated,
+            picker: None,
+            picker_index: 0,
+            agents,
+            preferences,
         }
     }
 
@@ -97,16 +140,135 @@ impl TauView {
     }
 
     fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
-        self.agent = self.agent.next();
+        if let Some(next) = next_agent(&self.agents, Some(&self.agent), false) {
+            self.select_agent(next);
+        }
         self.chat.status = ChatStatus::Ready;
         cx.notify();
     }
 
-    fn cycle_model(&mut self, _: &CycleModel, _: &mut Window, cx: &mut Context<Self>) {
+    fn cycle_model(&mut self, _: &CycleModel, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerKind::Model, window, cx);
         if !self.models.is_empty() {
             self.model_index = (self.model_index + 1) % self.models.len();
         }
         cx.notify();
+    }
+
+    fn open_picker(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = Some(kind);
+        self.picker_index = 0;
+        self.picker_input.update(cx, |input, _| input.reset());
+        if kind != PickerKind::Command {
+            window.focus(&self.picker_input.focus_handle(cx));
+        }
+    }
+    fn dismiss_picker(&mut self, _: &DismissPicker, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            self.picker = None;
+            self.picker_input.update(cx, |input, _| input.reset());
+        } else if command_mode(&self.input.read(cx).content()) {
+            self.input.update(cx, |input, _| input.reset());
+        }
+        cx.notify();
+    }
+    fn picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let query = if self.picker == Some(PickerKind::Command) || self.picker.is_none() {
+            self.input.read(cx).content()
+        } else {
+            self.picker_input.read(cx).content()
+        };
+        let count = self.picker_items(&query).len();
+        if count > 0 {
+            self.picker_index =
+                (self.picker_index as isize + delta).rem_euclid(count as isize) as usize;
+            cx.notify();
+        }
+    }
+    fn picker_up(&mut self, _: &PickerUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.picker_move(-1, cx);
+    }
+    fn picker_down(&mut self, _: &PickerDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.picker_move(1, cx);
+    }
+    fn picker_items(&self, query: &str) -> Vec<String> {
+        self.picker_items_for(self.picker.unwrap_or(PickerKind::Command), query)
+    }
+
+    fn picker_items_for(&self, kind: PickerKind, query: &str) -> Vec<String> {
+        match kind {
+            PickerKind::Model => {
+                let options = self.model_options();
+                crate::picker::fuzzy_models(&options, query)
+                    .into_iter()
+                    .map(|model| model.id)
+                    .collect()
+            }
+            PickerKind::Agent => self
+                .agents
+                .iter()
+                .filter(|a| {
+                    query.is_empty() || a.name.to_lowercase().contains(&query.to_lowercase())
+                })
+                .map(|a| a.name.clone())
+                .collect(),
+            PickerKind::Command => command_suggestions(query, &self.agents, &self.model_options()),
+        }
+    }
+    fn pick_item(&mut self, _: &PickItem, _: &mut Window, cx: &mut Context<Self>) {
+        let kind = self.picker.unwrap_or(PickerKind::Command);
+        let query = if kind == PickerKind::Command {
+            self.input.read(cx).content()
+        } else {
+            self.picker_input.read(cx).content()
+        };
+        let items = self.picker_items_for(kind, &query);
+        if let Some(item) = items.get(self.picker_index).cloned() {
+            match kind {
+                PickerKind::Model => self.select_model(item),
+                PickerKind::Agent => self.select_agent(item),
+                PickerKind::Command => self.accept_command(item, &query, cx),
+            }
+        }
+        self.picker = None;
+        self.picker_input.update(cx, |input, _| input.reset());
+        cx.notify();
+    }
+    fn click_model(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerKind::Model, window, cx);
+        cx.notify();
+    }
+    fn click_agent(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker(PickerKind::Agent, window, cx);
+        cx.notify();
+    }
+
+    fn model_options(&self) -> Vec<ModelOption> {
+        self.models
+            .iter()
+            .map(|id| {
+                ModelOption::from_id(
+                    id,
+                    self.preferences.recent_models.contains(id),
+                    self.preferences.favorites.contains(id),
+                )
+            })
+            .collect()
+    }
+
+    fn accept_command(&mut self, item: String, query: &str, cx: &mut Context<Self>) {
+        let value = if item.starts_with('/') {
+            format!("{item} ")
+        } else if query.trim_end() == query {
+            let start = query
+                .rfind(char::is_whitespace)
+                .map_or(0, |index| index + 1);
+            format!("{}{}", &query[..start], item)
+        } else {
+            format!("{query}{item}")
+        };
+        self.input.update(cx, |input, _| input.set_content(value));
+        self.picker = None;
     }
 
     fn toggle_tool(
@@ -217,6 +379,28 @@ impl TauView {
         if prompt.trim().is_empty() {
             return;
         }
+        if let Some(command) = parse_command(&prompt) {
+            if let Some(action) = command_action(command) {
+                match action {
+                    PickerAction::OpenModels => self.open_picker(PickerKind::Model, window, cx),
+                    PickerAction::OpenAgents => self.open_picker(PickerKind::Agent, window, cx),
+                    PickerAction::SelectModel(model) => self.select_model(model),
+                    PickerAction::SelectAgent(agent) => self.select_agent(agent),
+                    PickerAction::ToggleFavorite(model) => {
+                        let _ = self.backend.toggle_favorite(model.clone());
+                        self.preferences.toggle_favorite(model);
+                    }
+                    PickerAction::RecordRecentModel(model) => {
+                        let _ = self.backend.record_recent_model(model.clone());
+                        self.preferences.record_recent_model(model);
+                    }
+                    PickerAction::Dismiss => self.picker = None,
+                }
+                self.input.update(cx, |input, _| input.reset());
+                cx.notify();
+                return;
+            }
+        }
         self.input.update(cx, |input, _| {
             input.record_submission(prompt.clone());
             input.reset();
@@ -231,7 +415,7 @@ impl TauView {
         let receiver = self.backend.turn_with_options(
             prompt,
             self.chat.session_id.clone(),
-            Some(self.agent.label().into()),
+            (!self.agent.is_empty()).then(|| self.agent.clone()),
             selected_model,
         );
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -246,6 +430,175 @@ impl TauView {
                 }
             }
         }));
+    }
+
+    fn select_model(&mut self, model: String) {
+        if let Some(index) = self.models.iter().position(|value| value == &model) {
+            self.model_index = index;
+        }
+        self.preferences.selected_model = Some(model.clone());
+        self.preferences.record_recent_model(model);
+        let _ = self
+            .backend
+            .select_model(self.preferences.selected_model.clone().unwrap_or_default());
+        let _ = self.preferences.save();
+    }
+
+    fn select_agent(&mut self, agent: String) {
+        self.agent = agent.clone();
+        self.preferences.selected_agent = Some(agent);
+        if let Some(selected) = self.preferences.selected_agent.clone() {
+            let _ = self.backend.select_agent(selected);
+        }
+        let _ = self.preferences.save();
+    }
+
+    fn picker_overlay(&self, cx: &mut Context<Self>, kind: PickerKind) -> impl IntoElement {
+        let title = match kind {
+            PickerKind::Model => "Select model",
+            PickerKind::Agent => "Select agent",
+            PickerKind::Command => "Commands",
+        };
+        let query = if kind == PickerKind::Command {
+            self.input.read(cx).content()
+        } else {
+            self.picker_input.read(cx).content()
+        };
+        let items = self.picker_items_for(kind, &query);
+        let rows: Vec<(String, Option<usize>)> = match kind {
+            PickerKind::Model => {
+                let mut rows = Vec::new();
+                for (provider, entries) in model_groups(&self.model_options(), &query) {
+                    rows.push((format!("{provider} · provider"), None));
+                    for model in entries {
+                        let index = items.iter().position(|item| item == &model.id);
+                        rows.push((
+                            format!(
+                                "{}{}",
+                                if model.favorite {
+                                    "★ "
+                                } else if model.recent {
+                                    "↻ "
+                                } else {
+                                    ""
+                                },
+                                model.id
+                            ),
+                            index,
+                        ));
+                    }
+                }
+                rows
+            }
+            PickerKind::Agent => self
+                .agents
+                .iter()
+                .filter(|a| {
+                    query.is_empty() || a.name.to_lowercase().contains(&query.to_lowercase())
+                })
+                .enumerate()
+                .map(|(index, a)| {
+                    (
+                        format!(
+                            "{}{}",
+                            a.name,
+                            if a.in_tab_cycle { "  · Tab cycle" } else { "" }
+                        ),
+                        Some(index),
+                    )
+                })
+                .collect(),
+            PickerKind::Command => items
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, item)| (item, Some(index)))
+                .collect(),
+        };
+        let search = if kind == PickerKind::Command {
+            div()
+                .mt_2()
+                .p_2()
+                .bg(rgb(0x11151b))
+                .child(format!("Command: {}", query))
+        } else {
+            div().mt_2().child(self.picker_input.clone())
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(0x66000000))
+            .child(
+                div()
+                    .key_context("Picker")
+                    .w(px(560.))
+                    .max_h(px(520.))
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(0x202630))
+                    .border_1()
+                    .border_color(rgb(0x52627a))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(title),
+                    )
+                    .child(search)
+                    .children(rows.into_iter().enumerate().map(
+                        |(display_index, (row, item_index))| {
+                            let selected = item_index == Some(self.picker_index);
+                            let favorite_model = (kind == PickerKind::Model)
+                                .then(|| item_index.and_then(|index| items.get(index).cloned()))
+                                .flatten();
+                            let mut row_view = div()
+                                .id(("picker-row", display_index))
+                                .mt_1()
+                                .p_2()
+                                .rounded_md()
+                                .when(selected, |d| d.bg(rgb(0x34506f)))
+                                .when(item_index.is_some(), |d| {
+                                    d.cursor_pointer().on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |view, _, window, cx| {
+                                            view.picker_index = item_index.unwrap_or(0);
+                                            view.pick_item(&PickItem, window, cx);
+                                        }),
+                                    )
+                                })
+                                .child(row);
+                            if let Some(model) = favorite_model {
+                                let favorite = self.preferences.favorites.contains(&model);
+                                row_view = row_view.child(
+                                    div()
+                                        .ml_auto()
+                                        .cursor_pointer()
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |view, _, _, cx| {
+                                                let _ = view.backend.toggle_favorite(model.clone());
+                                                view.preferences.toggle_favorite(model.clone());
+                                                let _ = view.preferences.save();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if favorite { "★" } else { "☆" }),
+                                );
+                            }
+                            row_view
+                        },
+                    ))
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_xs()
+                            .text_color(rgb(0x8994a8))
+                            .child("↑↓ navigate  Enter select  Esc close"),
+                    ),
+            )
     }
 
     fn apply_event(&mut self, event: Result<TurnStreamEvent, String>, cx: &mut Context<Self>) {
@@ -298,24 +651,31 @@ impl Render for TauView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("tau"),
             )
-            .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
-                "{}  ·  {}",
-                current_model,
-                match self.backend.daemon_status() {
-                    DaemonStatus::Absent => "Absent",
-                    DaemonStatus::Spawning => "Spawning",
-                    DaemonStatus::Connecting => "Connecting",
-                    DaemonStatus::Negotiating => "Negotiating",
-                    DaemonStatus::Incompatible => "Incompatible",
-                    DaemonStatus::Degraded => "Degraded",
-                    DaemonStatus::Ready => match &self.chat.status {
-                        ChatStatus::Ready => "Ready",
-                        ChatStatus::Streaming => "Thinking...",
-                        ChatStatus::Failed(_) => "Request failed",
-                    },
-                    DaemonStatus::Failed => "Failed",
-                }
-            )));
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x8c96a8))
+                    .cursor_pointer()
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_model))
+                    .child(format!(
+                        "{}  ·  {}",
+                        current_model,
+                        match self.backend.daemon_status() {
+                            DaemonStatus::Absent => "Absent",
+                            DaemonStatus::Spawning => "Spawning",
+                            DaemonStatus::Connecting => "Connecting",
+                            DaemonStatus::Negotiating => "Negotiating",
+                            DaemonStatus::Incompatible => "Incompatible",
+                            DaemonStatus::Degraded => "Degraded",
+                            DaemonStatus::Ready => match &self.chat.status {
+                                ChatStatus::Ready => "Ready",
+                                ChatStatus::Streaming => "Thinking...",
+                                ChatStatus::Failed(_) => "Request failed",
+                            },
+                            DaemonStatus::Failed => "Failed",
+                        }
+                    )),
+            );
         let runtime_banner = match &self.runtime {
             RuntimeState::NotNegotiated => Some((
                 "Runtime is not negotiated. Send a message to begin protocol negotiation.",
@@ -597,7 +957,12 @@ impl Render for TauView {
             .flex_none()
             .border_l_1()
             .border_color(rgb(0x2c3340))
-            .child(sidebar_card("AGENT", self.agent.label()))
+            .child(
+                div()
+                    .cursor_pointer()
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_agent))
+                    .child(sidebar_card("AGENT", &self.agent)),
+            )
             .child(sidebar_card(
                 "PLAN",
                 if self.chat.status == ChatStatus::Streaming {
@@ -672,6 +1037,16 @@ impl Render for TauView {
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::switch_agent));
         root = root.on_action(cx.listener(Self::cycle_model));
+        root = root.on_action(cx.listener(Self::dismiss_picker));
+        root = root.on_action(cx.listener(Self::picker_up));
+        root = root.on_action(cx.listener(Self::picker_down));
+        root = root.on_action(cx.listener(Self::pick_item));
+        let command_active = self.picker.is_none() && command_mode(&self.input.read(cx).content());
+        if let Some(kind) = self.picker {
+            root = root.child(self.picker_overlay(cx, kind));
+        } else if command_active {
+            root = root.child(self.picker_overlay(cx, PickerKind::Command));
+        }
         root.child(header)
             .children(runtime_banner_view)
             .child(
