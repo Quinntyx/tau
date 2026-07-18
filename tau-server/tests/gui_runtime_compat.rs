@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use tau_proto::prelude::*;
 use tempfile::TempDir;

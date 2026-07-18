@@ -67,7 +67,8 @@ async fn real_daemon_broadcasts_stream_and_replays_after_control_reply() -> Resu
             turn_id,
             idempotency_key: IdempotencyKey::new("real-tui-test-response"),
             response: tau_proto::prelude::ClientResponse::Question {
-                answer: "yes".into(),
+                question_id: "test-question".into(),
+                answer: tau_proto::prelude::QuestionAnswer("yes".into()),
             },
         })
         .await?;

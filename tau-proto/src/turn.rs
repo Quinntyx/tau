@@ -102,9 +102,20 @@ pub enum RequestAction {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientResponse {
-    Permission { choice: String },
-    Question { answer: String },
-    DiffHunk { index: u32, approved: bool },
+    Permission {
+        request_id: String,
+        choice: TurnPermissionChoice,
+    },
+    Question {
+        question_id: String,
+        answer: QuestionAnswer,
+    },
+    DiffHunk {
+        request_id: String,
+        path: String,
+        index: u32,
+        approved: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +141,8 @@ pub struct TurnResponseResult {
 pub enum TurnPermissionChoice {
     AllowOnce,
     AllowAlways,
+    AllowSession,
+    DenyOnce,
     Reject,
     Inspect,
     Cancel,
@@ -193,7 +206,7 @@ pub struct TurnReplayResult {
     pub gap: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactReference {
     pub artifact_id: String,
     pub media_type: String,
@@ -202,7 +215,7 @@ pub struct ArtifactReference {
     pub storage_ref: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundedOutput {
     pub inline: String,
     pub truncated: bool,
@@ -210,7 +223,7 @@ pub struct BoundedOutput {
     pub artifacts: Vec<ArtifactReference>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnEvent {
     TurnStarted {
@@ -220,9 +233,40 @@ pub enum TurnEvent {
         turn_id: String,
         text: String,
     },
+    ReasoningDelta {
+        turn_id: String,
+        text: String,
+    },
     ToolOutput {
         turn_id: String,
         output: BoundedOutput,
+    },
+    /// A tool invocation has been observed, before its output is available.
+    ToolStarted {
+        turn_id: String,
+        tool_call_id: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+    },
+    /// Incremental tool metadata/status (for example, a subprocess pid).
+    ToolStatus {
+        turn_id: String,
+        tool_call_id: String,
+        status: ToolStatusValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+    ToolCompleted {
+        turn_id: String,
+        tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<BoundedOutput>,
+    },
+    ToolError {
+        turn_id: String,
+        tool_call_id: String,
+        error: String,
     },
     PermissionRequested {
         turn_id: String,
@@ -261,6 +305,52 @@ pub enum TurnEvent {
         turn_id: String,
         message: String,
     },
+    CompactionStarted {
+        turn_id: String,
+    },
+    CompactionCompleted {
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    SystemMessage {
+        turn_id: String,
+        message: String,
+    },
+    IntegrationEvent {
+        turn_id: String,
+        integration: String,
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
+    PlanUpdated {
+        turn_id: String,
+        plan: serde_json::Value,
+    },
+    StatusChanged {
+        turn_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    Telemetry {
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<serde_json::Value>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatusValue {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +437,82 @@ mod tests {
                 if request_id == "d1" && path == "a.txt"
         ));
     }
+
+    #[test]
+    fn extended_events_round_trip_without_parsing_payload_strings() {
+        let events = [
+            TurnEvent::ReasoningDelta {
+                turn_id: "t".into(),
+                text: "raw prefix: value".into(),
+            },
+            TurnEvent::ToolStarted {
+                turn_id: "t".into(),
+                tool_call_id: "c".into(),
+                tool: "shell".into(),
+                input: Some(serde_json::json!({"command": "printf x", "nested": [1, true]})),
+            },
+            TurnEvent::ToolStatus {
+                turn_id: "t".into(),
+                tool_call_id: "c".into(),
+                status: ToolStatusValue::Running,
+                metadata: Some(serde_json::json!({"pid": 42})),
+            },
+            TurnEvent::ToolCompleted {
+                turn_id: "t".into(),
+                tool_call_id: "c".into(),
+                output: Some(BoundedOutput {
+                    inline: "output".into(),
+                    truncated: false,
+                    artifacts: vec![],
+                }),
+            },
+            TurnEvent::ToolError {
+                turn_id: "t".into(),
+                tool_call_id: "c".into(),
+                error: "failed".into(),
+            },
+            TurnEvent::CompactionCompleted {
+                turn_id: "t".into(),
+                summary: Some("summary".into()),
+            },
+            TurnEvent::SystemMessage {
+                turn_id: "t".into(),
+                message: "system".into(),
+            },
+            TurnEvent::IntegrationEvent {
+                turn_id: "t".into(),
+                integration: "slack".into(),
+                event: "message".into(),
+                data: Some(serde_json::json!({"raw": true})),
+            },
+            TurnEvent::PlanUpdated {
+                turn_id: "t".into(),
+                plan: serde_json::json!({"steps": [{"status": "custom"}]}),
+            },
+            TurnEvent::StatusChanged {
+                turn_id: "t".into(),
+                status: "thinking".into(),
+                message: None,
+            },
+            TurnEvent::Telemetry {
+                turn_id: "t".into(),
+                usage: Some(serde_json::json!({"input": 3})),
+                context: None,
+            },
+            TurnEvent::TurnCancelled {
+                turn_id: "t".into(),
+            },
+            TurnEvent::TurnFailed {
+                turn_id: "t".into(),
+                message: "error".into(),
+            },
+        ];
+        for event in events {
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(serde_json::from_value::<TurnEvent>(value).unwrap(), event);
+        }
+    }
+
     #[test]
     fn every_public_shape_round_trips() {
         let values = [
@@ -401,12 +567,16 @@ mod tests {
     fn client_responses_round_trip_with_stable_wire_tags() {
         let responses = [
             ClientResponse::Permission {
-                choice: "allow".into(),
+                request_id: "r1".into(),
+                choice: TurnPermissionChoice::AllowOnce,
             },
             ClientResponse::Question {
-                answer: "yes".into(),
+                question_id: "q1".into(),
+                answer: QuestionAnswer("yes".into()),
             },
             ClientResponse::DiffHunk {
+                request_id: "d1".into(),
+                path: "src/lib.rs".into(),
                 index: 2,
                 approved: false,
             },
@@ -423,6 +593,8 @@ mod tests {
             turn_id: "t".into(),
             idempotency_key: IdempotencyKey::new("k"),
             response: ClientResponse::DiffHunk {
+                request_id: "d1".into(),
+                path: "src/lib.rs".into(),
                 index: 0,
                 approved: true,
             },

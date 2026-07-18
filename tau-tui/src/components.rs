@@ -150,6 +150,7 @@ fn format_tool(t: &ToolCard) -> String {
         ToolStatus::Complete => "✓",
         ToolStatus::Failed => "!",
         ToolStatus::Denied => "×",
+        ToolStatus::Cancelled => "−",
     };
     if t.expanded {
         format!(
@@ -193,6 +194,7 @@ pub fn tool_card(frame: &mut Frame, area: Rect, t: &ToolCard) {
         ToolStatus::Complete => "✓",
         ToolStatus::Failed => "!",
         ToolStatus::Denied => "×",
+        ToolStatus::Cancelled => "−",
     };
     let mut lines = vec![Line::from(format!(
         "{} {} — {}",

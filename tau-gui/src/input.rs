@@ -503,8 +503,9 @@ impl TextInput {
     /// Replace the prompt text while preserving the input entity and focus.
     /// Picker views use this instead of reaching into the editor's storage.
     pub fn set_content(&mut self, content: impl Into<String>) {
-        self.content = content.into();
-        self.cursor = self.content.len();
+        self.buffer = EditorBuffer::new(content);
+        self.history_index = None;
+        self.marked_range = None;
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
@@ -1044,6 +1045,7 @@ impl Element for TextElement {
             ),
             gpui::blue(),
         );
+        let line_height = window.line_height();
         let selection = input
             .buffer
             .selection()
@@ -1062,11 +1064,11 @@ impl Element for TextElement {
                                 Bounds::from_corners(
                                     point(
                                         bounds.left() + line.x_for_index(start_byte - line_start),
-                                        bounds.top() + window.line_height() * index as f32,
+                                        bounds.top() + line_height * index as f32,
                                     ),
                                     point(
                                         bounds.left() + line.x_for_index(end_byte - line_start),
-                                        bounds.top() + window.line_height() * (index + 1) as f32,
+                                        bounds.top() + line_height * (index + 1) as f32,
                                     ),
                                 ),
                                 gpui::rgba(0x3311ff30),
