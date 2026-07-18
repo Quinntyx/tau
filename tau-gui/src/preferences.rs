@@ -39,6 +39,16 @@ pub fn path() -> Result<PathBuf> {
 impl GuiPreferences {
     pub const MAX_RECENT_MODELS: usize = 8;
 
+    /// Make preference collections safe to use even when they came from an
+    /// older (or hand-edited) preferences file.  Ordering is intentional:
+    /// favorites retain their first-seen order, while recents retain their
+    /// newest-first order.
+    pub fn normalize(&mut self) {
+        deduplicate(&mut self.favorites);
+        deduplicate(&mut self.recent_models);
+        self.recent_models.truncate(Self::MAX_RECENT_MODELS);
+    }
+
     pub fn load() -> Result<Self> {
         Self::load_from(&path()?)
     }
@@ -49,8 +59,8 @@ impl GuiPreferences {
 
     pub fn toggle_favorite(&mut self, model: impl Into<String>) {
         let model = model.into();
-        if let Some(index) = self.favorites.iter().position(|value| value == &model) {
-            self.favorites.remove(index);
+        if self.favorites.iter().any(|value| value == &model) {
+            self.favorites.retain(|value| value != &model);
         } else {
             self.favorites.push(model);
         }
@@ -137,7 +147,7 @@ impl GuiPreferences {
                 _ => {}
             }
         }
-        result.recent_models.truncate(Self::MAX_RECENT_MODELS);
+        result.normalize();
         Ok(result)
     }
     pub fn save_to(&self, file: &Path) -> Result<()> {
@@ -145,25 +155,27 @@ impl GuiPreferences {
             std::fs::create_dir_all(parent)?;
         }
         let mut out = String::new();
-        for value in &self.favorites {
+        let mut normalized = self.clone();
+        normalized.normalize();
+        for value in &normalized.favorites {
             out.push_str(&format!(
                 "favorite {}\n",
                 kdl::KdlValue::String(value.clone())
             ));
         }
-        for value in &self.recent_models {
+        for value in &normalized.recent_models {
             out.push_str(&format!(
                 "recent {}\n",
                 kdl::KdlValue::String(value.clone())
             ));
         }
-        if let Some(value) = &self.selected_model {
+        if let Some(value) = &normalized.selected_model {
             out.push_str(&format!(
                 "selected_model {}\n",
                 kdl::KdlValue::String(value.clone())
             ));
         }
-        if let Some(value) = &self.selected_agent {
+        if let Some(value) = &normalized.selected_agent {
             out.push_str(&format!(
                 "selected_agent {}\n",
                 kdl::KdlValue::String(value.clone())
@@ -171,12 +183,22 @@ impl GuiPreferences {
         }
         out.push_str(&format!(
             "sidebar #{}\nautonomy #{}\ndaemon_warning #{}\ndaemon_owned #{}\n",
-            self.sidebar, self.autonomy, self.daemon_warning, self.daemon_owned
+            normalized.sidebar, normalized.autonomy, normalized.daemon_warning, normalized.daemon_owned
         ));
         let temporary = file.with_extension("kdl.tmp");
         std::fs::write(&temporary, out).context("writing temporary gui.kdl")?;
         std::fs::rename(&temporary, file).context("committing gui.kdl atomically")
     }
+}
+
+fn deduplicate(values: &mut Vec<String>) {
+    let mut unique = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        if !unique.iter().any(|existing| existing == &value) {
+            unique.push(value);
+        }
+    }
+    *values = unique;
 }
 
 #[cfg(test)]
@@ -299,5 +321,50 @@ mod tests {
         assert_eq!(loaded.selected_model.as_deref(), Some("provider/model"));
         assert_eq!(loaded.selected_agent.as_deref(), Some("builder"));
         assert_eq!(loaded.recent_models, vec!["provider/model"]);
+    }
+
+    #[test]
+    fn loading_normalizes_duplicate_favorites_and_recents_without_filtering_catalog() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("gui.kdl");
+        let mut text = String::new();
+        text.push_str("favorite \"server/model\"\nfavorite \"server/model\"\n");
+        for index in 0..(GuiPreferences::MAX_RECENT_MODELS + 2) {
+            text.push_str(&format!("recent \"model-{index}\"\nrecent \"model-{index}\"\n"));
+        }
+        text.push_str("selected_model \"server/model\"\nselected_agent \"remote-agent\"\n");
+        std::fs::write(&p, text).unwrap();
+
+        let loaded = GuiPreferences::load_from(&p).unwrap();
+        assert_eq!(loaded.favorites, vec!["server/model"]);
+        assert_eq!(loaded.recent_models.len(), GuiPreferences::MAX_RECENT_MODELS);
+        assert_eq!(loaded.recent_models[0], "model-0");
+        assert_eq!(loaded.selected_model.as_deref(), Some("server/model"));
+        assert_eq!(loaded.selected_agent.as_deref(), Some("remote-agent"));
+    }
+
+    #[test]
+    fn save_normalizes_legacy_duplicates_and_preserves_selection() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("gui.kdl");
+        let mut preferences = GuiPreferences::default();
+        preferences.favorites = vec!["a".into(), "a".into(), "b".into()];
+        preferences.recent_models = vec!["x".into(), "x".into()];
+        preferences.selected_model = Some("catalog-only-model".into());
+        preferences.save_to(&p).unwrap();
+        let loaded = GuiPreferences::load_from(&p).unwrap();
+        assert_eq!(loaded.favorites, vec!["a", "b"]);
+        assert_eq!(loaded.recent_models, vec!["x"]);
+        assert_eq!(loaded.selected_model.as_deref(), Some("catalog-only-model"));
+    }
+
+    #[test]
+    fn malformed_known_nodes_still_report_errors_but_unknown_nodes_are_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("gui.kdl");
+        std::fs::write(&p, "future_preference (not understood)\nunknown #true\n").unwrap();
+        assert!(GuiPreferences::load_from(&p).is_ok());
+        std::fs::write(&p, "selected_model #true\n").unwrap();
+        assert!(GuiPreferences::load_from(&p).is_err());
     }
 }
