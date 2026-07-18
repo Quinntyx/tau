@@ -326,6 +326,16 @@ async fn typed_git_operations_are_contained_and_safe() -> Result<()> {
         })
         .await?;
 
+    assert!(
+        client
+            .git_revert(GitRevertParams {
+                project: project.clone(),
+                path: "tracked.txt".into(),
+                confirmed: false,
+            })
+            .await
+            .is_err()
+    );
     client
         .git_revert(GitRevertParams {
             project: project.clone(),

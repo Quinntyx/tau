@@ -279,7 +279,7 @@ pub async fn acknowledge(
     Ok(result.acknowledged)
 }
 
-fn content_revision(content: &str) -> String {
+pub fn content_revision(content: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);

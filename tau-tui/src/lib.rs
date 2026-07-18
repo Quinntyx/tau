@@ -77,7 +77,11 @@ async fn session(
     mut client: Client,
     socket: PathBuf,
 ) -> Result<()> {
-    let mut state = AppState::default();
+    let mut state = AppState {
+        project_root: std::env::current_dir()?.to_string_lossy().into_owned(),
+        ..AppState::default()
+    };
+    state.operations.project = state.project_root.clone();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut event_task = tokio::spawn(adapter::persistent_events(
         client.clone(),
@@ -113,7 +117,8 @@ async fn session(
                     Event::Resize(_, _) => Some(reducer::Action::Reconnect),
                     _ => None,
                 };
-                if let Some(action) = action {
+                    if let Some(action) = action {
+                        let operation_action = action.clone();
                     let is_cancel = matches!(action, reducer::Action::Cancel);
                     let is_submit = matches!(action, reducer::Action::Submit);
                     let reconnect_requested = matches!(action, reducer::Action::Reconnect);
@@ -142,11 +147,13 @@ async fn session(
                         }),
                         _ => None,
                     };
-                    if let Some(prompt) = reducer::apply(&mut state, action) {
-                        if is_submit {
-                            adapter::complete(&mut state, &client, prompt, events_tx.clone()).await?;
-                        }
-                    }
+                     let prompt = reducer::apply(&mut state, action);
+                     if let Some(prompt) = prompt {
+                         if is_submit {
+                             adapter::complete(&mut state, &client, prompt, events_tx.clone()).await?;
+                         }
+                     }
+                     handle_operations(&mut state, &client, operation_action).await;
                     if let Some(response) = response {
                         let snapshot = state.clone();
                         let c = client.clone();
@@ -215,6 +222,58 @@ async fn session(
     input_task.abort();
     event_task.abort();
     Ok(())
+}
+
+async fn handle_operations(state: &mut AppState, client: &Client, action: reducer::Action) {
+    use reducer::Action;
+    let result = match action {
+        Action::OperationsRefresh => {
+            match operations::status(client, &mut state.operations).await {
+                Ok(()) => operations::branches(client, &mut state.operations).await,
+                Err(error) => Err(error),
+            }
+        }
+        Action::OperationsOpen => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::file(client, &mut state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsStage => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::stage(client, &state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsUnstage => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::unstage(client, &state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsRevertConfirmed => {
+            if let Some(p) = state.operations.path().map(str::to_owned) {
+                operations::revert(client, &state.operations, p).await
+            } else {
+                Ok(())
+            }
+        }
+        Action::OperationsCreateBranch(name) => {
+            operations::create_branch(client, &state.operations, name).await
+        }
+        Action::OperationsSwitchBranch(name) => {
+            operations::switch_branch(client, &state.operations, name).await
+        }
+        _ => return,
+    };
+    state.operations_loading = false;
+    match result {
+        Ok(()) => state.operations_ack = Some("operation complete".into()),
+        Err(e) => state.operations_error = Some(e.to_string()),
+    }
 }
 
 fn permission_choice(choice: state::PermissionChoice) -> TurnPermissionChoice {

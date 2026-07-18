@@ -1,4 +1,5 @@
 //! Small composable widgets. Keeping these pure makes ratatui snapshots cheap.
+use crate::operations::OperationsState;
 use crate::{reducer::filtered_models, state::*};
 use ratatui::{
     Frame,
@@ -10,9 +11,13 @@ use ratatui::{
 
 pub fn render(frame: &mut Frame, s: &AppState) {
     let root = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(40), Constraint::Length(38)])
+        .split(frame.area());
+    let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(5)])
-        .split(frame.area());
+        .split(root[0]);
     let mut transcript = s.transcript.join("\n");
     for tool in &s.tools {
         transcript.push('\n');
@@ -26,7 +31,7 @@ pub fn render(frame: &mut Frame, s: &AppState) {
         Paragraph::new(transcript)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(" tau ")),
-        root[0],
+        shell[0],
     );
     let footer = Line::from(vec![
         Span::styled(format!(" {} ", s.model), Style::default().fg(Color::Cyan)),
@@ -43,14 +48,23 @@ pub fn render(frame: &mut Frame, s: &AppState) {
                 .borders(Borders::ALL)
                 .title(" prompt (Shift+Enter newline) "),
         ),
-        root[1],
+        shell[1],
     );
     // Keep the terminal cursor at the UTF-8 byte cursor's visual column so
     // multiline editing remains usable instead of merely storing text.
     let line_start = s.input[..s.cursor].rfind('\n').map_or(0, |i| i + 1);
     let line = s.input[..s.cursor].matches('\n').count() as u16;
     let column = s.input[line_start..s.cursor].chars().count() as u16;
-    frame.set_cursor_position((root[1].x + 1 + column, root[1].y + 2 + line));
+    frame.set_cursor_position((shell[1].x + 1 + column, shell[1].y + 2 + line));
+    render_operations_panel(
+        frame,
+        root[1],
+        &s.operations,
+        s.operations_tab,
+        s.operations_loading,
+        s.operations_error.as_deref(),
+        s.operations_ack.as_deref(),
+    );
     if s.picker != Picker::None {
         picker(frame, s);
     }
@@ -60,6 +74,104 @@ pub fn render(frame: &mut Frame, s: &AppState) {
     if let Some(question) = &s.question {
         question_modal(frame, question);
     }
+}
+
+/// Render the daemon-backed operations projection. The caller owns loading,
+/// error, selected-tab, and acknowledgement state; this widget only reads it.
+/// `OperationsState` currently carries the durable portion of that projection.
+pub fn render_operations_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &OperationsState,
+    tab: OperationsTab,
+    loading: bool,
+    error: Option<&str>,
+    acknowledgement: Option<&str>,
+) {
+    let tab_label = |name, selected| {
+        if selected {
+            Span::styled(
+                format!(" {name} "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(format!(" {name} "))
+        }
+    };
+    let tabs = Line::from(vec![
+        tab_label("Status", tab == OperationsTab::Status),
+        tab_label("Git", tab == OperationsTab::Git),
+        tab_label("Changes", tab == OperationsTab::Changes),
+    ]);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+        .split(area);
+    let files = state
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let marker = if file.staged { "●" } else { "○" };
+            let selected = if i == state.selected { ">" } else { " " };
+            ListItem::new(format!("{selected}{marker} {}", file.path))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(files).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Operations [{}]", state.branch)),
+    );
+    frame.render_widget(list, columns[0]);
+    let state_line = if loading {
+        " loading: yes ".to_owned()
+    } else if let Some(error) = error {
+        format!(" error: {error} ")
+    } else {
+        format!(" loading: no   error: —{}", acknowledgement.unwrap_or(""))
+    };
+    let mut body = vec![tabs, Line::from(state_line)];
+    if let Some(content) = &state.content {
+        body.push(Line::from(content.path.to_string()));
+        if tab == OperationsTab::Status {
+            body.push(Line::from("Status: selected project file"));
+        }
+        if tab == OperationsTab::Changes {
+            body.push(Line::from("Changes: full content and diff"));
+            body.extend(
+                content
+                    .content
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}"))),
+            );
+        }
+        body.push(Line::from("[s] stage  [u] unstage  [r] revert  [k] Keep"));
+        body.push(Line::from("[b] branch  [Enter] acknowledge"));
+        if tab != OperationsTab::Status {
+            body.extend(content.diff.lines().map(Line::from));
+        }
+        if state
+            .acknowledged
+            .get(&content.path)
+            .copied()
+            .unwrap_or(false)
+        {
+            body.insert(2, Line::from(" acknowledged ✓ "));
+        }
+    } else {
+        body.push(Line::from("Select a file to inspect full content/diff."));
+        body.push(Line::from("[s] stage  [u] unstage  [r] revert  [b] branch"));
+    }
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Git / Changes "),
+        ),
+        columns[1],
+    );
 }
 fn picker(frame: &mut Frame, s: &AppState) {
     let area = center(frame.area(), 60, 14);
