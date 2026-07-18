@@ -5,6 +5,8 @@ pub mod chat;
 pub mod input;
 pub mod picker;
 pub mod preferences;
+pub mod projects;
+pub mod shell;
 pub mod view;
 
 use std::path::PathBuf;

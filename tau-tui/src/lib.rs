@@ -2,7 +2,9 @@
 //! thin; all interesting behaviour lives in typed state and renderable components.
 mod adapter;
 pub mod components;
+pub mod projects;
 pub mod reducer;
+pub mod shell;
 pub mod state;
 
 use anyhow::{Context, Result};
