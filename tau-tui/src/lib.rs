@@ -203,11 +203,51 @@ async fn session(
                 match message {
                     adapter::ClientEvent::Complete { session_id, turn_id } => {
                         state.session_id = Some(session_id);
-                        state.turn_id = Some(turn_id);
+                        let _ = turn_id;
+                        state.turn_id = None;
+                        // A completed stream is terminal from the composer’s
+                        // perspective, even if the daemon did not emit a
+                        // separate terminal event before closing it.
+                        state.cancelling = false;
+                        let _ = state
+                            .composer
+                            .apply(crate::composer::ComposerAction::SetSending(false));
+                        reducer::sync_composer(&mut state);
                     }
-                    adapter::ClientEvent::Turn(event) => adapter::reduce_event(&mut state, event),
-                    adapter::ClientEvent::Disconnected => state.connection = state::Connection::Disconnected,
-                    other => adapter::ScriptedClient { events: vec![other] }.drive(&mut state),
+                    adapter::ClientEvent::Turn(event) => {
+                        let finished = matches!(
+                            &event.event,
+                            tau_proto::prelude::TurnEvent::TurnCompleted { .. }
+                                | tau_proto::prelude::TurnEvent::TurnCancelled { .. }
+                                | tau_proto::prelude::TurnEvent::TurnFailed { .. }
+                        );
+                        adapter::reduce_event(&mut state, event);
+                        if finished {
+                            let _ = state
+                                .composer
+                                .apply(crate::composer::ComposerAction::SetSending(false));
+                        }
+                        reducer::sync_composer(&mut state);
+                    }
+                    adapter::ClientEvent::Disconnected => {
+                        state.connection = state::Connection::Disconnected;
+                        state.cancelling = false;
+                        let _ = state
+                            .composer
+                            .apply(crate::composer::ComposerAction::SetSending(false));
+                        reducer::sync_composer(&mut state);
+                    }
+                    other => {
+                        let failed = matches!(&other, adapter::ClientEvent::Error(_));
+                        adapter::ScriptedClient { events: vec![other] }.drive(&mut state);
+                        if failed {
+                            state.cancelling = false;
+                            let _ = state
+                                .composer
+                                .apply(crate::composer::ComposerAction::SetSending(false));
+                        }
+                        reducer::sync_composer(&mut state);
+                    }
                 }
             }
             else => break,

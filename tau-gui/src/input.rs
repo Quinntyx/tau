@@ -8,6 +8,123 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::composer::{Composer, ComposerAction, Selection};
+
+/// GPUI-facing adapter for the canonical, window-independent composer.
+/// GPUI still owns focus, layout, and IME UTF-16 conversion; all editing
+/// state and actions live in `Composer`.
+#[derive(Default)]
+pub struct ComposerAdapter {
+    composer: Composer,
+}
+
+impl ComposerAdapter {
+    pub fn composer(&self) -> &Composer {
+        &self.composer
+    }
+    pub fn composer_mut(&mut self) -> &mut Composer {
+        &mut self.composer
+    }
+    pub fn dispatch(&mut self, action: ComposerAction) -> Option<String> {
+        self.composer.apply(action)
+    }
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.composer.set_model(model);
+    }
+    pub fn set_agent(&mut self, agent: impl Into<String>) {
+        self.composer.set_agent(agent);
+    }
+    pub fn set_ids(&mut self, session_id: impl Into<String>, project_id: impl Into<String>) {
+        self.composer.set_ids(session_id, project_id);
+    }
+    pub fn set_content(&mut self, content: impl Into<String>) {
+        self.composer.sync_ime_text(content);
+    }
+    pub fn set_selection(&mut self, selection: Selection) {
+        // Selection is byte-indexed, as is the canonical composer. Rebuild it
+        // through canonical grapheme-aware actions so GPUI never owns a range.
+        let text = self.text().to_owned();
+        self.dispatch(ComposerAction::SelectAll);
+        self.dispatch(ComposerAction::MoveHome { selecting: false });
+        let anchor = text[..selection.anchor].graphemes(true).count();
+        let cursor = text[..selection.cursor].graphemes(true).count();
+        for _ in 0..anchor {
+            self.dispatch(ComposerAction::MoveRight { selecting: false });
+        }
+        if cursor >= anchor {
+            for _ in anchor..cursor {
+                self.dispatch(ComposerAction::MoveRight { selecting: true });
+            }
+        } else {
+            for _ in cursor..anchor {
+                self.dispatch(ComposerAction::MoveLeft { selecting: true });
+            }
+        }
+    }
+    pub fn text(&self) -> &str {
+        self.composer.text()
+    }
+    pub fn cursor(&self) -> usize {
+        self.composer.selection().cursor
+    }
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let selection = self.composer.selection();
+        (!selection.is_empty()).then(|| {
+            let (start, end) = selection.range();
+            start..end
+        })
+    }
+    pub fn selected_text(&self) -> Option<&str> {
+        self.composer.selected_text()
+    }
+    pub fn char_count(&self) -> usize {
+        self.composer.character_count()
+    }
+    pub fn file_references(&self) -> Vec<String> {
+        self.composer.file_references()
+    }
+    pub fn disabled(&self) -> bool {
+        self.composer.state().disabled
+    }
+    fn backspace(&mut self) {
+        self.dispatch(ComposerAction::Backspace);
+    }
+    fn delete(&mut self) {
+        self.dispatch(ComposerAction::Delete);
+    }
+    fn insert(&mut self, text: &str) {
+        self.dispatch(ComposerAction::InsertText(text.to_owned()));
+    }
+    fn move_left(&mut self, selecting: bool) {
+        self.dispatch(ComposerAction::MoveLeft { selecting });
+    }
+    fn move_right(&mut self, selecting: bool) {
+        self.dispatch(ComposerAction::MoveRight { selecting });
+    }
+    fn move_up(&mut self, selecting: bool) {
+        self.dispatch(ComposerAction::MoveUp { selecting });
+    }
+    fn move_down(&mut self, selecting: bool) {
+        self.dispatch(ComposerAction::MoveDown { selecting });
+    }
+    fn move_home(&mut self, selecting: bool) {
+        self.dispatch(ComposerAction::MoveHome { selecting });
+    }
+    fn move_end(&mut self, selecting: bool) {
+        self.dispatch(ComposerAction::MoveEnd { selecting });
+    }
+    fn replace_range(&mut self, range: Range<usize>, text: &str) {
+        self.set_selection(Selection {
+            anchor: range.start,
+            cursor: range.end,
+        });
+        self.dispatch(ComposerAction::InsertText(text.to_owned()));
+    }
+    fn set_cursor(&mut self, cursor: usize) {
+        self.set_selection(Selection::caret(cursor));
+    }
+}
+
 /// Pure editing core kept independent of GPUI, so scripted fixtures can test
 /// Unicode, multiline movement and selection without opening a window.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,15 +236,6 @@ impl EditorBuffer {
             self.anchor = None;
         }
         self.cursor = position;
-    }
-    fn replace_range(&mut self, range: Range<usize>, value: &str) {
-        self.text.replace_range(range.clone(), value);
-        self.cursor = range.start + value.len();
-        self.anchor = None;
-    }
-    fn set_cursor(&mut self, cursor: usize) {
-        self.cursor = cursor;
-        self.anchor = None;
     }
     fn delete_selection(&mut self) -> bool {
         if let Some(range) = self.selection() {
@@ -421,10 +529,7 @@ mod autocomplete_tests {
 
 pub struct TextInput {
     focus_handle: FocusHandle,
-    buffer: EditorBuffer,
-    history: Vec<String>,
-    history_index: Option<usize>,
-    disabled: bool,
+    adapter: ComposerAdapter,
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_lines: Vec<(usize, ShapedLine)>,
@@ -435,10 +540,7 @@ impl TextInput {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            buffer: EditorBuffer::default(),
-            history: Vec::new(),
-            history_index: None,
-            disabled: false,
+            adapter: ComposerAdapter::default(),
             marked_range: None,
             last_layout: None,
             last_lines: Vec::new(),
@@ -447,36 +549,47 @@ impl TextInput {
     }
 
     pub fn content(&self) -> String {
-        self.buffer.text().to_owned()
+        self.adapter.text().to_owned()
+    }
+
+    pub fn dispatch(&mut self, action: ComposerAction) -> Option<String> {
+        self.adapter.dispatch(action)
+    }
+
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.adapter.set_model(model);
+    }
+
+    pub fn set_agent(&mut self, agent: impl Into<String>) {
+        self.adapter.set_agent(agent);
+    }
+
+    pub fn set_ids(&mut self, session_id: impl Into<String>, project_id: impl Into<String>) {
+        self.adapter.set_ids(session_id, project_id);
+    }
+
+    pub fn disabled(&self) -> bool {
+        self.adapter.disabled()
     }
 
     /// Unicode scalar count used by the composer counter (rather than bytes).
     pub fn char_count(&self) -> usize {
-        self.buffer.text().chars().count()
+        self.adapter.char_count()
     }
 
     /// File references are deliberately kept as prompt text; the backend owns
     /// interpretation. This projection only supplies chips for the composer.
     pub fn file_references(&self) -> Vec<String> {
-        self.buffer
-            .text()
-            .split_whitespace()
-            .filter(|word| word.starts_with('@') && word.len() > 1)
-            .map(|word| {
-                word.trim_matches(|ch: char| matches!(ch, ',' | ';' | ')' | ']'))
-                    .to_owned()
-            })
-            .collect()
+        self.adapter.file_references()
     }
 
     pub fn reset(&mut self) {
-        self.buffer = EditorBuffer::default();
-        self.history_index = None;
+        self.adapter.composer_mut().sync_ime_text(String::new());
         self.marked_range = None;
     }
 
     pub fn set_disabled(&mut self, disabled: bool) {
-        self.disabled = disabled;
+        self.adapter.composer_mut().set_streaming(disabled);
     }
 
     pub fn record_submission(&mut self, text: impl Into<String>) {
@@ -484,91 +597,70 @@ impl TextInput {
         if text.trim().is_empty() {
             return;
         }
-        if self.history.last() != Some(&text) {
-            self.history.push(text);
-        }
-        self.history_index = None;
+        self.adapter.composer_mut().record_history(text);
     }
 
     pub fn history(&self) -> &[String] {
-        &self.history
+        self.adapter.composer().history()
     }
 
     fn history_previous(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let next = self
-            .history_index
-            .map_or(self.history.len() - 1, |index| index.saturating_sub(1));
-        self.history_index = Some(next);
-        self.buffer = EditorBuffer::new(self.history[next].clone());
+        self.adapter.dispatch(ComposerAction::HistoryPrevious);
     }
 
     fn history_next(&mut self) {
-        let Some(index) = self.history_index else {
-            return;
-        };
-        if index + 1 < self.history.len() {
-            let next = index + 1;
-            self.history_index = Some(next);
-            self.buffer = EditorBuffer::new(self.history[next].clone());
-        } else {
-            self.history_index = None;
-            self.buffer = EditorBuffer::default();
-        }
+        self.adapter.dispatch(ComposerAction::HistoryNext);
     }
 
     /// Replace the prompt text while preserving the input entity and focus.
     /// Picker views use this instead of reaching into the editor's storage.
     pub fn set_content(&mut self, content: impl Into<String>) {
-        self.buffer = EditorBuffer::new(content);
-        self.history_index = None;
+        self.adapter.set_content(content);
         self.marked_range = None;
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        if self.disabled {
+        if self.disabled() {
             return;
         }
-        self.buffer.backspace();
+        self.adapter.backspace();
         cx.notify();
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.disabled {
-            self.buffer.delete();
+        if !self.disabled() {
+            self.adapter.delete();
             cx.notify();
         }
     }
 
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_left(false);
+        self.adapter.move_left(false);
         cx.notify();
     }
 
     fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_right(false);
+        self.adapter.move_right(false);
         cx.notify();
     }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_up(false);
+        self.adapter.move_up(false);
         cx.notify();
     }
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_down(false);
+        self.adapter.move_down(false);
         cx.notify();
     }
 
     fn move_home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_home(false);
+        self.adapter.move_home(false);
         cx.notify();
     }
 
     fn move_end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_end(false);
+        self.adapter.move_end(false);
         cx.notify();
     }
 
@@ -578,7 +670,7 @@ impl TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.buffer.move_left(true);
+        self.adapter.move_left(true);
         cx.notify();
     }
 
@@ -588,12 +680,12 @@ impl TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.buffer.move_right(true);
+        self.adapter.move_right(true);
         cx.notify();
     }
 
     fn move_up_selecting(&mut self, _: &MoveUpSelecting, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_up(true);
+        self.adapter.move_up(true);
         cx.notify();
     }
 
@@ -603,7 +695,7 @@ impl TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.buffer.move_down(true);
+        self.adapter.move_down(true);
         cx.notify();
     }
 
@@ -613,45 +705,45 @@ impl TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.buffer.move_home(true);
+        self.adapter.move_home(true);
         cx.notify();
     }
 
     fn move_end_selecting(&mut self, _: &MoveEndSelecting, _: &mut Window, cx: &mut Context<Self>) {
-        self.buffer.move_end(true);
+        self.adapter.move_end(true);
         cx.notify();
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.disabled {
-            self.buffer.insert("\n");
+        if !self.disabled() {
+            self.adapter.insert("\n");
             cx.notify();
         }
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.buffer.selected_text() {
+        if let Some(text) = self.adapter.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
         }
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        if self.disabled {
+        if self.disabled() {
             return;
         }
-        if let Some(text) = self.buffer.selected_text().map(str::to_owned) {
+        if let Some(text) = self.adapter.selected_text().map(str::to_owned) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.buffer.delete();
+            self.adapter.delete();
             cx.notify();
         }
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if self.disabled {
+        if self.disabled() {
             return;
         }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.buffer.insert(&text);
+            self.adapter.insert(&text);
             cx.notify();
         }
     }
@@ -760,7 +852,7 @@ impl Render for TextInput {
             .border_1()
             .border_color(rgb(0x394354))
             .rounded_lg()
-            .when(self.disabled, |element| element.opacity(0.6))
+            .when(self.disabled(), |element| element.opacity(0.6))
             .child(TextElement { input: cx.entity() })
     }
 }
@@ -781,7 +873,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.utf8_range(range);
         adjusted.replace(self.utf16_range(range.clone()));
-        Some(self.buffer.text()[range].to_string())
+        Some(self.adapter.text()[range].to_string())
     }
 
     fn selected_text_range(
@@ -790,20 +882,20 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let cursor = self.buffer.text()[..self.buffer.cursor()]
+        let cursor = self.adapter.text()[..self.adapter.cursor()]
             .encode_utf16()
             .count();
-        let selection = self.buffer.selection();
+        let selection = self.adapter.selection();
         let range = selection.as_ref().map_or(cursor..cursor, |range| {
-            self.buffer.text()[..range.start].encode_utf16().count()
-                ..self.buffer.text()[..range.end].encode_utf16().count()
+            self.adapter.text()[..range.start].encode_utf16().count()
+                ..self.adapter.text()[..range.end].encode_utf16().count()
         });
         Some(UTF16Selection {
             range,
             reversed: self
-                .buffer
+                .adapter
                 .selection()
-                .is_some_and(|range| self.buffer.cursor() == range.start),
+                .is_some_and(|range| self.adapter.cursor() == range.start),
         })
     }
 
@@ -824,15 +916,15 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
+        if self.disabled() {
             return;
         }
         let range = range
             .map(|range| self.utf8_range(range))
             .or_else(|| self.marked_range.clone())
-            .or_else(|| self.buffer.selection())
-            .unwrap_or_else(|| self.buffer.cursor()..self.buffer.cursor());
-        self.buffer.replace_range(range, text);
+            .or_else(|| self.adapter.selection())
+            .unwrap_or_else(|| self.adapter.cursor()..self.adapter.cursor());
+        self.adapter.replace_range(range, text);
         self.marked_range = None;
         cx.notify();
     }
@@ -848,16 +940,17 @@ impl EntityInputHandler for TextInput {
         let range = range
             .map(|range| self.utf8_range(range))
             .or_else(|| self.marked_range.clone())
-            .or_else(|| self.buffer.selection())
-            .unwrap_or_else(|| self.buffer.cursor()..self.buffer.cursor());
-        if self.disabled {
+            .or_else(|| self.adapter.selection())
+            .unwrap_or_else(|| self.adapter.cursor()..self.adapter.cursor());
+        if self.disabled() {
             return;
         }
-        self.buffer.replace_range(range.clone(), text);
+        self.adapter.replace_range(range.clone(), text);
         self.marked_range = (!text.is_empty()).then_some(range.start..range.start + text.len());
         if let Some(selected) = new_selected_range {
             let cursor = range.start + utf8_offset(text, selected.end).min(text.len());
-            self.buffer.set_cursor(cursor.min(self.buffer.text().len()));
+            self.adapter
+                .set_cursor(cursor.min(self.adapter.text().len()));
         }
         cx.notify();
     }
@@ -908,7 +1001,7 @@ impl EntityInputHandler for TextInput {
             .get(line_index.min(self.last_lines.len().saturating_sub(1)))?;
         let index = line.closest_index_for_x(point.x - bounds.left());
         Some(
-            self.buffer.text()[..(*line_start + index).min(self.buffer.text().len())]
+            self.adapter.text()[..(*line_start + index).min(self.adapter.text().len())]
                 .encode_utf16()
                 .count(),
         )
@@ -923,12 +1016,12 @@ impl TextInput {
     }
 
     fn utf16_range(&self, range: Range<usize>) -> Range<usize> {
-        self.buffer.text()[..range.start].encode_utf16().count()
-            ..self.buffer.text()[..range.end].encode_utf16().count()
+        self.adapter.text()[..range.start].encode_utf16().count()
+            ..self.adapter.text()[..range.end].encode_utf16().count()
     }
 
     fn utf8_offset(&self, offset: usize) -> usize {
-        utf8_offset(self.buffer.text(), offset)
+        utf8_offset(self.adapter.text(), offset)
     }
 }
 
@@ -980,7 +1073,7 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let line_count = self.input.read(cx).buffer.text().split('\n').count();
+        let line_count = self.input.read(cx).adapter.text().split('\n').count();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = (window.line_height() * line_count as f32).into();
@@ -999,7 +1092,7 @@ impl Element for TextElement {
         let input = self.input.read(cx);
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let text = input.buffer.text();
+        let text = input.adapter.text();
         let mut lines = Vec::new();
         let mut line_start = 0;
         for line_text in text.split('\n') {
@@ -1052,8 +1145,8 @@ impl Element for TextElement {
             .enumerate()
             .find_map(|(index, (start, line))| {
                 let end = *start + line.len();
-                (input.buffer.cursor() <= end || index + 1 == lines.len())
-                    .then_some((index, input.buffer.cursor().saturating_sub(*start)))
+                (input.adapter.cursor() <= end || index + 1 == lines.len())
+                    .then_some((index, input.adapter.cursor().saturating_sub(*start)))
             })
             .unwrap_or((0, 0));
         let cursor_x = lines[cursor_line].1.x_for_index(cursor_offset);
@@ -1066,7 +1159,7 @@ impl Element for TextElement {
         );
         let line_height = window.line_height();
         let selection = input
-            .buffer
+            .adapter
             .selection()
             .into_iter()
             .flat_map(|range| {

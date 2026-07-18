@@ -42,6 +42,7 @@ pub struct ComposerState {
     pub agent: Option<String>,
     pub slash_query: Option<String>,
     pub picker: Option<PickerKind>,
+    pub picker_index: usize,
     pub character_count: usize,
     pub disabled: bool,
     pub sending: bool,
@@ -52,6 +53,7 @@ pub struct ComposerState {
 pub enum PickerKind {
     Model,
     Agent,
+    Command,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +65,8 @@ pub enum ComposerAction {
     Delete,
     MoveLeft { selecting: bool },
     MoveRight { selecting: bool },
+    MoveUp { selecting: bool },
+    MoveDown { selecting: bool },
     MoveHome { selecting: bool },
     MoveEnd { selecting: bool },
     SelectAll,
@@ -74,6 +78,7 @@ pub enum ComposerAction {
     InsertFileReference(String),
     SlashQuery(String),
     Autocomplete(String),
+    ChooseSlashCommand(String),
     OpenPicker(PickerKind),
     ChooseModel(String),
     ChooseAgent(String),
@@ -83,6 +88,7 @@ pub enum ComposerAction {
     Cancel,
     SetSending(bool),
     SetConnection { connected: bool, detail: String },
+    SetPickerIndex(usize),
     HistoryPrevious,
     HistoryNext,
 }
@@ -117,6 +123,7 @@ impl Composer {
                 agent: None,
                 slash_query: None,
                 picker: None,
+                picker_index: 0,
                 character_count: 0,
                 disabled: false,
                 sending: false,
@@ -159,8 +166,8 @@ impl Composer {
 
     pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
         self.state.selection = Selection {
-            anchor: anchor.min(self.state.text.len()),
-            cursor: cursor.min(self.state.text.len()),
+            anchor: safe_boundary(&self.state.text, anchor),
+            cursor: safe_boundary(&self.state.text, cursor),
         };
     }
     pub fn clipboard(&self) -> &str {
@@ -216,12 +223,13 @@ impl Composer {
                 | ComposerAction::Delete
                 | ComposerAction::MoveLeft { .. }
                 | ComposerAction::MoveRight { .. }
+                | ComposerAction::MoveUp { .. }
+                | ComposerAction::MoveDown { .. }
                 | ComposerAction::MoveHome { .. }
                 | ComposerAction::MoveEnd { .. }
                 | ComposerAction::SelectAll
                 | ComposerAction::Copy
                 | ComposerAction::Cut
-                | ComposerAction::Clear
                 | ComposerAction::InsertFileReference(_)
                 | ComposerAction::Autocomplete(_)
                 | ComposerAction::HistoryPrevious
@@ -241,6 +249,12 @@ impl Composer {
             }
             ComposerAction::MoveRight { selecting } => {
                 self.move_by(1, selecting);
+            }
+            ComposerAction::MoveUp { selecting } => {
+                self.move_vertical(-1, selecting);
+            }
+            ComposerAction::MoveDown { selecting } => {
+                self.move_vertical(1, selecting);
             }
             ComposerAction::MoveHome { selecting } => {
                 self.edge(false, selecting);
@@ -263,27 +277,42 @@ impl Composer {
                 self.clipboard = self.state.text[a..b].to_owned();
                 self.replace(String::new());
             }
-            ComposerAction::Clear => self.replace(String::new()),
+            ComposerAction::Clear => {
+                self.state.selection = Selection {
+                    anchor: 0,
+                    cursor: self.state.text.len(),
+                };
+                self.replace(String::new());
+            }
             ComposerAction::InsertFileReference(path) => {
                 self.replace(format!("@{}", Path::new(&path).display()))
             }
             ComposerAction::SlashQuery(q) => {
                 self.state.slash_query = Some(q);
             }
-            ComposerAction::Autocomplete(v) => self.replace(v),
+            ComposerAction::Autocomplete(v) => self.replace_completion(v),
+            ComposerAction::ChooseSlashCommand(v) => self.replace_completion(v),
             ComposerAction::OpenPicker(k) => {
                 self.state.picker = Some(k);
+                self.state.slash_query = None;
+                self.state.picker_index = 0;
             }
             ComposerAction::ChooseModel(v) => {
                 self.state.model = Some(v);
                 self.state.picker = None;
+                self.state.slash_query = None;
             }
             ComposerAction::ChooseAgent(v) => {
                 self.state.agent = Some(v);
                 self.state.picker = None;
+                self.state.slash_query = None;
             }
             ComposerAction::ClosePicker => {
                 self.state.picker = None;
+                self.state.slash_query = None;
+            }
+            ComposerAction::SetPickerIndex(index) => {
+                self.state.picker_index = index;
             }
             ComposerAction::SetDisabled(v) => {
                 self.state.disabled = v;
@@ -350,13 +379,31 @@ impl Composer {
         changed
     }
     fn replace(&mut self, value: String) {
-        let (a, b) = ordered(self.state.selection);
+        let (a, b) = self.safe_range();
         self.state.text.replace_range(a..b, &value);
         let p = a + value.len();
         self.state.selection = Selection {
             anchor: p,
             cursor: p,
         };
+    }
+    fn replace_completion(&mut self, value: String) {
+        let cursor = safe_boundary(&self.state.text, self.state.selection.cursor);
+        let start = self.state.text[..cursor]
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        self.state.selection = Selection {
+            anchor: start,
+            cursor,
+        };
+        self.replace(value);
+    }
+    fn safe_range(&self) -> (usize, usize) {
+        let (a, b) = ordered(self.state.selection);
+        (
+            safe_boundary(&self.state.text, a),
+            safe_boundary(&self.state.text, b),
+        )
     }
     fn delete(&mut self, forward: bool) {
         let (a, b) = ordered(self.state.selection);
@@ -403,7 +450,15 @@ impl Composer {
         true
     }
     fn edge(&mut self, end: bool, selecting: bool) -> bool {
-        let p = if end { self.state.text.len() } else { 0 };
+        let line_start = self.state.text[..self.state.selection.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let line_end = self.state.text[self.state.selection.cursor..]
+            .find('\n')
+            .map_or(self.state.text.len(), |index| {
+                self.state.selection.cursor + index
+            });
+        let p = if end { line_end } else { line_start };
         self.state.selection = if selecting {
             Selection {
                 anchor: self.state.selection.anchor,
@@ -416,6 +471,43 @@ impl Composer {
             }
         };
         true
+    }
+    fn move_vertical(&mut self, direction: i8, selecting: bool) {
+        let cursor = self.state.selection.cursor;
+        let line_start = self.state.text[..cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let line_end = self.state.text[cursor..]
+            .find('\n')
+            .map_or(self.state.text.len(), |index| cursor + index);
+        let column = self.state.text[line_start..cursor].graphemes(true).count();
+        let position = if direction < 0 {
+            if line_start == 0 {
+                0
+            } else {
+                let end = line_start - 1;
+                let start = self.state.text[..end]
+                    .rfind('\n')
+                    .map_or(0, |index| index + 1);
+                grapheme_at_column(&self.state.text, start, end, column)
+            }
+        } else if line_end == self.state.text.len() {
+            line_end
+        } else {
+            let start = line_end + 1;
+            let end = self.state.text[start..]
+                .find('\n')
+                .map_or(self.state.text.len(), |index| start + index);
+            grapheme_at_column(&self.state.text, start, end, column)
+        };
+        self.state.selection = if selecting {
+            Selection {
+                anchor: self.state.selection.anchor,
+                cursor: position,
+            }
+        } else {
+            Selection::caret(position)
+        };
     }
     fn undo_redo(&mut self, undo: bool) -> bool {
         let stack = if undo { &mut self.undo } else { &mut self.redo };
@@ -446,10 +538,25 @@ fn prev_boundary(t: &str, p: usize) -> usize {
         .map_or(0, |(i, _)| i)
 }
 fn next_boundary(t: &str, p: usize) -> usize {
+    let p = safe_boundary(t, p);
     t[p..]
         .grapheme_indices(true)
         .next()
         .map_or(p, |(_, grapheme)| p + grapheme.len())
+}
+fn safe_boundary(text: &str, p: usize) -> usize {
+    let p = p.min(text.len());
+    if text.is_char_boundary(p) {
+        p
+    } else {
+        text[..p].char_indices().next_back().map_or(0, |(i, _)| i)
+    }
+}
+fn grapheme_at_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    text[start..end]
+        .grapheme_indices(true)
+        .nth(column)
+        .map_or(end, |(index, _)| start + index)
 }
 
 #[cfg(test)]

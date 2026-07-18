@@ -7,6 +7,7 @@ use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
 
 use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
+use crate::composer::ComposerAction;
 use crate::input::{TextInput, command_mode};
 use crate::picker::{
     AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
@@ -433,6 +434,14 @@ impl TauView {
                 in_tab_cycle: true,
             });
         }
+        let initial_model = models
+            .get(model_index)
+            .cloned()
+            .unwrap_or_else(|| default_model.clone());
+        input.update(cx, |input, _| {
+            input.set_model(initial_model);
+            input.set_agent(agent.clone());
+        });
         Self {
             input,
             picker_input,
@@ -469,7 +478,7 @@ impl TauView {
 
     fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(next) = next_agent(&self.agents, Some(&self.agent), false) {
-            self.select_agent(next);
+            self.select_agent(next, cx);
         }
         self.chat.status = ChatStatus::Ready;
         cx.notify();
@@ -553,8 +562,8 @@ impl TauView {
         let items = self.picker_items_for(kind, &query);
         if let Some(item) = items.get(self.picker_index).cloned() {
             match kind {
-                PickerKind::Model => self.select_model(item),
-                PickerKind::Agent => self.select_agent(item),
+                PickerKind::Model => self.select_model(item, cx),
+                PickerKind::Agent => self.select_agent(item, cx),
                 PickerKind::Command => self.accept_command(item, &query, cx),
             }
         }
@@ -595,7 +604,9 @@ impl TauView {
         } else {
             format!("{query}{item}")
         };
-        self.input.update(cx, |input, _| input.set_content(value));
+        self.input.update(cx, |input, _| {
+            input.dispatch(ComposerAction::ChooseCompletion(value));
+        });
         self.picker = None;
     }
 
@@ -767,6 +778,9 @@ impl TauView {
     }
 
     fn cancel_turn(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, _| {
+            input.dispatch(ComposerAction::Cancel);
+        });
         self.backend.cancel();
         self.chat.active_assistant = None;
         self.chat.status = ChatStatus::Ready;
@@ -802,8 +816,8 @@ impl TauView {
                 match action {
                     PickerAction::OpenModels => self.open_picker(PickerKind::Model, window, cx),
                     PickerAction::OpenAgents => self.open_picker(PickerKind::Agent, window, cx),
-                    PickerAction::SelectModel(model) => self.select_model(model),
-                    PickerAction::SelectAgent(agent) => self.select_agent(agent),
+                    PickerAction::SelectModel(model) => self.select_model(model, cx),
+                    PickerAction::SelectAgent(agent) => self.select_agent(agent, cx),
                     PickerAction::ToggleFavorite(model) => {
                         let _ = self.backend.toggle_favorite(model.clone());
                         self.preferences.toggle_favorite(model);
@@ -820,6 +834,7 @@ impl TauView {
             }
         }
         self.input.update(cx, |input, _| {
+            input.dispatch(ComposerAction::Send);
             input.record_submission(prompt.clone());
             input.reset();
             input.set_disabled(true);
@@ -850,7 +865,9 @@ impl TauView {
         }));
     }
 
-    fn select_model(&mut self, model: String) {
+    fn select_model(&mut self, model: String, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, _| input.set_model(model.clone()));
         if let Some(index) = self.models.iter().position(|value| value == &model) {
             self.model_index = index;
         }
@@ -862,7 +879,9 @@ impl TauView {
         let _ = self.preferences.save();
     }
 
-    fn select_agent(&mut self, agent: String) {
+    fn select_agent(&mut self, agent: String, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, _| input.set_agent(agent.clone()));
         self.agent = agent.clone();
         self.preferences.selected_agent = Some(agent);
         if let Some(selected) = self.preferences.selected_agent.clone() {
@@ -1024,6 +1043,12 @@ impl TauView {
             Ok(TurnStreamEvent::Event(event)) => {
                 self.runtime = RuntimeState::Ready;
                 self.chat.reduce(ChatAction::SessionEvent(event));
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    let project_id = self.backend.cwd().to_owned();
+                    self.input.update(cx, |input, _| {
+                        input.set_ids(session_id, project_id);
+                    });
+                }
                 cx.notify();
             }
             Ok(TurnStreamEvent::Complete(_)) => {
@@ -1482,6 +1507,7 @@ impl Render for TauView {
                     .child({
                         let input = self.input.read(cx);
                         let refs = input.file_references();
+                        let char_count = input.char_count();
                         div()
                             .flex()
                             .items_center()
@@ -1496,7 +1522,7 @@ impl Render for TauView {
                                     .bg(rgb(0x293b52))
                                     .child(reference)
                             }))
-                            .child(format!("{} characters", input.char_count()))
+                            .child(format!("{} characters", char_count))
                     })
                     .child(
                         div()

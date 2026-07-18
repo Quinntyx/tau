@@ -151,6 +151,8 @@ impl AppState {
         state.session_id = Some(session_id.clone());
         state.project_id = Some(project_id.clone());
         state.composer = Composer::new(session_id, project_id);
+        state.composer.set_model(state.model.clone());
+        state.composer.set_agent(state.agent.clone());
         state
     }
 
@@ -163,16 +165,20 @@ impl AppState {
     }
 
     pub fn restore_buffer(&mut self, snapshot: BufferSnapshot) {
-        self.input = snapshot.input;
-        self.cursor = snapshot.cursor.min(self.input.len());
-        self.selection = snapshot
-            .selection
-            .map(|cursor| cursor.min(self.input.len()));
+        self.composer.set_text(snapshot.input);
+        self.composer.set_selection(
+            snapshot.selection.unwrap_or(snapshot.cursor),
+            snapshot.cursor,
+        );
+        self.input = self.composer.text().to_owned();
+        self.cursor = self.composer.selection().cursor;
+        self.selection = (self.composer.selection().anchor != self.cursor)
+            .then_some(self.composer.selection().anchor);
     }
 }
 impl Default for AppState {
     fn default() -> Self {
-        Self {
+        let mut state = Self {
             composer: Composer::new("", ""),
             project_id: None,
             connection: Connection::Connected,
@@ -224,6 +230,9 @@ impl Default for AppState {
             replaying: false,
             server_index: 0,
             servers: vec!["local".into()],
-        }
+        };
+        state.composer.set_model(state.model.clone());
+        state.composer.set_agent(state.agent.clone());
+        state
     }
 }

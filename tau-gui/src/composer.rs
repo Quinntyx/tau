@@ -145,6 +145,11 @@ impl Composer {
         self.project_id.as_deref()
     }
 
+    pub fn set_ids(&mut self, session_id: impl Into<String>, project_id: impl Into<String>) {
+        self.session_id = Some(session_id.into());
+        self.project_id = Some(project_id.into());
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -153,8 +158,22 @@ impl Composer {
         self.selection
     }
 
+    /// Synchronize the GPUI IME adapter after an edit made by its native
+    /// `EntityInputHandler`.  All subsequent actions still go through this
+    /// model; this is intentionally not a second editable buffer.
+    pub fn sync_ime_text(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if self.text != text {
+            self.text = text;
+            self.selection = Selection::caret(self.text.len());
+            self.undo.clear();
+            self.redo.clear();
+            self.state.send_enabled = !self.state.disabled && !self.text.trim().is_empty();
+        }
+    }
+
     pub fn selected_text(&self) -> Option<&str> {
-        let (start, end) = self.selection.range();
+        let (start, end) = self.safe_range();
         (!self.selection.is_empty()).then(|| &self.text[start..end])
     }
 
@@ -252,7 +271,7 @@ impl Composer {
             ComposerAction::HistoryNext => self.history_next(),
             ComposerAction::InsertFileReference(path) => self.replace(&format!("@{path}")),
             ComposerAction::ChooseSlashCommand(value) | ComposerAction::ChooseCompletion(value) => {
-                self.replace(&value)
+                self.replace_completion(&value)
             }
             ComposerAction::ChooseModel(value) => self.set_model(value),
             ComposerAction::ChooseAgent(value) => self.set_agent(value),
@@ -271,7 +290,7 @@ impl Composer {
     }
 
     fn replace(&mut self, value: &str) {
-        let (start, end) = self.selection.range();
+        let (start, end) = self.safe_range();
         self.undo.push(Snapshot {
             text: self.text.clone(),
             selection: self.selection,
@@ -279,6 +298,22 @@ impl Composer {
         self.redo.clear();
         self.text.replace_range(start..end, value);
         self.selection = Selection::caret(start + value.len());
+    }
+
+    fn replace_completion(&mut self, value: &str) {
+        let start = self.text[..self.selection.cursor]
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        self.selection.anchor = start;
+        self.replace(value);
+    }
+
+    fn safe_range(&self) -> (usize, usize) {
+        let (start, end) = self.selection.range();
+        (
+            previous_boundary(&self.text, start),
+            previous_boundary(&self.text, end),
+        )
     }
 
     fn delete(&mut self, forward: bool) {
@@ -426,6 +461,15 @@ fn grapheme_at_column(text: &str, start: usize, end: usize, column: usize) -> us
         .grapheme_indices(true)
         .nth(column)
         .map_or(end, |(index, _)| start + index)
+}
+
+fn previous_boundary(text: &str, at: usize) -> usize {
+    let at = at.min(text.len());
+    if text.is_char_boundary(at) {
+        at
+    } else {
+        text[..at].char_indices().next_back().map_or(0, |(i, _)| i)
+    }
 }
 
 pub fn command_suggestions(input: &str, commands: &[String]) -> Vec<String> {
