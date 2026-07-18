@@ -4,7 +4,7 @@ use gpui::{
 };
 use tau_client::TurnStreamEvent;
 
-use crate::backend::{Backend, DaemonAction};
+use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, PermissionChoice, Role};
 use crate::input::TextInput;
 
@@ -294,15 +294,19 @@ impl Render for TauView {
             .child(div().text_sm().text_color(rgb(0x8c96a8)).child(format!(
                 "{}  ·  {}",
                 current_model,
-                match &self.runtime {
-                    RuntimeState::NotNegotiated => "Not connected",
-                    RuntimeState::Negotiating => "Negotiating...",
-                    RuntimeState::Ready => match &self.chat.status {
+                match self.backend.daemon_status() {
+                    DaemonStatus::Absent => "Absent",
+                    DaemonStatus::Spawning => "Spawning",
+                    DaemonStatus::Connecting => "Connecting",
+                    DaemonStatus::Negotiating => "Negotiating",
+                    DaemonStatus::Incompatible => "Incompatible",
+                    DaemonStatus::Degraded => "Degraded",
+                    DaemonStatus::Ready => match &self.chat.status {
                         ChatStatus::Ready => "Ready",
                         ChatStatus::Streaming => "Thinking...",
                         ChatStatus::Failed(_) => "Request failed",
                     },
-                    RuntimeState::Failed(_) => "Compatibility error",
+                    DaemonStatus::Failed => "Failed",
                 }
             )));
         let runtime_banner = match &self.runtime {

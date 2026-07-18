@@ -33,6 +33,7 @@ pub enum PolicyEvent {
 struct Inner {
     sink: Mutex<futures_util::stream::SplitSink<WebSocketStream<UnixStream>, Message>>,
     pending: Mutex<HashMap<Id, mpsc::UnboundedSender<Incoming>>>,
+    negotiation: Mutex<Option<NegotiationReport>>,
     events: broadcast::Sender<SequencedEvent>,
     policy_events: broadcast::Sender<PolicyEvent>,
     disconnected: broadcast::Sender<()>,
@@ -106,6 +107,34 @@ impl NegotiationReport {
     }
 }
 
+fn classify_negotiation(
+    requested: ProtocolNegotiateParams,
+    server: ProtocolNegotiateResult,
+) -> NegotiationReport {
+    let missing_capabilities: Vec<Capability> = requested
+        .capabilities
+        .iter()
+        .filter(|capability| !server.capabilities.contains(capability))
+        .cloned()
+        .collect();
+    let version_compatible = server.version.major == requested.version.major
+        && server.version.minor >= requested.version.minor;
+    let core_available = !missing_capabilities.contains(&Capability::TurnStreaming);
+    let compatibility = if !version_compatible || !core_available {
+        ProtocolCompatibility::Incompatible
+    } else if missing_capabilities.is_empty() {
+        ProtocolCompatibility::Compatible
+    } else {
+        ProtocolCompatibility::Degraded
+    };
+    NegotiationReport {
+        requested,
+        server,
+        compatibility,
+        missing_capabilities,
+    }
+}
+
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self> {
         let stream = UnixStream::connect(path.as_ref())
@@ -121,6 +150,7 @@ impl Client {
         let inner = Arc::new(Inner {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
+            negotiation: Mutex::new(None),
             events,
             policy_events,
             disconnected,
@@ -201,6 +231,7 @@ impl Client {
             // Drop their senders so the request table is clean for any owner
             // that establishes a replacement connection.
             pending.clear();
+            routed.negotiation.lock().await.take();
         });
         Ok(Self {
             inner,
@@ -314,8 +345,14 @@ impl Client {
         &self,
         params: ProtocolNegotiateParams,
     ) -> Result<ProtocolNegotiateResult> {
-        serde_json::from_value(self.call(METHOD_PROTOCOL_NEGOTIATE, Some(params)).await?)
-            .context("decoding negotiation")
+        let requested = params.clone();
+        self.inner.negotiation.lock().await.take();
+        let server: ProtocolNegotiateResult =
+            serde_json::from_value(self.call(METHOD_PROTOCOL_NEGOTIATE, Some(params)).await?)
+                .context("decoding negotiation")?;
+        let report = classify_negotiation(requested, server.clone());
+        *self.inner.negotiation.lock().await = Some(report);
+        Ok(server)
     }
 
     /// Negotiate and classify the result against the caller's requirements.
@@ -327,29 +364,10 @@ impl Client {
     ) -> Result<NegotiationReport> {
         let requested = params.clone();
         let server = self.negotiate(params).await?;
-        let missing_capabilities: Vec<Capability> = requested
-            .capabilities
-            .iter()
-            .filter(|capability| !server.capabilities.contains(capability))
-            .cloned()
-            .collect::<Vec<_>>();
-        let version_compatible = server.version.major == requested.version.major
-            && server.version.minor >= requested.version.minor;
-        // Required capabilities are part of the compatibility contract, not a
-        // best-effort hint: callers must not use a feature the daemon omitted.
-        let compatibility = if !version_compatible || !missing_capabilities.is_empty() {
-            ProtocolCompatibility::Incompatible
-        } else {
-            ProtocolCompatibility::Compatible
-        };
-        Ok(NegotiationReport {
-            requested,
-            server,
-            compatibility,
-            missing_capabilities,
-        })
+        Ok(classify_negotiation(requested, server))
     }
     pub async fn turn_cancel(&self, params: TurnCancelParams) -> Result<TurnCancelResult> {
+        self.ensure_capability(Capability::TurnCancellation).await?;
         serde_json::from_value(self.call(METHOD_TURN_CANCEL, Some(params)).await?)
             .context("decoding cancellation")
     }
@@ -358,6 +376,7 @@ impl Client {
             .context("decoding turn response")
     }
     pub async fn turn_replay(&self, params: TurnReplayParams) -> Result<TurnReplayResult> {
+        self.ensure_capability(Capability::EventReplay).await?;
         serde_json::from_value(self.call(METHOD_TURN_REPLAY, Some(params)).await?)
             .context("decoding replay")
     }
@@ -375,6 +394,7 @@ impl Client {
         })
     }
     pub async fn turn_start(&self, params: TurnStartParams) -> Result<TurnStream> {
+        self.ensure_capability(Capability::TurnStreaming).await?;
         let (id, rx) = self.send(METHOD_TURN_START, Some(params)).await?;
         Ok(TurnStream {
             rx,
@@ -382,6 +402,17 @@ impl Client {
             id,
             done: false,
         })
+    }
+
+    async fn ensure_capability(&self, capability: Capability) -> Result<()> {
+        let negotiation = self.inner.negotiation.lock().await;
+        let Some(report) = negotiation.as_ref() else {
+            anyhow::bail!("protocol negotiation required before session.turn.*")
+        };
+        if !report.is_usable() || !report.server.capabilities.contains(&capability) {
+            anyhow::bail!("daemon protocol incompatible; capability unavailable: {capability:?}")
+        }
+        Ok(())
     }
     pub fn events(&self) -> EventStream {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -572,25 +603,7 @@ mod tests {
             version: ProtocolVersion { major: 1, minor: 0 },
             capabilities: offered,
         };
-        let missing_capabilities: Vec<Capability> = requested
-            .capabilities
-            .iter()
-            .filter(|capability| !server.capabilities.contains(capability))
-            .cloned()
-            .collect();
-        let version_compatible = server.version.major == requested.version.major
-            && server.version.minor >= requested.version.minor;
-        let compatibility = if !version_compatible || !missing_capabilities.is_empty() {
-            ProtocolCompatibility::Incompatible
-        } else {
-            ProtocolCompatibility::Compatible
-        };
-        NegotiationReport {
-            requested,
-            server,
-            compatibility,
-            missing_capabilities,
-        }
+        classify_negotiation(requested, server)
     }
 
     #[test]
@@ -624,5 +637,15 @@ mod tests {
         };
         assert_eq!(result.compatibility, ProtocolCompatibility::Incompatible);
         assert!(!result.is_usable());
+    }
+
+    #[test]
+    fn optional_capability_loss_is_degraded_but_turn_usable() {
+        let result = report(
+            vec![Capability::TurnStreaming, Capability::EventReplay],
+            vec![Capability::TurnStreaming],
+        );
+        assert_eq!(result.compatibility, ProtocolCompatibility::Degraded);
+        assert!(result.is_usable());
     }
 }
