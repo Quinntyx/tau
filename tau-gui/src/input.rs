@@ -128,6 +128,55 @@ mod editor_tests {
         e.insert("ok");
         assert_eq!(e.text(), "ok");
     }
+
+    #[test]
+    fn deletion_is_noop_at_both_unicode_boundaries() {
+        let mut e = EditorBuffer::new("😀x");
+        e.move_home(false);
+        e.backspace();
+        e.delete();
+        assert_eq!(e.text(), "x");
+        e.delete();
+        e.delete();
+        assert_eq!(e.text(), "x");
+        e.move_end(false);
+        e.backspace();
+        e.backspace();
+        e.backspace();
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn selection_delete_and_backspace_collapse_to_selection_start() {
+        let mut e = EditorBuffer::new("ab😀cd");
+        e.move_home(false);
+        e.move_right(true);
+        e.move_right(true);
+        e.move_right(true);
+        assert_eq!(e.selected_text(), Some("ab😀"));
+        e.delete();
+        assert_eq!(e.text(), "cd");
+        assert_eq!(e.cursor(), 0);
+
+        e.move_end(false);
+        e.move_left(true);
+        e.backspace();
+        assert_eq!(e.text(), "c");
+        assert_eq!(e.cursor(), 1);
+        assert_eq!(e.selection(), None);
+    }
+
+    #[test]
+    fn horizontal_selection_can_be_reversed_without_invalid_ranges() {
+        let mut e = EditorBuffer::new("a😀b");
+        e.move_end(false);
+        e.move_left(true);
+        e.move_left(true);
+        assert_eq!(e.selected_text(), Some("😀b"));
+        e.move_left(false);
+        assert_eq!(e.selection(), None);
+        assert_eq!(e.cursor(), 0);
+    }
 }
 
 /// Whether the prompt should be interpreted as a command rather than a chat
@@ -456,10 +505,16 @@ impl TextInput {
     fn utf8_offset(&self, offset: usize) -> usize {
         let mut utf16 = 0;
         for (index, ch) in self.content.char_indices() {
-            if utf16 >= offset {
+            // IME ranges are UTF-16 offsets and may point into a surrogate
+            // pair.  Clamp such an offset to the start of the scalar rather
+            // than producing a byte range that splits UTF-8 text.
+            if offset <= utf16 {
                 return index;
             }
             utf16 += ch.len_utf16();
+            if offset < utf16 {
+                return index;
+            }
         }
         self.content.len()
     }
