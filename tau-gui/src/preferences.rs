@@ -183,7 +183,10 @@ impl GuiPreferences {
         }
         out.push_str(&format!(
             "sidebar #{}\nautonomy #{}\ndaemon_warning #{}\ndaemon_owned #{}\n",
-            normalized.sidebar, normalized.autonomy, normalized.daemon_warning, normalized.daemon_owned
+            normalized.sidebar,
+            normalized.autonomy,
+            normalized.daemon_warning,
+            normalized.daemon_owned
         ));
         let temporary = file.with_extension("kdl.tmp");
         std::fs::write(&temporary, out).context("writing temporary gui.kdl")?;
@@ -330,14 +333,19 @@ mod tests {
         let mut text = String::new();
         text.push_str("favorite \"server/model\"\nfavorite \"server/model\"\n");
         for index in 0..(GuiPreferences::MAX_RECENT_MODELS + 2) {
-            text.push_str(&format!("recent \"model-{index}\"\nrecent \"model-{index}\"\n"));
+            text.push_str(&format!(
+                "recent \"model-{index}\"\nrecent \"model-{index}\"\n"
+            ));
         }
         text.push_str("selected_model \"server/model\"\nselected_agent \"remote-agent\"\n");
         std::fs::write(&p, text).unwrap();
 
         let loaded = GuiPreferences::load_from(&p).unwrap();
         assert_eq!(loaded.favorites, vec!["server/model"]);
-        assert_eq!(loaded.recent_models.len(), GuiPreferences::MAX_RECENT_MODELS);
+        assert_eq!(
+            loaded.recent_models.len(),
+            GuiPreferences::MAX_RECENT_MODELS
+        );
         assert_eq!(loaded.recent_models[0], "model-0");
         assert_eq!(loaded.selected_model.as_deref(), Some("server/model"));
         assert_eq!(loaded.selected_agent.as_deref(), Some("remote-agent"));

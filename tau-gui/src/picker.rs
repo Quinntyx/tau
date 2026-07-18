@@ -9,8 +9,45 @@ pub struct ModelOption {
 }
 
 impl ModelOption {
+    /// Adapt the protocol's provider/model identifier once at the typed
+    /// boundary. Renderers should use `provider` and `id` directly rather than
+    /// parsing presentation text.
+    pub fn from_id(id: impl Into<String>, recent: bool, favorite: bool) -> Self {
+        let id = id.into();
+        let provider = id
+            .split_once('/')
+            .map_or_else(|| "default".to_owned(), |(provider, _)| provider.to_owned());
+        Self {
+            id,
+            provider,
+            recent,
+            favorite,
+        }
+    }
+
     pub fn provider_label(&self) -> String {
         self.provider.clone()
+    }
+}
+
+/// The complete model catalog.  Preferences are annotations on catalog
+/// entries, rather than a second (favorites/recents-only) model list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelCatalog {
+    pub models: Vec<ModelOption>,
+}
+
+impl ModelCatalog {
+    pub fn new(models: Vec<ModelOption>) -> Self {
+        Self { models }
+    }
+
+    pub fn filter(&self, query: &str) -> Vec<ModelOption> {
+        fuzzy_models(&self.models, query)
+    }
+
+    pub fn providers(&self, query: &str) -> Vec<(String, Vec<ModelOption>)> {
+        model_groups(&self.models, query)
     }
 }
 
@@ -74,15 +111,28 @@ pub fn fuzzy_models(models: &[ModelOption], query: &str) -> Vec<ModelOption> {
         .cloned()
         .collect();
     result.sort_by(|a, b| {
+        let relevance = |model: &ModelOption| {
+            if query.is_empty() {
+                2
+            } else if model.id.to_lowercase() == query {
+                0
+            } else if model.id.to_lowercase().starts_with(&query) {
+                1
+            } else {
+                2
+            }
+        };
         (
             !a.favorite,
             !a.recent,
+            relevance(a),
             a.provider.to_lowercase(),
             a.id.to_lowercase(),
         )
             .cmp(&(
                 !b.favorite,
                 !b.recent,
+                relevance(b),
                 b.provider.to_lowercase(),
                 b.id.to_lowercase(),
             ))
@@ -190,6 +240,8 @@ pub enum Command {
 pub enum PickerAction {
     SelectModel(String),
     SelectAgent(String),
+    ToggleFavorite(String),
+    RecordRecentModel(String),
     OpenAgents,
     OpenModels,
     Dismiss,
@@ -297,6 +349,55 @@ mod tests {
         assert_eq!(search_agents(&a, "LAN")[0].name, "Plan");
         assert_eq!(next_agent(&a, Some("plan"), false), Some("Build".into()));
     }
+
+    #[test]
+    fn catalog_keeps_provider_identity_and_unmarked_models_reachable() {
+        let catalog = ModelCatalog::new(vec![
+            ModelOption {
+                id: "shared".into(),
+                provider: "alpha".into(),
+                recent: false,
+                favorite: true,
+            },
+            ModelOption {
+                id: "shared".into(),
+                provider: "beta".into(),
+                recent: false,
+                favorite: false,
+            },
+            ModelOption {
+                id: "other".into(),
+                provider: "gamma".into(),
+                recent: false,
+                favorite: false,
+            },
+        ]);
+        let results = catalog.filter("shared");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].provider_label(), "alpha");
+        assert_eq!(results[1].provider_label(), "beta");
+        assert_eq!(catalog.filter("other")[0].provider, "gamma");
+    }
+
+    #[test]
+    fn ranking_is_deterministic_for_equal_preferences() {
+        let models = vec![
+            ModelOption {
+                id: "zeta/fast".into(),
+                provider: "Cloud".into(),
+                recent: false,
+                favorite: false,
+            },
+            ModelOption {
+                id: "alpha/fast".into(),
+                provider: "Cloud".into(),
+                recent: false,
+                favorite: false,
+            },
+        ];
+        assert_eq!(fuzzy_models(&models, "fast")[0].id, "alpha/fast");
+        assert_eq!(fuzzy_models(&models, "fast")[1].id, "zeta/fast");
+    }
     #[test]
     fn commands_parse_suggest_and_emit_actions() {
         assert_eq!(
@@ -346,5 +447,35 @@ mod tests {
         assert_eq!(picker.selected_agent().unwrap().name, "two");
         assert_eq!(picker.cycle(Some("one"), false), Some("two".into()));
         assert_eq!(command_parts("  /agent one"), Some(("/agent", "one")));
+    }
+
+    #[test]
+    fn agent_cycle_uses_configured_options_not_special_names() {
+        let agents = vec![
+            agent("review", true),
+            agent("custom", false),
+            agent("ship", true),
+        ];
+        assert_eq!(
+            next_agent(&agents, Some("review"), false),
+            Some("ship".into())
+        );
+        assert_eq!(
+            next_agent(&agents, Some("ship"), false),
+            Some("review".into())
+        );
+        assert_eq!(
+            next_agent(&agents, Some("review"), true),
+            Some("ship".into())
+        );
+    }
+
+    #[test]
+    fn protocol_model_identifier_is_adapted_before_rendering() {
+        let model = ModelOption::from_id("cloud/reasoner", true, false);
+        assert_eq!(model.id, "cloud/reasoner");
+        assert_eq!(model.provider, "cloud");
+        assert!(model.recent);
+        assert!(!model.favorite);
     }
 }

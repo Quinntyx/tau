@@ -11,6 +11,8 @@ use tau_proto::prelude::{
 };
 use tokio::sync::mpsc;
 
+use crate::picker::PickerAction;
+
 #[derive(Clone)]
 pub struct Backend {
     socket: PathBuf,
@@ -38,17 +40,6 @@ pub enum DaemonAction {
     NeverShowAgain,
 }
 
-/// Typed inputs emitted by the GUI pickers.  These values are identifiers, not
-/// presentation labels, and can be recorded or dispatched without inventing
-/// a separate wire protocol for picker state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PickerAction {
-    SelectModel(String),
-    SelectAgent(String),
-    ToggleFavorite(String),
-    RecordRecentModel(String),
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnRequest {
     pub prompt: String,
@@ -70,7 +61,11 @@ impl TurnRequest {
         match action {
             PickerAction::SelectModel(model) => self.model = Some(model),
             PickerAction::SelectAgent(agent) => self.agent = Some(agent),
-            PickerAction::ToggleFavorite(_) | PickerAction::RecordRecentModel(_) => {}
+            PickerAction::ToggleFavorite(_)
+            | PickerAction::RecordRecentModel(_)
+            | PickerAction::OpenAgents
+            | PickerAction::OpenModels
+            | PickerAction::Dismiss => {}
         }
     }
 
@@ -125,6 +120,16 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    /// Return configured agent identifiers from the daemon's shared config
+    /// schema. The current protocol has no catalog/list RPC, so this explicit
+    /// typed boundary avoids inferring agents from rendered labels while
+    /// selections still cross `TurnStartParams.agent` unchanged.
+    pub fn configured_agents() -> Vec<crate::picker::AgentOption> {
+        tau_core::config::Config::load()
+            .map(configured_agent_options)
+            .unwrap_or_default()
+    }
+
     pub async fn prepare(socket: &PathBuf) -> Result<(Option<Child>, bool, String, String)> {
         let daemon = ensure_daemon(socket).await?;
         let auto_started = daemon.is_some();
@@ -210,6 +215,9 @@ impl Backend {
             PickerAction::SelectAgent(agent) => preferences.select_agent(agent),
             PickerAction::ToggleFavorite(model) => preferences.toggle_favorite(model),
             PickerAction::RecordRecentModel(model) => preferences.record_recent_model(model),
+            PickerAction::OpenAgents | PickerAction::OpenModels | PickerAction::Dismiss => {
+                anyhow::bail!("non-persistent picker action passed to backend")
+            }
         }
         preferences.save_to(&path)
     }
@@ -404,6 +412,17 @@ impl Backend {
     }
 }
 
+fn configured_agent_options(config: tau_core::config::Config) -> Vec<crate::picker::AgentOption> {
+    config
+        .agents
+        .into_iter()
+        .map(|(name, agent)| crate::picker::AgentOption {
+            name,
+            in_tab_cycle: agent.cycle,
+        })
+        .collect()
+}
+
 async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
     // A stale/unresponsive socket must not prevent startup indefinitely.
     if daemon_reachable(socket).await {
@@ -497,5 +516,29 @@ mod tests {
             .into_params("/tmp".into(), "default/model".into());
         assert_eq!(params.model, "default/model");
         assert_eq!(params.agent, None);
+    }
+
+    #[test]
+    fn configured_agent_boundary_preserves_server_configured_names_and_cycle_flags() {
+        let mut config = tau_core::config::Config::default();
+        config.agents.insert(
+            "reviewer".into(),
+            tau_core::config::AgentConfig {
+                cycle: true,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "archive".into(),
+            tau_core::config::AgentConfig {
+                cycle: false,
+                ..Default::default()
+            },
+        );
+        let agents = configured_agent_options(config);
+        assert_eq!(agents[0].name, "archive");
+        assert!(!agents[0].in_tab_cycle);
+        assert_eq!(agents[1].name, "reviewer");
+        assert!(agents[1].in_tab_cycle);
     }
 }

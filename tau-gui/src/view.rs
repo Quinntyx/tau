@@ -92,6 +92,13 @@ impl TauView {
             .and_then(|model| models.iter().position(|candidate| candidate == model))
             .unwrap_or(0);
         let agent = selected_agent.unwrap_or_default();
+        let mut agents = Backend::configured_agents();
+        if !agent.is_empty() && !agents.iter().any(|candidate| candidate.name == agent) {
+            agents.push(AgentOption {
+                name: agent.clone(),
+                in_tab_cycle: true,
+            });
+        }
         Self {
             input,
             picker_input,
@@ -101,11 +108,15 @@ impl TauView {
             agent: agent.clone(),
             toast_visible,
             model_index,
-            models: if models.is_empty() { vec![selected_model.unwrap_or(default_model)] } else { models },
+            models: if models.is_empty() {
+                vec![selected_model.unwrap_or(default_model)]
+            } else {
+                models
+            },
             sidebar_visible: preferences.sidebar,
             picker: None,
             picker_index: 0,
-            agents: if agent.is_empty() { Vec::new() } else { vec![AgentOption { name: agent, in_tab_cycle: true }] },
+            agents,
             preferences,
         }
     }
@@ -225,11 +236,12 @@ impl TauView {
     fn model_options(&self) -> Vec<ModelOption> {
         self.models
             .iter()
-            .map(|id| ModelOption {
-                id: id.clone(),
-                provider: id.split('/').next().unwrap_or("default").to_owned(),
-                recent: self.preferences.recent_models.contains(id),
-                favorite: self.preferences.favorites.contains(id),
+            .map(|id| {
+                ModelOption::from_id(
+                    id,
+                    self.preferences.recent_models.contains(id),
+                    self.preferences.favorites.contains(id),
+                )
             })
             .collect()
     }
@@ -349,6 +361,14 @@ impl TauView {
                     PickerAction::OpenAgents => self.open_picker(PickerKind::Agent, window, cx),
                     PickerAction::SelectModel(model) => self.select_model(model),
                     PickerAction::SelectAgent(agent) => self.select_agent(agent),
+                    PickerAction::ToggleFavorite(model) => {
+                        let _ = self.backend.toggle_favorite(model.clone());
+                        self.preferences.toggle_favorite(model);
+                    }
+                    PickerAction::RecordRecentModel(model) => {
+                        let _ = self.backend.record_recent_model(model.clone());
+                        self.preferences.record_recent_model(model);
+                    }
                     PickerAction::Dismiss => self.picker = None,
                 }
                 self.input.update(cx, |input, _| input.reset());
@@ -365,7 +385,7 @@ impl TauView {
         let receiver = self.backend.turn_with_options(
             prompt,
             self.chat.session_id.clone(),
-                    (!self.agent.is_empty()).then(|| self.agent.clone()),
+            (!self.agent.is_empty()).then(|| self.agent.clone()),
             selected_model,
         );
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -501,7 +521,10 @@ impl TauView {
                     .children(rows.into_iter().enumerate().map(
                         |(display_index, (row, item_index))| {
                             let selected = item_index == Some(self.picker_index);
-                            div()
+                            let favorite_model = (kind == PickerKind::Model)
+                                .then(|| item_index.and_then(|index| items.get(index).cloned()))
+                                .flatten();
+                            let mut row_view = div()
                                 .id(("picker-row", display_index))
                                 .mt_1()
                                 .p_2()
@@ -516,7 +539,26 @@ impl TauView {
                                         }),
                                     )
                                 })
-                                .child(row)
+                                .child(row);
+                            if let Some(model) = favorite_model {
+                                let favorite = self.preferences.favorites.contains(&model);
+                                row_view = row_view.child(
+                                    div()
+                                        .ml_auto()
+                                        .cursor_pointer()
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |view, _, _, cx| {
+                                                let _ = view.backend.toggle_favorite(model.clone());
+                                                view.preferences.toggle_favorite(model.clone());
+                                                let _ = view.preferences.save();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if favorite { "★" } else { "☆" }),
+                                );
+                            }
+                            row_view
                         },
                     ))
                     .child(
@@ -806,7 +848,7 @@ impl Render for TauView {
                 div()
                     .cursor_pointer()
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::click_agent))
-                .child(sidebar_card("AGENT", &self.agent)),
+                    .child(sidebar_card("AGENT", &self.agent)),
             )
             .child(sidebar_card(
                 "PLAN",
