@@ -448,6 +448,8 @@ mod tests {
             .collect::<String>();
         assert!(x.contains("Projects") && x.contains("Conversation"));
         assert!(x.contains("Permission required") && x.contains("run command"));
+        // The current responsive shell places the composer at the bottom of
+        // the content column (after the two-row top bar and project rail).
         assert_eq!(t.get_cursor_position().unwrap(), (35, 25).into());
     }
 

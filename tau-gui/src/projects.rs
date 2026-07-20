@@ -9,12 +9,48 @@ use std::path::PathBuf;
 
 pub type ProjectId = String;
 
+/// The lifecycle state persisted alongside a project record.
+///
+/// `Project` keeps its historical `inactive` field for compatibility with the
+/// shell projection, while this type gives callers a typed way to inspect the
+/// state without manufacturing a "Current project" record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectAvailability {
+    Active,
+    Inactive,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub root: PathBuf,
     pub inactive: bool,
+}
+
+impl Project {
+    /// Convert the daemon's authoritative record into the GUI domain shape.
+    /// The GUI never invents IDs when hydrating this boundary.
+    pub fn from_daemon(record: &tau_proto::projects::Project) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            root: PathBuf::from(&record.root),
+            inactive: !record.active,
+        }
+    }
+
+    pub fn availability(&self) -> ProjectAvailability {
+        if self.inactive {
+            ProjectAvailability::Inactive
+        } else {
+            ProjectAvailability::Active
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.availability() == ProjectAvailability::Active
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -97,6 +133,31 @@ impl ProjectState {
         }
     }
 
+    /// Hydrate solely from records returned by the daemon and restore only an
+    /// active preferred selection. This is the integration seam used by GUI
+    /// adapters after `project.list` completes.
+    pub fn from_daemon(
+        records: impl IntoIterator<Item = tau_proto::projects::Project>,
+        preferred: Option<&str>,
+    ) -> Self {
+        let mut state = Self::new();
+        for record in records {
+            let project = Project::from_daemon(&record);
+            state.projects.insert(project.id.clone(), project);
+        }
+        state.restore_active(preferred);
+        state
+    }
+
+    /// Replace the projection after a daemon mutation or refresh.
+    pub fn replace_from_daemon(
+        &mut self,
+        records: impl IntoIterator<Item = tau_proto::projects::Project>,
+        preferred: Option<&str>,
+    ) {
+        *self = Self::from_daemon(records, preferred);
+    }
+
     /// Restore the last selection only when it still names an active project.
     pub fn restore_active(&mut self, saved: Option<&str>) -> Option<&Project> {
         self.active_project_id = saved.and_then(|id| {
@@ -112,6 +173,18 @@ impl ProjectState {
         self.active_project_id
             .as_ref()
             .and_then(|id| self.projects.get(id))
+    }
+
+    /// The only project identifier that should be written as the last-active
+    /// preference. In particular, inactive records never leak into storage.
+    pub fn persisted_active_id(&self) -> Option<&str> {
+        self.active().map(|project| project.id.as_str())
+    }
+
+    /// Return records suitable for a persistence/UI projection without adding
+    /// a synthetic placeholder when the registry is empty.
+    pub fn records(&self) -> impl Iterator<Item = &Project> {
+        self.projects.values()
     }
 
     pub fn apply(&mut self, action: ProjectAction) -> Result<Option<ProjectId>, ProjectError> {
@@ -153,7 +226,7 @@ impl ProjectState {
         if let Some(existing) = self
             .projects
             .values()
-            .find(|p| p.root == root && p.inactive)
+            .find(|p| p.root == root && p.availability() == ProjectAvailability::Inactive)
             .map(|p| p.id.clone())
         {
             return match choice {
@@ -248,5 +321,43 @@ mod tests {
             ),
             Err(ProjectError::DaemonRequired)
         );
+    }
+
+    #[test]
+    fn daemon_hydration_preserves_ids_and_preferred_active_only() {
+        let records = vec![
+            tau_proto::projects::Project {
+                id: "p_active".into(),
+                name: "Active".into(),
+                root: "/active".into(),
+                active: true,
+                created_at: 1,
+                updated_at: 1,
+            },
+            tau_proto::projects::Project {
+                id: "p_old".into(),
+                name: "Old".into(),
+                root: "/old".into(),
+                active: false,
+                created_at: 1,
+                updated_at: 1,
+            },
+        ];
+        let state = ProjectState::from_daemon(records, Some("p_active"));
+        assert_eq!(state.projects.len(), 2);
+        assert_eq!(state.persisted_active_id(), Some("p_active"));
+        assert!(state.projects["p_old"].inactive);
+        let no_selection = ProjectState::from_daemon(
+            vec![tau_proto::projects::Project {
+                id: "p_old".into(),
+                name: "Old".into(),
+                root: "/old".into(),
+                active: false,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            Some("p_old"),
+        );
+        assert!(no_selection.persisted_active_id().is_none());
     }
 }

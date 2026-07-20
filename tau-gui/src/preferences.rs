@@ -8,6 +8,7 @@ pub struct GuiPreferences {
     pub recent_models: Vec<String>,
     pub selected_model: Option<String>,
     pub selected_agent: Option<String>,
+    pub selected_project_id: Option<String>,
     pub sidebar: bool,
     pub autonomy: bool,
     pub daemon_warning: bool,
@@ -21,6 +22,7 @@ impl Default for GuiPreferences {
             recent_models: Vec::new(),
             selected_model: None,
             selected_agent: None,
+            selected_project_id: None,
             sidebar: true,
             autonomy: false,
             daemon_warning: true,
@@ -113,6 +115,10 @@ impl GuiPreferences {
                     result.selected_agent =
                         Some(value().context("selected_agent requires a string")?)
                 }
+                "selected_project" => {
+                    result.selected_project_id =
+                        Some(value().context("selected_project requires a string")?)
+                }
                 "sidebar" => {
                     result.sidebar = node
                         .entries()
@@ -181,6 +187,12 @@ impl GuiPreferences {
                 kdl::KdlValue::String(value.clone())
             ));
         }
+        if let Some(value) = &normalized.selected_project_id {
+            out.push_str(&format!(
+                "selected_project {}\n",
+                kdl::KdlValue::String(value.clone())
+            ));
+        }
         out.push_str(&format!(
             "sidebar #{}\nautonomy #{}\ndaemon_warning #{}\ndaemon_owned #{}\n",
             normalized.sidebar,
@@ -216,6 +228,7 @@ mod tests {
             recent_models: vec!["b".into()],
             selected_model: Some("b".into()),
             selected_agent: Some("code".into()),
+            selected_project_id: Some("project-a".into()),
             sidebar: true,
             autonomy: false,
             daemon_warning: true,
@@ -234,6 +247,7 @@ mod tests {
             recent_models: vec![],
             selected_model: None,
             selected_agent: None,
+            selected_project_id: None,
             sidebar: true,
             autonomy: true,
             daemon_warning: false,
