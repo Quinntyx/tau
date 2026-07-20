@@ -98,7 +98,7 @@ async fn clean_home_launches_and_reopens_the_scripted_workflow() -> Result<()> {
     assert!(
         client
             .git_status(GitStatusParams {
-                project: project.root.clone()
+                project: project.id.clone()
             })
             .await?
             .files
