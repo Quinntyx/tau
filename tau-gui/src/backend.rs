@@ -214,6 +214,13 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    fn require_project_id(project_id: &str) -> Result<()> {
+        if project_id.trim().is_empty() {
+            anyhow::bail!("cannot access session: select an active project first")
+        }
+        Ok(())
+    }
+
     async fn typed_client(&self) -> Result<tau_client::Client> {
         let mut guard = self.session.lock().await;
         if guard.is_none() {
@@ -240,6 +247,7 @@ impl Backend {
         let backend = self.clone();
         let cwd = self.cwd.clone();
         self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
             let client = backend.typed_client().await?;
             let summary = client
                 .session_create(CreateSession {
@@ -251,6 +259,21 @@ impl Backend {
         })
     }
 
+    /// Load the daemon-owned project registry.  Callers must use the returned
+    /// opaque IDs; deriving IDs from a working directory creates a split-brain
+    /// registry and cannot create valid sessions.
+    pub async fn project_list(
+        &self,
+        include_inactive: bool,
+    ) -> Result<tau_proto::projects::ProjectListResult> {
+        self.typed_client()
+            .await?
+            .project_list(tau_proto::projects::ProjectListParams {
+                include_inactive: Some(include_inactive),
+            })
+            .await
+    }
+
     pub fn session_list(
         &self,
         project_id: ProjectId,
@@ -258,6 +281,7 @@ impl Backend {
     ) -> tokio::task::JoinHandle<Result<Vec<SessionSummary>>> {
         let backend = self.clone();
         self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
             let client = backend.typed_client().await?;
             client
                 .session_list_with_archived(project_id, include_archived)
@@ -282,8 +306,10 @@ impl Backend {
         params: SessionRename,
     ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
         let backend = self.clone();
-        self.runtime
-            .spawn(async move { backend.typed_client().await?.session_rename(params).await })
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_rename(params).await
+        })
     }
 
     pub fn session_archive(
@@ -291,8 +317,10 @@ impl Backend {
         params: SessionRef,
     ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
         let backend = self.clone();
-        self.runtime
-            .spawn(async move { backend.typed_client().await?.session_archive(params).await })
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_archive(params).await
+        })
     }
 
     pub fn session_restore(
@@ -300,8 +328,10 @@ impl Backend {
         params: SessionRef,
     ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
         let backend = self.clone();
-        self.runtime
-            .spawn(async move { backend.typed_client().await?.session_restore(params).await })
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_restore(params).await
+        })
     }
 
     pub fn session_history(
@@ -309,8 +339,10 @@ impl Backend {
         params: SessionRef,
     ) -> tokio::task::JoinHandle<Result<SessionHistory>> {
         let backend = self.clone();
-        self.runtime
-            .spawn(async move { backend.typed_client().await?.session_history(params).await })
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_history(params).await
+        })
     }
 
     /// The active session is a GUI-local preference; the daemon only owns the
@@ -327,6 +359,7 @@ impl Backend {
     ) -> tokio::task::JoinHandle<Result<Option<SessionSummary>>> {
         let backend = self.clone();
         self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
             let store = Self::active_session_store()?;
             let restored = store.restore(&backend.typed_client().await?).await?;
             Ok(restored.filter(|session| session.project_id.as_str() == project_id.as_str()))
@@ -340,6 +373,10 @@ impl Backend {
     ) -> tokio::task::JoinHandle<Result<()>> {
         let session_id = session_id.into();
         self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
+            if session_id.trim().is_empty() {
+                anyhow::bail!("cannot save active session: session ID is empty");
+            }
             let store = Self::active_session_store()?;
             store.save(&SessionRef {
                 project_id,

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use uuid::Uuid;
 
 use super::Db;
@@ -35,9 +36,9 @@ impl Db {
     pub fn create_session_for_project(
         &self,
         project_id: &ProjectId,
-        _cwd: &str,
+        cwd: &str,
     ) -> Result<SessionRecord> {
-        let session = self.create_session(project_id.as_str())?;
+        let session = self.create_session_with_cwd(project_id.as_str(), cwd)?;
         Ok(SessionRecord {
             id: session.id,
             project_id: project_id.clone(),
@@ -185,11 +186,54 @@ impl Db {
         )?))
     }
     pub fn create_session(&self, project_id: &str) -> Result<Session> {
+        self.create_session_with_cwd(project_id, "")
+    }
+
+    fn create_session_with_cwd(&self, project_id: &str, requested_cwd: &str) -> Result<Session> {
         let now = now_ms();
+        let root = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT root FROM projects WHERE id = ?1 AND active = 1",
+                [project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| anyhow::anyhow!("project does not exist or is inactive"))?
+        };
+        let cwd = if requested_cwd.trim().is_empty() {
+            root.clone()
+        } else {
+            let candidate = Path::new(requested_cwd);
+            let candidate = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                Path::new(&root).join(candidate)
+            };
+            if candidate != Path::new(&root) {
+                // Check the canonical parent before allowing the path helper
+                // to create one missing final directory.  Otherwise a
+                // traversal such as `../outside` could create an
+                // out-of-project directory before the containment check
+                // rejects it.  The project root itself is the one valid path
+                // whose parent is necessarily outside the project.
+                let parent = candidate
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("session cwd has no parent"))?;
+                let canonical_parent = std::fs::canonicalize(parent)?;
+                if !canonical_parent.starts_with(&root) {
+                    anyhow::bail!("session cwd must be within project root");
+                }
+            }
+            let canonical = super::domain::canonical_project_root(&candidate)?;
+            if !Path::new(&canonical).starts_with(&root) {
+                anyhow::bail!("session cwd must be within project root");
+            }
+            canonical
+        };
         let session = Session {
             id: Uuid::new_v4().to_string(),
             project_id: project_id.to_string(),
-            cwd: String::new(),
+            cwd: cwd.clone(),
             title: None,
             created_at: now,
             updated_at: now,
@@ -197,7 +241,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (id, project_id, cwd, title, created_at, updated_at, archived_at) \
-             SELECT ?1, id, root, ?2, ?3, ?4, NULL FROM projects \
+             SELECT ?1, id, ?6, ?2, ?3, ?4, NULL FROM projects \
              WHERE id = ?5 AND active = 1",
             rusqlite::params![
                 &session.id,
@@ -205,16 +249,12 @@ impl Db {
                 session.created_at,
                 session.updated_at,
                 project_id,
+                cwd,
             ],
         )?;
         if conn.changes() != 1 {
             anyhow::bail!("project does not exist or is inactive");
         }
-        let cwd: String = conn.query_row(
-            "SELECT cwd FROM sessions WHERE id=?1",
-            [&session.id],
-            |row| row.get(0),
-        )?;
         Ok(Session { cwd, ..session })
     }
 

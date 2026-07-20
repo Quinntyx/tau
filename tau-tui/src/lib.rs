@@ -84,15 +84,39 @@ async fn session(
     socket: PathBuf,
 ) -> Result<()> {
     let mut state = AppState {
-        project_root: std::env::current_dir()?.to_string_lossy().into_owned(),
+        project_root: String::new(),
         ..AppState::default()
     };
     state.operations.project = state.project_root.clone();
-    // Projects are a client-local projection.  Keep their lifecycle entirely
-    // on this side of the daemon adapter: turns continue to use AppState and
-    // no project wire protocol is implied by the shell.
+    // The daemon is authoritative for projects.  Until its list is loaded,
+    // leave selection empty rather than inventing a cwd-derived project.
+    let registry = client
+        .project_list(tau_proto::projects::ProjectListParams {
+            include_inactive: Some(true),
+        })
+        .await?;
     let mut projects = ProjectState::default();
-    initialize_projects(&mut projects);
+    projects.load_daemon_projects(registry.projects.iter().map(|project| {
+        (
+            projects::ProjectId(project.id.clone()),
+            project.name.clone(),
+            project.root.clone(),
+            if project.active {
+                projects::ProjectStatus::Active
+            } else {
+                projects::ProjectStatus::Inactive
+            },
+        )
+    }));
+    if let Some(selected) = projects
+        .selected
+        .as_ref()
+        .and_then(|id| projects.projects.get(id))
+    {
+        state.project_id = Some(selected.id.0.clone());
+        state.project_root = selected.root.clone();
+        state.operations.project = selected.root.clone();
+    }
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut event_task = tokio::spawn(adapter::persistent_events(
         client.clone(),
@@ -283,28 +307,8 @@ async fn session(
     Ok(())
 }
 
-/// Seed and restore the local project projection for a new client session.
-/// The working directory is deliberately only a UI-local registration; it is
-/// not sent to the daemon as a protocol request.
-fn initialize_projects(projects: &mut ProjectState) {
-    if let Ok(root) = std::env::current_dir() {
-        let root = root.to_string_lossy().into_owned();
-        let name = root
-            .rsplit(std::path::MAIN_SEPARATOR)
-            .find(|part| !part.is_empty())
-            .unwrap_or("project")
-            .to_owned();
-        let _ = apply_project_action(projects, ProjectAction::Register { name, root });
-    }
-    let saved = projects.selected.clone();
-    projects.restore_active(saved.as_ref());
-}
-
-/// Narrow adapter seam for project intents.  Project actions remain typed and
-/// client-local until a future adapter explicitly gains server support.
-/// Dispatch a typed project intent through the client-local adapter seam.
-/// S1 can replace this function's implementation with acknowledged service
-/// calls without changing the Ratatui shell or reducer.
+/// Dispatch a typed project projection update. Production callers should feed
+/// this from acknowledged daemon project responses, never cwd discovery.
 pub fn apply_project_action(
     projects: &mut ProjectState,
     action: ProjectAction,
@@ -397,8 +401,7 @@ mod tests {
     #[test]
     fn initial_buffer_has_client_chrome() {
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut projects = ProjectState::default();
-        initialize_projects(&mut projects);
+        let projects = ProjectState::default();
         t.draw(|f| shell::render_with_projects(f, &AppState::default(), &projects))
             .unwrap();
         let text: String = t

@@ -277,12 +277,12 @@ mod tests {
     #[test]
     fn typed_project_projection_renders_selected_project() {
         let mut projects = ProjectState::default();
-        projects
-            .apply(crate::projects::ProjectAction::Register {
-                name: "demo".into(),
-                root: "/tmp/demo".into(),
-            })
-            .unwrap();
+        projects.load_daemon_projects([(
+            crate::projects::ProjectId("daemon-demo".into()),
+            "demo".into(),
+            "/tmp/demo".into(),
+            crate::projects::ProjectStatus::Active,
+        )]);
         let state = AppState::default();
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal

@@ -20,6 +20,13 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 // the compatibility name.
 const METHOD_DIFF_REPLY: &str = METHOD_DIFF_DECISION;
 
+fn require_non_empty(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    Ok(())
+}
+
 /// Opaque project identifier supplied by the application.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -100,6 +107,12 @@ mod compatibility_tests {
     #[test]
     fn diff_reply_uses_protocol_decision_method() {
         assert_eq!(METHOD_DIFF_REPLY, METHOD_DIFF_DECISION);
+    }
+
+    #[test]
+    fn identifiers_are_not_allowed_to_be_empty() {
+        assert!(require_non_empty("", "project_id").is_err());
+        assert!(require_non_empty("session", "session_id").is_ok());
     }
 }
 
@@ -501,6 +514,8 @@ impl Client {
     }
 
     pub async fn session_create(&self, params: CreateSession) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(&params.cwd, "cwd")?;
         let wire = tau_proto::session::CreateParams {
             project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
             cwd: params.cwd,
@@ -516,6 +531,7 @@ impl Client {
         project_id: ProjectId,
         include_archived: bool,
     ) -> Result<Vec<SessionSummary>> {
+        require_non_empty(project_id.as_str(), "project_id")?;
         let params = tau_proto::session::ListParams {
             project_id: tau_proto::session::ProjectId::new(project_id.as_str()),
             include_archived,
@@ -532,6 +548,8 @@ impl Client {
         after_sequence: u64,
         limit: Option<u32>,
     ) -> Result<SessionHistory> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
         let wire = tau_proto::session::HistoryParams {
             project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
             session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
@@ -546,6 +564,8 @@ impl Client {
         })
     }
     pub async fn session_rename(&self, params: SessionRename) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
         let wire = tau_proto::session::RenameParams {
             project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
             session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
@@ -555,6 +575,8 @@ impl Client {
             .context("decoding renamed session")
     }
     pub async fn session_archive(&self, params: SessionRef) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
         let wire = tau_proto::session::SessionIdParams {
             project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
             session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
@@ -563,6 +585,8 @@ impl Client {
             .context("decoding archived session")
     }
     pub async fn session_restore(&self, params: SessionRef) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
         let wire = tau_proto::session::SessionIdParams {
             project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
             session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
@@ -598,6 +622,8 @@ impl Client {
     }
     pub async fn turn_cancel(&self, params: TurnCancelParams) -> Result<TurnCancelResult> {
         self.ensure_capability(Capability::TurnCancellation).await?;
+        require_non_empty(&params.session_id, "session_id")?;
+        require_non_empty(&params.turn_id, "turn_id")?;
         serde_json::from_value(self.call(METHOD_TURN_CANCEL, Some(params)).await?)
             .context("decoding cancellation")
     }
@@ -608,6 +634,8 @@ impl Client {
     }
 
     pub async fn project_create(&self, params: ProjectCreateParams) -> Result<ProjectCreateResult> {
+        require_non_empty(&params.name, "name")?;
+        require_non_empty(&params.root, "root")?;
         serde_json::from_value(self.call(METHOD_PROJECT_CREATE, Some(params)).await?)
             .context("decoding project creation")
     }
@@ -616,6 +644,8 @@ impl Client {
         &self,
         params: ProjectRenameParams,
     ) -> Result<ProjectMutationResult> {
+        require_non_empty(&params.project_id, "project_id")?;
+        require_non_empty(&params.name, "name")?;
         serde_json::from_value(self.call(METHOD_PROJECT_RENAME, Some(params)).await?)
             .context("decoding project rename")
     }
@@ -624,30 +654,38 @@ impl Client {
         &self,
         params: ProjectRepathParams,
     ) -> Result<ProjectMutationResult> {
+        require_non_empty(&params.project_id, "project_id")?;
+        require_non_empty(&params.root, "root")?;
         serde_json::from_value(self.call(METHOD_PROJECT_REPATH, Some(params)).await?)
             .context("decoding project repath")
     }
 
     pub async fn project_unregister(&self, params: ProjectIdParams) -> Result<ProjectActionResult> {
+        require_non_empty(&params.project_id, "project_id")?;
         serde_json::from_value(self.call(METHOD_PROJECT_UNREGISTER, Some(params)).await?)
             .context("decoding project unregister")
     }
 
     pub async fn project_reactivate(&self, params: ProjectIdParams) -> Result<ProjectActionResult> {
+        require_non_empty(&params.project_id, "project_id")?;
         serde_json::from_value(self.call(METHOD_PROJECT_REACTIVATE, Some(params)).await?)
             .context("decoding project reactivation")
     }
 
     pub async fn project_new_id(&self, params: ProjectNewIdParams) -> Result<ProjectNewIdResult> {
+        require_non_empty(&params.project_id, "project_id")?;
         serde_json::from_value(self.call(METHOD_PROJECT_NEW_ID, Some(params)).await?)
             .context("decoding project id")
     }
     pub async fn turn_response(&self, params: TurnResponseParams) -> Result<TurnResponseResult> {
+        require_non_empty(&params.session_id, "session_id")?;
+        require_non_empty(&params.turn_id, "turn_id")?;
         serde_json::from_value(self.call(METHOD_TURN_RESPONSE, Some(params)).await?)
             .context("decoding turn response")
     }
     pub async fn turn_replay(&self, params: TurnReplayParams) -> Result<TurnReplayResult> {
         self.ensure_capability(Capability::EventReplay).await?;
+        require_non_empty(&params.session_id, "session_id")?;
         serde_json::from_value(self.call(METHOD_TURN_REPLAY, Some(params)).await?)
             .context("decoding replay")
     }
@@ -666,6 +704,10 @@ impl Client {
     }
     pub async fn turn_start(&self, params: TurnStartParams) -> Result<TurnStream> {
         self.ensure_capability(Capability::TurnStreaming).await?;
+        require_non_empty(&params.project_id, "project_id")?;
+        if let Some(session_id) = params.session_id.as_deref() {
+            require_non_empty(session_id, "session_id")?;
+        }
         let (id, rx) = self.send(METHOD_TURN_START, Some(params)).await?;
         Ok(TurnStream {
             rx,

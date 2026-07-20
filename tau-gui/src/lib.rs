@@ -64,22 +64,28 @@ impl ProjectServiceAdapter for LocalProjectAdapter {
 }
 
 impl ProjectShellRoot {
-    fn new(backend: Backend, cx: &mut GpuiContext<Self>) -> Self {
-        let cwd = PathBuf::from(backend.cwd());
+    fn new(
+        backend: Backend,
+        daemon_projects: Vec<tau_proto::projects::Project>,
+        cx: &mut GpuiContext<Self>,
+    ) -> Self {
         let mut state = ProjectState::new();
-        let id = state
-            .create("Current project".into(), cwd.clone())
-            .expect("fresh project");
-        let shell_state = shell::ProjectState::Ready(vec![ProjectItem {
-            id: id.clone(),
-            name: "Current project".into(),
-            path: cwd,
-        }]);
-        let shell = cx.new(|_: &mut GpuiContext<ProjectShell>| {
-            let mut project_shell = ProjectShell::new(shell_state.clone());
-            project_shell.select(id);
-            project_shell
-        });
+        for project in &daemon_projects {
+            state.insert_daemon_project(
+                project.id.clone(),
+                project.name.clone(),
+                PathBuf::from(&project.root),
+                !project.active,
+            );
+        }
+        let items = project_items(&state);
+        let shell_state = if items.is_empty() {
+            shell::ProjectState::Empty
+        } else {
+            shell::ProjectState::Ready(items)
+        };
+        let shell =
+            cx.new(|_: &mut GpuiContext<ProjectShell>| ProjectShell::new(shell_state.clone()));
         let view = cx.new(|cx| TauView::new(backend, cx));
         Self {
             shell,
@@ -220,7 +226,17 @@ pub fn run(socket: PathBuf) -> Result<()> {
             .context("starting tau daemon")?
     };
     let backend =
-        Backend::from_parts_with_startup(socket, handle, daemon, auto_started, cwd, model);
+        Backend::from_parts_with_startup(socket, handle.clone(), daemon, auto_started, cwd, model);
+    let project_handle = handle.clone();
+    let daemon_projects = if let Ok(result) = if Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| project_handle.block_on(backend.project_list(true)))
+    } else {
+        project_handle.block_on(backend.project_list(true))
+    } {
+        result.projects
+    } else {
+        Vec::new()
+    };
     Application::new().run(move |cx: &mut App| {
         input::bind_keys(cx);
         view::bind_keys(cx);
@@ -235,7 +251,7 @@ pub fn run(socket: PathBuf) -> Result<()> {
                     }),
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|cx| ProjectShellRoot::new(backend, cx)),
+                move |_, cx| cx.new(|cx| ProjectShellRoot::new(backend, daemon_projects, cx)),
             )
             .context("opening tau window");
         if let Err(error) = window {
@@ -254,10 +270,12 @@ mod tests {
     #[test]
     fn local_adapter_reaches_project_lifecycle_without_wire_types() {
         let mut adapter = LocalProjectAdapter::default();
-        adapter.dispatch(ProjectServiceAction::Create {
-            name: "demo".into(),
-            root: "/tmp/demo".into(),
-        });
+        adapter.state.insert_daemon_project(
+            "daemon-demo".into(),
+            "demo".into(),
+            "/tmp/demo".into(),
+            false,
+        );
         let id = adapter.state.active_project_id.clone().unwrap();
         adapter.dispatch(ProjectServiceAction::Update {
             id: id.clone(),

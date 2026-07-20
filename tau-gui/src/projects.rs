@@ -5,7 +5,7 @@
 //! client last displayed.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub type ProjectId = String;
 
@@ -49,11 +49,52 @@ pub enum ProjectAction {
 pub enum ProjectError {
     NotFound(ProjectId),
     AlreadyRegistered(PathBuf),
+    DaemonRequired,
 }
+
+impl std::fmt::Display for ProjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "project '{id}' was not found or is inactive"),
+            Self::AlreadyRegistered(root) => {
+                write!(f, "project root is already registered: {}", root.display())
+            }
+            Self::DaemonRequired => write!(f, "project changes require the daemon registry"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectError {}
 
 impl ProjectState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Insert a record returned by the daemon registry.  Project IDs are never
+    /// derived from paths in this projection.
+    pub fn insert_daemon_project(
+        &mut self,
+        id: ProjectId,
+        name: String,
+        root: PathBuf,
+        inactive: bool,
+    ) {
+        if id.trim().is_empty() {
+            return;
+        }
+        self.projects.insert(
+            id.clone(),
+            Project {
+                id: id.clone(),
+                name,
+                root,
+                inactive,
+            },
+        );
+        if !inactive && self.active_project_id.is_none() {
+            self.active_project_id = Some(id);
+        }
     }
 
     /// Restore the last selection only when it still names an active project.
@@ -99,25 +140,8 @@ impl ProjectState {
     }
 
     pub fn create(&mut self, name: String, root: PathBuf) -> Result<ProjectId, ProjectError> {
-        if self
-            .projects
-            .values()
-            .any(|p| p.root == root && !p.inactive)
-        {
-            return Err(ProjectError::AlreadyRegistered(root));
-        }
-        let id = fresh_id(&self.projects, &root);
-        self.projects.insert(
-            id.clone(),
-            Project {
-                id: id.clone(),
-                name,
-                root,
-                inactive: false,
-            },
-        );
-        self.active_project_id = Some(id.clone());
-        Ok(id)
+        let _ = (name, root);
+        Err(ProjectError::DaemonRequired)
     }
 
     pub fn register(
@@ -188,32 +212,14 @@ impl ProjectState {
     }
 }
 
-fn fresh_id(projects: &BTreeMap<ProjectId, Project>, root: &Path) -> ProjectId {
-    let base = format!("project-{:016x}", stable_hash(root));
-    if !projects.contains_key(&base) {
-        return base;
-    }
-    (1..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|id| !projects.contains_key(id))
-        .unwrap()
-}
-
-fn stable_hash(path: &Path) -> u64 {
-    path.to_string_lossy()
-        .bytes()
-        .fold(14695981039346656037, |h, b| {
-            (h ^ b as u64).wrapping_mul(1099511628211)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn scripted_lifecycle_and_restore() {
         let mut state = ProjectState::new();
-        let id = state.create("one".into(), PathBuf::from("/one")).unwrap();
+        let id = "daemon-one".to_owned();
+        state.insert_daemon_project(id.clone(), "one".into(), PathBuf::from("/one"), false);
         state
             .update(&id, "renamed".into(), PathBuf::from("/uno"))
             .unwrap();
@@ -231,19 +237,16 @@ mod tests {
     #[test]
     fn inactive_registration_choice_can_create_a_second_id_for_same_root() {
         let mut state = ProjectState::default();
-        let old = state
-            .create("old".into(), PathBuf::from("/shared"))
-            .unwrap();
+        let old = "daemon-old".to_owned();
+        state.insert_daemon_project(old.clone(), "old".into(), PathBuf::from("/shared"), false);
         state.unregister(&old).unwrap();
-        let new = state
-            .register(
+        assert_eq!(
+            state.register(
                 "new".into(),
                 PathBuf::from("/shared"),
-                InactiveRegistration::CreateNew,
-            )
-            .unwrap();
-        assert_ne!(new, old);
-        assert_eq!(state.projects[&new].root, PathBuf::from("/shared"));
-        assert_eq!(state.active_project_id.as_deref(), Some(new.as_str()));
+                InactiveRegistration::CreateNew
+            ),
+            Err(ProjectError::DaemonRequired)
+        );
     }
 }

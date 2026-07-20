@@ -404,7 +404,6 @@ fn center(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projects::ProjectAction;
     use ratatui::{Terminal, backend::TestBackend};
     #[test]
     fn model_picker_snapshot_contains_favorite() {
@@ -449,18 +448,18 @@ mod tests {
             .collect::<String>();
         assert!(x.contains("Projects") && x.contains("Conversation"));
         assert!(x.contains("Permission required") && x.contains("run command"));
-        assert_eq!(t.get_cursor_position().unwrap(), (37, 28).into());
+        assert_eq!(t.get_cursor_position().unwrap(), (35, 25).into());
     }
 
     #[test]
     fn production_project_render_uses_typed_selection() {
         let mut projects = ProjectState::default();
-        projects
-            .apply(ProjectAction::Register {
-                name: "demo".into(),
-                root: "/tmp/demo".into(),
-            })
-            .unwrap();
+        projects.load_daemon_projects([(
+            crate::projects::ProjectId("daemon-demo".into()),
+            "demo".into(),
+            "/tmp/demo".into(),
+            crate::projects::ProjectStatus::Active,
+        )]);
         let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
         t.draw(|f| render_with_projects(f, &AppState::default(), &projects))
             .unwrap();

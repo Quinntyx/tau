@@ -43,6 +43,27 @@ pub struct Navigator {
 }
 
 impl Navigator {
+    /// Replace the projection with summaries acknowledged by the daemon.
+    /// Records from another project are intentionally discarded here so a
+    /// stale response can never leak sessions into the active navigator.
+    pub fn load_daemon_sessions(
+        &mut self,
+        project: ProjectId,
+        sessions: impl IntoIterator<Item = (SessionId, String, u64, bool)>,
+    ) {
+        self.project = Some(project.clone());
+        self.sessions = sessions
+            .into_iter()
+            .map(|(id, title, updated_at, archived)| SessionEntry {
+                id,
+                project_id: project.clone(),
+                title,
+                updated_at,
+                archived,
+            })
+            .collect();
+        self.selected = 0;
+    }
     pub fn visible(&self) -> Vec<&SessionEntry> {
         let q = self.query.to_lowercase();
         let mut result: Vec<_> = self
@@ -82,18 +103,33 @@ impl Navigator {
             .unwrap_or(0);
     }
     pub fn rename(&mut self, id: &SessionId, title: impl Into<String>) {
-        if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
+        let project = self.project.clone();
+        if let Some(s) = self
+            .sessions
+            .iter_mut()
+            .find(|s| &s.id == id && project.as_ref() == Some(&s.project_id))
+        {
             s.title = title.into();
         }
     }
     pub fn archive(&mut self, id: &SessionId) {
-        if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
+        let project = self.project.clone();
+        if let Some(s) = self
+            .sessions
+            .iter_mut()
+            .find(|s| &s.id == id && project.as_ref() == Some(&s.project_id))
+        {
             s.archived = true;
         }
         self.selected = self.selected.min(self.visible().len().saturating_sub(1));
     }
     pub fn restore(&mut self, id: &SessionId) {
-        if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
+        let project = self.project.clone();
+        if let Some(s) = self
+            .sessions
+            .iter_mut()
+            .find(|s| &s.id == id && project.as_ref() == Some(&s.project_id))
+        {
             s.archived = false;
         }
     }
@@ -103,10 +139,14 @@ impl Navigator {
         self.selected = 0;
     }
 
-    /// The daemon/client adapter supplies the durable ID in production; this
-    /// helper keeps the presentation model immediately selectable in tests.
-    pub fn new_chat(&mut self, project_id: ProjectId, now: u64) -> SessionId {
-        let id = SessionId::new(format!("local-{now}"));
+    /// Insert a session created by the daemon. IDs are never synthesized in
+    /// the presentation layer.
+    pub fn new_chat(&mut self, project_id: ProjectId, id: SessionId, now: u64) -> SessionId {
+        if self.project.as_ref() != Some(&project_id) {
+            self.project = Some(project_id.clone());
+            self.selected = 0;
+        }
+        self.sessions.retain(|session| session.id != id);
         self.sessions.push(SessionEntry {
             id: id.clone(),
             project_id,
@@ -145,6 +185,7 @@ mod tests {
     #[test]
     fn archived_is_hidden_but_restore_recovers() {
         let mut n = Navigator {
+            project: Some(ProjectId::new("p")),
             sessions: vec![item("x", "X", 1)],
             ..Default::default()
         };
@@ -162,7 +203,8 @@ mod tests {
             project: Some(ProjectId::new("p")),
             ..Default::default()
         };
-        let id = n.new_chat(ProjectId::new("p"), 10);
+        let id = SessionId::new("daemon-session");
+        n.new_chat(ProjectId::new("p"), id.clone(), 10);
         n.restart_selection(Some(id.as_str()));
         assert_eq!(n.selected_id(), Some(id));
         assert_eq!(n.visible()[0].title, "");

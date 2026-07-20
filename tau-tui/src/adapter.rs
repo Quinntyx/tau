@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::Result;
 use futures_util::StreamExt;
-use tau_client::{Client, TurnStreamEvent};
+use tau_client::{Client, CreateSession, ProjectId, TurnStreamEvent};
 use tau_proto::prelude::{
     BoundedOutput, ClientResponse, IdempotencyKey, SequencedEvent, TurnEvent, TurnResponseParams,
 };
@@ -121,7 +121,23 @@ pub async fn complete(
     let Some(_) = s.project_id.as_deref() else {
         anyhow::bail!("cannot start turn: select an active project first");
     };
-    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let project_id = s.project_id.clone().expect("checked above");
+    let cwd = if s.project_root.trim().is_empty() {
+        anyhow::bail!("cannot start turn: active project has no canonical path")
+    } else {
+        s.project_root.clone()
+    };
+    // Establish the durable session before streaming a turn. This prevents a
+    // client-only/session-less turn from becoming an unattached history.
+    if s.session_id.is_none() {
+        let summary = client
+            .session_create(CreateSession {
+                project_id: ProjectId::new(project_id),
+                cwd: cwd.clone(),
+            })
+            .await?;
+        s.session_id = Some(summary.session_id.as_str().to_owned());
+    }
     let params = reducer::params(s, prompt, Some(cwd))?;
     s.transcript.push("tau: ".into());
     s.assistant_index = Some(s.transcript.len() - 1);
