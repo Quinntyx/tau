@@ -449,7 +449,7 @@ mod tests {
             .collect::<String>();
         assert!(x.contains("Projects") && x.contains("Conversation"));
         assert!(x.contains("Permission required") && x.contains("run command"));
-        assert_eq!(t.get_cursor_position().unwrap(), (37, 28).into());
+        assert_eq!(t.get_cursor_position().unwrap(), (35, 25).into());
     }
 
     #[test]

@@ -77,10 +77,11 @@ impl ProjectShellRoot {
         }]);
         let shell = cx.new(|_: &mut GpuiContext<ProjectShell>| {
             let mut project_shell = ProjectShell::new(shell_state.clone());
-            project_shell.select(id);
+            project_shell.select(id.clone());
             project_shell
         });
         let view = cx.new(|cx| TauView::new(backend, cx));
+        view.update(cx, |view, _| view.select_project(Some(id.clone())));
         Self {
             shell,
             view,
@@ -132,9 +133,11 @@ impl ProjectShellRoot {
             } else {
                 shell.projects = shell::ProjectState::Ready(items);
             }
-            shell.selected = selected;
+            shell.selected = selected.clone();
             cx.notify();
         });
+        self.view
+            .update(cx, |view, _| view.select_project(selected));
     }
 
     /// Registering an inactive path deliberately requires an explicit choice.

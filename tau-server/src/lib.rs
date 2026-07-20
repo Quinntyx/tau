@@ -1742,6 +1742,7 @@ mod session_rpc_tests {
             Arc::new(tau_core::config::Config::default()),
             tau_core::db::Db::open_in_memory().unwrap(),
         );
+        let project_id = state.db.create_project("project-a", "/tmp/a").unwrap().id;
         let (out, _received) = mpsc::channel(1);
         let negotiated = Arc::new(Mutex::new(None));
         let request =
@@ -1751,7 +1752,7 @@ mod session_rpc_tests {
                 1,
                 METHOD_SESSION_CREATE,
                 serde_json::json!({
-                    "project_id": "project-a", "cwd": "/tmp/a"
+                    "project_id": project_id, "cwd": "/tmp/a"
                 }),
             ),
             &state,
@@ -1763,7 +1764,7 @@ mod session_rpc_tests {
         let created: Response<serde_json::Value> = serde_json::from_str(&response).unwrap();
         let session: tau_proto::session::SessionRecord =
             serde_json::from_value(created.result.unwrap()).unwrap();
-        assert_eq!(session.project_id.as_str(), "project-a");
+        assert_eq!(session.project_id.as_str(), project_id);
         assert!(session.title.is_none());
 
         let response = handle_request(
@@ -1771,7 +1772,7 @@ mod session_rpc_tests {
                 2,
                 METHOD_SESSION_LIST,
                 serde_json::json!({
-                    "project_id": "project-a"
+                    "project_id": project_id
                 }),
             ),
             &state,
@@ -1790,7 +1791,7 @@ mod session_rpc_tests {
                 3,
                 METHOD_SESSION_RENAME,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id, "title": "Work"
+                    "project_id": project_id, "session_id": session.id, "title": "Work"
                 }),
             ),
             &state,
@@ -1809,7 +1810,7 @@ mod session_rpc_tests {
                 4,
                 METHOD_SESSION_ARCHIVE,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id
+                    "project_id": project_id, "session_id": session.id
                 }),
             ),
             &state,
