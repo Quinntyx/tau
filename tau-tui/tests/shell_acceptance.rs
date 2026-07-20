@@ -89,7 +89,8 @@ fn complete_shell_composition_snapshot() {
         &[
             "Projects",
             "alpha",
-            "Sessions · Ctrl-S close",
+            "Sessions ·",
+            "Ctrl-S close",
             "Review staged change",
             "Human: inspect",
             "prompt (Shift+Enter newline)",
