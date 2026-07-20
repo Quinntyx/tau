@@ -132,19 +132,27 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
 fn session_navigator(frame: &mut Frame, s: &AppState) {
     let area = center(frame.area(), 70, 16);
     frame.render_widget(Clear, area);
-    let items = s
+    let mut items = s
         .sessions
         .visible()
         .into_iter()
         .map(|entry| ListItem::new(format!("{}  {}", entry.title, entry.id.as_str())))
         .collect::<Vec<_>>();
+    if items.is_empty() {
+        items.push(ListItem::new(if s.sessions.query.is_empty() {
+            "No sessions for this project"
+        } else {
+            "No sessions match the search"
+        }));
+    }
     let item_count = items.len();
+    let title = if s.sessions.show_archived {
+        " Sessions · archived · ↑↓ select · Enter open · n new chat · Ctrl-S close · search "
+    } else {
+        " Sessions · ↑↓ select · Enter open · n new chat · Ctrl-S close · Ctrl-A archived · search "
+    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Sessions · Ctrl-S close · Ctrl-A archived · search "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ratatui::widgets::ListState::default();
     if item_count != 0 {
@@ -404,6 +412,7 @@ fn center(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projects::ProjectAction;
     use ratatui::{Terminal, backend::TestBackend};
     #[test]
     fn model_picker_snapshot_contains_favorite() {
@@ -448,20 +457,21 @@ mod tests {
             .collect::<String>();
         assert!(x.contains("Projects") && x.contains("Conversation"));
         assert!(x.contains("Permission required") && x.contains("run command"));
-        // The current responsive shell places the composer at the bottom of
-        // the content column (after the two-row top bar and project rail).
+        // The prompt is rendered inside the daemon-backed content column.  Keep
+        // this assertion tied to the current layout rather than the old
+        // pre-project-shell coordinates.
         assert_eq!(t.get_cursor_position().unwrap(), (35, 25).into());
     }
 
     #[test]
     fn production_project_render_uses_typed_selection() {
         let mut projects = ProjectState::default();
-        projects.load_daemon_projects([(
-            crate::projects::ProjectId("daemon-demo".into()),
-            "demo".into(),
-            "/tmp/demo".into(),
-            crate::projects::ProjectStatus::Active,
-        )]);
+        projects
+            .apply(ProjectAction::Register {
+                name: "demo".into(),
+                root: "/tmp/demo".into(),
+            })
+            .unwrap();
         let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
         t.draw(|f| render_with_projects(f, &AppState::default(), &projects))
             .unwrap();

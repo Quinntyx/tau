@@ -4,16 +4,33 @@ use crate::{
 };
 use anyhow::Result;
 use futures_util::StreamExt;
-use tau_client::{Client, CreateSession, ProjectId, TurnStreamEvent};
+use tau_client::{Client, SessionHistory, SessionSummary, TurnStreamEvent};
 use tau_proto::prelude::{
     BoundedOutput, ClientResponse, IdempotencyKey, SequencedEvent, TurnEvent, TurnResponseParams,
 };
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
+    ProjectsLoaded(Vec<tau_proto::projects::Project>),
+    ProjectReady(String),
+    SessionsLoaded {
+        project_id: String,
+        sessions: Vec<SessionSummary>,
+    },
+    SessionCreated(SessionSummary),
+    SessionHistory(SessionHistory),
     Turn(SequencedEvent),
-    Complete { session_id: String, turn_id: String },
-    Tool { name: String, output: BoundedOutput },
-    Permission { tool: String, summary: String },
+    Complete {
+        session_id: String,
+        turn_id: String,
+    },
+    Tool {
+        name: String,
+        output: BoundedOutput,
+    },
+    Permission {
+        tool: String,
+        summary: String,
+    },
     Disconnected,
     Reconnected,
     Error(String),
@@ -26,11 +43,86 @@ impl ScriptedClient {
     pub fn drive(&self, s: &mut AppState) {
         for e in &self.events {
             match e {
+                ClientEvent::ProjectsLoaded(_) | ClientEvent::ProjectReady(_) => {}
+                ClientEvent::SessionsLoaded {
+                    project_id,
+                    sessions,
+                } => {
+                    if s.project_id.as_deref() == Some(project_id.as_str()) {
+                        s.sessions.sessions = sessions
+                            .iter()
+                            .map(crate::sessions::entry_from_summary)
+                            .collect();
+                        s.sessions.project = Some(crate::sessions::ProjectId::new(project_id));
+                        s.sessions.restart_selection(s.session_id.as_deref());
+                    }
+                }
+                ClientEvent::SessionCreated(session) => {
+                    if s.project_id.as_deref() != Some(session.project_id.as_str()) {
+                        continue;
+                    }
+                    s.session_id = Some(session.session_id.as_str().to_owned());
+                    s.sessions
+                        .sessions
+                        .retain(|entry| entry.id.as_str() != session.session_id.as_str());
+                    s.sessions
+                        .sessions
+                        .push(crate::sessions::entry_from_summary(session));
+                    s.sessions
+                        .restart_selection(Some(session.session_id.as_str()));
+                    s.sessions.open = false;
+                    s.raw_events.clear();
+                    s.transcript = vec!["New chat".into()];
+                    s.sequence = 0;
+                    s.turn_id = None;
+                    // The daemon acknowledgement is the point at which a new
+                    // session is usable.  Do not leave the composer blocked by
+                    // the asynchronous create request.
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetDisabled(false));
+                }
+                ClientEvent::SessionHistory(history) => {
+                    if s.session_id.as_deref() != Some(history.session_id.as_str()) {
+                        continue;
+                    }
+                    // A late history response must not roll a live projection
+                    // back to an older snapshot.
+                    let history_sequence = history.entries.iter().map(|event| event.sequence).max();
+                    if !s.raw_events.is_empty()
+                        && history_sequence.is_none_or(|sequence| sequence <= s.sequence)
+                    {
+                        continue;
+                    }
+                    s.session_id = Some(history.session_id.as_str().to_owned());
+                    s.raw_events.clear();
+                    s.transcript.clear();
+                    s.human_messages.clear();
+                    s.tools.clear();
+                    s.tool_call_ids.clear();
+                    s.assistant_index = None;
+                    s.turn_id = None;
+                    s.sequence = 0;
+                    let mut entries = history.entries.clone();
+                    entries.sort_by_key(|event| event.sequence);
+                    for event in entries {
+                        reduce_event(s, event);
+                    }
+                    if s.transcript.is_empty() {
+                        s.transcript.push("No conversation yet".into());
+                    }
+                }
                 ClientEvent::Turn(event) => reduce_event(s, event.clone()),
                 ClientEvent::Complete {
                     session_id,
                     turn_id,
                 } => {
+                    if s.session_id.as_deref() != Some(session_id.as_str()) {
+                        continue;
+                    }
                     s.session_id = Some(session_id.clone());
                     // The stream completion is terminal; IDs are retained by
                     // the protocol response only and must not leave an active
@@ -121,23 +213,7 @@ pub async fn complete(
     let Some(_) = s.project_id.as_deref() else {
         anyhow::bail!("cannot start turn: select an active project first");
     };
-    let project_id = s.project_id.clone().expect("checked above");
-    let cwd = if s.project_root.trim().is_empty() {
-        anyhow::bail!("cannot start turn: active project has no canonical path")
-    } else {
-        s.project_root.clone()
-    };
-    // Establish the durable session before streaming a turn. This prevents a
-    // client-only/session-less turn from becoming an unattached history.
-    if s.session_id.is_none() {
-        let summary = client
-            .session_create(CreateSession {
-                project_id: ProjectId::new(project_id),
-                cwd: cwd.clone(),
-            })
-            .await?;
-        s.session_id = Some(summary.session_id.as_str().to_owned());
-    }
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
     let params = reducer::params(s, prompt, Some(cwd))?;
     s.transcript.push("tau: ".into());
     s.assistant_index = Some(s.transcript.len() - 1);
@@ -227,6 +303,12 @@ pub async fn replay_task(
 }
 
 pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
+    if s.session_id
+        .as_deref()
+        .is_some_and(|session_id| session_id != event.session_id)
+    {
+        return;
+    }
     if event.sequence <= s.sequence {
         return;
     }

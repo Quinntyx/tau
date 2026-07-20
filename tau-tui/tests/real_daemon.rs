@@ -3,8 +3,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_proto::prelude::{
-    Capability, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion, RequestAction,
-    TurnStartParams,
+    Capability, IdempotencyKey, ProjectCreateParams, ProjectIdParams, ProjectListParams,
+    ProjectNewIdParams, ProtocolNegotiateParams, ProtocolVersion, RequestAction, TurnStartParams,
 };
 use tokio::net::UnixListener;
 
@@ -99,6 +99,132 @@ async fn real_daemon_broadcasts_stream_and_replays_after_control_reply() -> Resu
         .await?;
     assert!(!replay.events.is_empty());
 
+    server.abort();
+    let _ = tokio::fs::remove_file(socket).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_daemon_typed_project_and_session_lifecycle() -> Result<()> {
+    let socket = std::env::temp_dir().join(format!(
+        "tau-tui-registry-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let listener = UnixListener::bind(&socket)?;
+    let app = tau_server::router(tau_server::AppState::default());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service()).await;
+    });
+    let client = tau_client::Client::connect(&socket).await?;
+
+    let empty = client.project_list(ProjectListParams::default()).await?;
+    assert!(empty.projects.is_empty());
+    let project = client
+        .project_create(ProjectCreateParams {
+            name: "scripted project".into(),
+            root: std::env::temp_dir().to_string_lossy().into_owned(),
+        })
+        .await?
+        .project;
+    assert!(project.active);
+    assert_eq!(
+        client
+            .project_list(ProjectListParams::default())
+            .await?
+            .projects
+            .len(),
+        1
+    );
+
+    let selected = tau_tui::AppState::with_ids("not-yet-created", project.id.clone());
+    assert_eq!(selected.project_id.as_deref(), Some(project.id.as_str()));
+    assert_eq!(selected.composer.project_id(), project.id);
+
+    let session = client
+        .session_create(tau_client::CreateSession {
+            project_id: tau_client::ProjectId::new(project.id.clone()),
+            cwd: project.root.clone(),
+        })
+        .await?;
+    assert_eq!(session.project_id.as_str(), project.id);
+    assert_eq!(
+        client
+            .session_list(tau_client::ProjectId::new(project.id.clone()))
+            .await?
+            .len(),
+        1
+    );
+    let reference = tau_client::SessionRef {
+        project_id: tau_client::ProjectId::new(project.id.clone()),
+        session_id: session.session_id.clone(),
+    };
+    client.session_archive(reference.clone()).await?;
+    assert!(
+        client
+            .session_list(tau_client::ProjectId::new(project.id.clone()))
+            .await?
+            .is_empty()
+    );
+    let restored = client.session_restore(reference).await?;
+    assert_eq!(restored.session_id, session.session_id);
+
+    let inactive = client
+        .project_unregister(ProjectIdParams {
+            project_id: project.id.clone(),
+        })
+        .await?
+        .project;
+    assert!(!inactive.active);
+    let reactivated = client
+        .project_reactivate(ProjectIdParams {
+            project_id: project.id.clone(),
+        })
+        .await?
+        .project;
+    assert!(reactivated.active);
+    let inactive_again = client
+        .project_unregister(ProjectIdParams {
+            project_id: project.id.clone(),
+        })
+        .await?
+        .project;
+    assert!(!inactive_again.active);
+    let new_id = client
+        .project_new_id(ProjectNewIdParams {
+            project_id: project.id.clone(),
+        })
+        .await?
+        .project_id;
+    assert_ne!(new_id, project.id);
+    assert!(
+        client
+            .project_reactivate(ProjectIdParams {
+                project_id: project.id.clone()
+            })
+            .await
+            .is_err()
+    );
+
+    assert!(
+        client
+            .project_reactivate(ProjectIdParams {
+                project_id: "missing".into()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .session_restore(tau_client::SessionRef {
+                project_id: tau_client::ProjectId::new(project.id),
+                session_id: tau_client::SessionId::new("missing"),
+            })
+            .await
+            .is_err()
+    );
     server.abort();
     let _ = tokio::fs::remove_file(socket).await;
     Ok(())

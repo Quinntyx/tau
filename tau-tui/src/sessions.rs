@@ -32,6 +32,21 @@ pub struct SessionEntry {
     pub archived: bool,
 }
 
+/// Convert the daemon's typed session summary into the navigator projection.
+/// The navigator never allocates or derives durable identifiers locally.
+pub fn entry_from_summary(summary: &tau_client::SessionSummary) -> SessionEntry {
+    SessionEntry {
+        id: SessionId::new(summary.session_id.as_str()),
+        project_id: ProjectId::new(summary.project_id.as_str()),
+        title: summary
+            .title
+            .clone()
+            .unwrap_or_else(|| "new conversation".into()),
+        updated_at: summary.updated_at.max(0) as u64,
+        archived: summary.archived_at.is_some(),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Navigator {
     pub project: Option<ProjectId>,
@@ -43,27 +58,26 @@ pub struct Navigator {
 }
 
 impl Navigator {
-    /// Replace the projection with summaries acknowledged by the daemon.
-    /// Records from another project are intentionally discarded here so a
-    /// stale response can never leak sessions into the active navigator.
-    pub fn load_daemon_sessions(
+    /// Replace the daemon snapshot, retaining selection only when its
+    /// durable daemon id is still present in the active project projection.
+    ///
+    /// The project is supplied by the request/response envelope rather than
+    /// inferred from the first row; an empty response therefore cannot leak a
+    /// previous project's selection.
+    pub fn replace_sessions(
         &mut self,
         project: ProjectId,
-        sessions: impl IntoIterator<Item = (SessionId, String, u64, bool)>,
+        sessions: Vec<SessionEntry>,
+        persisted_id: Option<&str>,
     ) {
         self.project = Some(project.clone());
         self.sessions = sessions
             .into_iter()
-            .map(|(id, title, updated_at, archived)| SessionEntry {
-                id,
-                project_id: project.clone(),
-                title,
-                updated_at,
-                archived,
-            })
+            .filter(|session| session.project_id == project)
             .collect();
-        self.selected = 0;
+        self.restart_selection(persisted_id);
     }
+
     pub fn visible(&self) -> Vec<&SessionEntry> {
         let q = self.query.to_lowercase();
         let mut result: Vec<_> = self
@@ -103,35 +117,21 @@ impl Navigator {
             .unwrap_or(0);
     }
     pub fn rename(&mut self, id: &SessionId, title: impl Into<String>) {
-        let project = self.project.clone();
-        if let Some(s) = self
-            .sessions
-            .iter_mut()
-            .find(|s| &s.id == id && project.as_ref() == Some(&s.project_id))
-        {
+        if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
             s.title = title.into();
         }
     }
     pub fn archive(&mut self, id: &SessionId) {
-        let project = self.project.clone();
-        if let Some(s) = self
-            .sessions
-            .iter_mut()
-            .find(|s| &s.id == id && project.as_ref() == Some(&s.project_id))
-        {
+        if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
             s.archived = true;
         }
         self.selected = self.selected.min(self.visible().len().saturating_sub(1));
     }
     pub fn restore(&mut self, id: &SessionId) {
-        let project = self.project.clone();
-        if let Some(s) = self
-            .sessions
-            .iter_mut()
-            .find(|s| &s.id == id && project.as_ref() == Some(&s.project_id))
-        {
+        if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
             s.archived = false;
         }
+        self.selected = self.selected.min(self.visible().len().saturating_sub(1));
     }
 
     pub fn toggle_archived(&mut self) {
@@ -139,23 +139,15 @@ impl Navigator {
         self.selected = 0;
     }
 
-    /// Insert a session created by the daemon. IDs are never synthesized in
-    /// the presentation layer.
-    pub fn new_chat(&mut self, project_id: ProjectId, id: SessionId, now: u64) -> SessionId {
-        if self.project.as_ref() != Some(&project_id) {
-            self.project = Some(project_id.clone());
-            self.selected = 0;
-        }
-        self.sessions.retain(|session| session.id != id);
-        self.sessions.push(SessionEntry {
-            id: id.clone(),
-            project_id,
-            title: String::new(),
-            updated_at: now,
-            archived: false,
-        });
+    /// Prepare the navigator for a daemon-backed new-chat request.
+    ///
+    /// Creation is asynchronous, so no placeholder entry (and, in
+    /// particular, no fabricated local identifier) is inserted here.  The
+    /// acknowledged `SessionCreated` response supplies the durable entry.
+    pub fn prepare_new_chat(&mut self, project_id: ProjectId) {
+        self.project = Some(project_id);
         self.selected = 0;
-        id
+        self.open = false;
     }
 }
 
@@ -185,7 +177,6 @@ mod tests {
     #[test]
     fn archived_is_hidden_but_restore_recovers() {
         let mut n = Navigator {
-            project: Some(ProjectId::new("p")),
             sessions: vec![item("x", "X", 1)],
             ..Default::default()
         };
@@ -198,15 +189,31 @@ mod tests {
     }
 
     #[test]
-    fn restart_selection_and_new_chat_are_project_bound() {
+    fn new_chat_does_not_fabricate_an_id() {
         let mut n = Navigator {
             project: Some(ProjectId::new("p")),
             ..Default::default()
         };
-        let id = SessionId::new("daemon-session");
-        n.new_chat(ProjectId::new("p"), id.clone(), 10);
-        n.restart_selection(Some(id.as_str()));
-        assert_eq!(n.selected_id(), Some(id));
-        assert_eq!(n.visible()[0].title, "");
+        n.prepare_new_chat(ProjectId::new("p"));
+        assert!(n.sessions.is_empty());
+        assert_eq!(n.selected_id(), None);
+    }
+
+    #[test]
+    fn replacement_is_project_bound_and_restarts_by_daemon_id() {
+        let mut n = Navigator::default();
+        n.replace_sessions(
+            ProjectId::new("p"),
+            vec![
+                SessionEntry {
+                    project_id: ProjectId::new("other"),
+                    ..item("wrong", "Wrong", 3)
+                },
+                item("kept", "Kept", 2),
+            ],
+            Some("kept"),
+        );
+        assert_eq!(n.sessions.len(), 1);
+        assert_eq!(n.selected_id().unwrap().as_str(), "kept");
     }
 }

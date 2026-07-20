@@ -5,6 +5,30 @@ use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    /// Focus the left-hand project navigator.  Project data and persistence
+    /// remain owned by lib.rs; these actions are deliberately just intents.
+    FocusProjects,
+    ProjectMove(i8),
+    ProjectSelect(crate::projects::ProjectId),
+    /// Select a daemon record and carry its acknowledged root with the intent.
+    ProjectSelectWithRoot {
+        id: crate::projects::ProjectId,
+        root: String,
+    },
+    ProjectSelectCurrent,
+    ProjectCreateCurrent,
+    ProjectReactivateCurrent,
+    ProjectNewIdCurrent,
+    ProjectCreate {
+        name: String,
+        root: String,
+    },
+    ProjectRename {
+        id: crate::projects::ProjectId,
+        name: String,
+    },
+    ProjectReactivate(crate::projects::ProjectId),
+    ProjectChooseInactive(crate::projects::InactiveConflictChoice),
     Insert(char),
     Paste(String),
     Backspace,
@@ -77,11 +101,33 @@ pub enum Action {
     OperationsRevertConfirmed,
     OperationsKeep,
     OperationsAcknowledge,
+    OperationsClose,
     OperationsCreateBranch(String),
     OperationsSwitchBranch(String),
 }
 
 pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
+    if s.project_focus {
+        return match k.code {
+            KeyCode::Esc => Some(Action::FocusProjects),
+            KeyCode::Up => Some(Action::ProjectMove(-1)),
+            KeyCode::Down => Some(Action::ProjectMove(1)),
+            KeyCode::Enter => Some(Action::ProjectSelectCurrent),
+            KeyCode::Char('r') => Some(Action::ProjectReactivateCurrent),
+            KeyCode::Char('n') => Some(Action::ProjectNewIdCurrent),
+            KeyCode::Char('c') => Some(Action::ProjectCreateCurrent),
+            KeyCode::Char('1') => Some(Action::ProjectChooseInactive(
+                crate::projects::InactiveConflictChoice::Reactivate,
+            )),
+            KeyCode::Char('2') => Some(Action::ProjectChooseInactive(
+                crate::projects::InactiveConflictChoice::CreateNew,
+            )),
+            KeyCode::Char('3') => Some(Action::ProjectChooseInactive(
+                crate::projects::InactiveConflictChoice::Cancel,
+            )),
+            _ => None,
+        };
+    }
     if s.sessions.open {
         if k.code == KeyCode::Char('a') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return Some(Action::SessionToggleArchived);
@@ -91,6 +137,12 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
             KeyCode::Up => Some(Action::SessionMove(-1)),
             KeyCode::Down => Some(Action::SessionMove(1)),
             KeyCode::Enter => Some(Action::SessionSelect),
+            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Action::SessionArchive)
+            }
+            KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Action::SessionRestore)
+            }
             KeyCode::Backspace => Some(Action::SessionSearchBackspace),
             KeyCode::Char(c) => Some(Action::SessionSearch(c)),
             _ => None,
@@ -149,6 +201,10 @@ pub fn key_action(s: &AppState, k: KeyEvent) -> Option<Action> {
         };
     }
     match k.code {
+        KeyCode::Esc if s.operations_focused => Some(Action::OperationsClose),
+        KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::FocusProjects)
+        }
         KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Action::ToggleSessions)
         }
@@ -522,6 +578,46 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             s.sessions.open = !s.sessions.open;
             s.sessions.selected = 0;
         }
+        Action::FocusProjects => return Some("project:focus".into()),
+        Action::ProjectMove(delta) => return Some(format!("project:move:{delta}")),
+        Action::ProjectSelectCurrent
+        | Action::ProjectCreateCurrent
+        | Action::ProjectReactivateCurrent
+        | Action::ProjectNewIdCurrent => return Some("project:navigation".into()),
+        Action::ProjectSelect(id) => {
+            s.project_id = Some(id.0.clone());
+            // Legacy callers only have the daemon id.  New callers should use
+            // ProjectSelectWithRoot so operations never guess a cwd from an id.
+            s.sessions.project = Some(crate::sessions::ProjectId::new(id.0));
+            s.session_id = None;
+            s.turn_id = None;
+            s.replaying = false;
+            return Some(format!(
+                "project:select:{}",
+                s.project_id.as_deref().unwrap_or_default()
+            ));
+        }
+        Action::ProjectSelectWithRoot { id, root } => {
+            s.set_project(Some(id.0.clone()), root);
+            s.sessions.project = Some(crate::sessions::ProjectId::new(id.0));
+            s.session_id = None;
+            s.turn_id = None;
+            s.replaying = false;
+            return Some(format!(
+                "project:select:{}",
+                s.project_id.as_deref().unwrap_or_default()
+            ));
+        }
+        Action::ProjectCreate { name, root } => {
+            return Some(format!("project:create:{name}\n{root}"));
+        }
+        Action::ProjectRename { id, name } => {
+            return Some(format!("project:rename:{}\n{name}", id.0));
+        }
+        Action::ProjectReactivate(id) => return Some(format!("project:reactivate:{}", id.0)),
+        Action::ProjectChooseInactive(choice) => {
+            return Some(format!("project:inactive:{choice:?}"));
+        }
         Action::SessionMove(delta) => s.sessions.select_delta(delta),
         Action::SessionSearch(c) => {
             s.sessions.query.push(c);
@@ -548,11 +644,13 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         Action::SessionArchive => {
             if let Some(id) = s.sessions.selected_id() {
                 s.sessions.archive(&id);
+                return Some(format!("session:archive:{}", id.as_str()));
             }
         }
         Action::SessionRestore => {
             if let Some(id) = s.sessions.selected_id() {
                 s.sessions.restore(&id);
+                return Some(format!("session:restore:{}", id.as_str()));
             }
         }
         Action::SessionToggleArchived => s.sessions.toggle_archived(),
@@ -562,12 +660,19 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             s.sequence = 0;
             s.raw_events.clear();
             s.transcript = vec!["New chat".into()];
+            s.human_messages.clear();
+            s.input.clear();
+            s.cursor = 0;
+            s.selection = None;
+            s.composer.set_text("");
             s.sessions.open = false;
+            return Some("new-chat".into());
         }
         Action::OperationsTab(tab) => {
             s.operations_tab = tab;
             s.operations_focused = true;
         }
+        Action::OperationsClose => s.operations_focused = false,
         Action::OperationsSelect(delta) => {
             let n = s.operations.files.len();
             if n > 0 {
@@ -706,6 +811,13 @@ fn apply_composer_action(s: &mut AppState, action: &Action) -> Option<Option<Str
         },
         Action::Submit => {
             if !s.composer.send_enabled() {
+                return Some(None);
+            }
+            // New Chat is asynchronous: until the daemon acknowledges the
+            // replacement session, keep the draft pending rather than
+            // accidentally starting a turn against no session.
+            if s.session_id.is_none() && s.transcript.last().is_some_and(|line| line == "New chat")
+            {
                 return Some(None);
             }
             let prompt = s.composer.text().to_owned();
