@@ -67,7 +67,7 @@ impl GitWorkspace {
     /// the core service rather than leaking filesystem/Git access into a UI or
     /// transport crate.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = std::fs::canonicalize(root.into()).context("canonicalizing project root")?;
+        let root = canonical_project_root(root.into())?;
         if !root.is_dir() {
             bail!("project root is not a directory")
         }
@@ -81,6 +81,15 @@ impl GitWorkspace {
         })
     }
 
+    /// Open a selected project root for operations whose paths are relative to
+    /// that project.  This is intentionally named separately from `open` at
+    /// call sites which receive a project selection from a daemon request; it
+    /// prevents the selection from being accidentally treated as a path from
+    /// the daemon process's current directory.
+    pub fn open_project(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open(root)
+    }
+
     pub fn initialize(
         root: impl Into<PathBuf>,
         topology: GitTopology,
@@ -88,6 +97,7 @@ impl GitWorkspace {
     ) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
+        let root = canonical_project_root(root)?;
         match topology {
             GitTopology::Direct => {
                 if !is_repo(&root) {
@@ -158,23 +168,36 @@ impl GitWorkspace {
         })
     }
     fn project(&self, project: &Path) -> Result<PathBuf> {
-        let root = std::fs::canonicalize(&self.manifest.root).with_context(|| {
-            format!(
-                "canonicalizing project root {}",
-                self.manifest.root.display()
-            )
-        })?;
-        let path = if project.is_absolute() {
+        // `manifest.root` is canonicalized when the workspace is opened (or
+        // initialized).  Do not resolve it again here: the selected root is
+        // the security boundary, even if a path at its original location is
+        // later replaced by a symlink.
+        let root = self.manifest.root.as_path();
+        let path = if project.as_os_str().is_empty() || project == Path::new(".") {
+            root.to_path_buf()
+        } else if project.is_absolute() {
             project.to_path_buf()
         } else {
             root.join(project)
         };
         let resolved = std::fs::canonicalize(&path)
             .with_context(|| format!("canonicalizing project path {}", path.display()))?;
-        if resolved != root && !resolved.starts_with(&root) {
+        if resolved != root && !resolved.starts_with(root) {
             bail!("project path is outside workspace")
         }
         Ok(resolved)
+    }
+    fn repository(&self, project: &Path) -> Result<PathBuf> {
+        let root = self.project(project)?;
+        let actual =
+            String::from_utf8_lossy(&git_output(&root, &["rev-parse", "--show-toplevel"])?.stdout)
+                .trim()
+                .to_owned();
+        let actual = std::fs::canonicalize(&actual).context("canonicalizing Git root")?;
+        if actual != root {
+            bail!("selected project is not the sole Git root")
+        }
+        Ok(root)
     }
     fn file_path(&self, project: &Path, path: &Path) -> Result<(PathBuf, String)> {
         if path.is_absolute() {
@@ -200,7 +223,7 @@ impl GitWorkspace {
         Ok((canonical, path.to_string_lossy().into_owned()))
     }
     pub fn status(&self, project: &Path) -> Result<GitStatus> {
-        let project = self.project(project)?;
+        let project = self.repository(project)?;
         let branch =
             String::from_utf8_lossy(&git_output(&project, &["branch", "--show-current"])?.stdout)
                 .trim()
@@ -240,7 +263,7 @@ impl GitWorkspace {
     }
     pub fn file(&self, project: &Path, path: &Path) -> Result<GitFile> {
         let (full, display) = self.file_path(project, path)?;
-        let repo = self.project(project)?;
+        let repo = self.repository(project)?;
         let content = std::fs::read_to_string(&full)
             .with_context(|| format!("reading {}", full.display()))?;
         let diff =
@@ -254,14 +277,16 @@ impl GitWorkspace {
     }
     pub fn stage(&self, project: &Path, path: &Path) -> Result<()> {
         let (_, p) = self.file_path(project, path)?;
-        let repo = self.project(project)?;
+        let repo = self.repository(project)?;
         git(&repo, &["add", "--", &p])?;
         Ok(())
     }
     pub fn unstage(&self, project: &Path, path: &Path) -> Result<()> {
         let (_, p) = self.file_path(project, path)?;
-        let repo = self.project(project)?;
-        git(&repo, &["restore", "--staged", "--", &p])?;
+        let repo = self.repository(project)?;
+        // `reset` is a no-op for an untracked path, unlike restore --staged,
+        // which reports an error and makes the operation needlessly fragile.
+        git(&repo, &["reset", "HEAD", "--", &p])?;
         Ok(())
     }
     pub fn revert(&self, project: &Path, path: &Path, confirmed: bool) -> Result<()> {
@@ -269,13 +294,25 @@ impl GitWorkspace {
             bail!("revert requires explicit confirmation")
         }
         let (_, p) = self.file_path(project, path)?;
-        let repo = self.project(project)?;
+        let repo = self.repository(project)?;
+        // A path can be present in the index without existing in HEAD (for
+        // example, a newly added file). Reverting such a path must remove it,
+        // not merely unstage it and leave the user's addition behind.
+        if git(&repo, &["cat-file", "-e", &format!("HEAD:{p}")]).is_err() {
+            let _ = git(&repo, &["rm", "--cached", "--ignore-unmatch", "--", &p]);
+            let working = repo.join(&p);
+            if working.exists() || working.is_symlink() {
+                std::fs::remove_file(&working)
+                    .with_context(|| format!("removing untracked file {p}"))?;
+            }
+            return Ok(());
+        }
         git(&repo, &["restore", "--source=HEAD", "--staged", "--", &p])?;
         git(&repo, &["restore", "--", &p])?;
         Ok(())
     }
     pub fn branches(&self, project: &Path) -> Result<Vec<GitBranch>> {
-        let repo = self.project(project)?;
+        let repo = self.repository(project)?;
         let current =
             String::from_utf8_lossy(&git_output(&repo, &["branch", "--show-current"])?.stdout)
                 .trim()
@@ -295,13 +332,13 @@ impl GitWorkspace {
     }
     pub fn create_branch(&self, project: &Path, name: &str) -> Result<()> {
         validate_branch(name)?;
-        let repo = self.project(project)?;
+        let repo = self.repository(project)?;
         git(&repo, &["branch", name])?;
         Ok(())
     }
     pub fn switch_branch(&self, project: &Path, name: &str) -> Result<()> {
         validate_branch(name)?;
-        let repo = self.project(project)?;
+        let repo = self.repository(project)?;
         ensure_clean(&repo, "switching branch")?;
         git(&repo, &["switch", name])?;
         Ok(())
@@ -390,6 +427,15 @@ impl GitWorkspace {
         Ok(())
     }
 }
+
+fn canonical_project_root(root: PathBuf) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalizing project root {}", root.display()))?;
+    if !root.is_dir() {
+        bail!("project root is not a directory")
+    }
+    Ok(root)
+}
 pub fn managed_name(model: &str) -> String {
     let mut s = model
         .chars()
@@ -438,11 +484,19 @@ fn validate_branch(name: &str) -> Result<()> {
     if name.is_empty()
         || name.starts_with('-')
         || name.contains("..")
+        || name.contains("@{")
         || name.contains(' ')
         || name.contains('~')
         || name.contains('^')
         || name.contains(':')
         || name.contains('\\')
+        || name.contains('?')
+        || name.contains('*')
+        || name.contains('[')
+        || name.chars().any(|c| c.is_control())
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.contains("//")
         || name.ends_with('/')
     {
         bail!("invalid branch name")
@@ -498,5 +552,58 @@ mod tests {
         let non_git = GitWorkspace::initialize(plain.path(), GitTopology::NonGit, vec![]).unwrap();
         assert!(!plain.path().join(".git").exists());
         assert!(non_git.manifest.tau_metadata.join("HEAD").exists());
+    }
+
+    #[test]
+    fn project_roots_are_canonical_and_cannot_cross() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let one = GitWorkspace::open_project(&first).unwrap();
+        let two = GitWorkspace::open_project(&second).unwrap();
+        assert_eq!(one.manifest.root, std::fs::canonicalize(&first).unwrap());
+        assert_ne!(one.manifest.root, two.manifest.root);
+        assert!(one.project(Path::new("../second")).is_err());
+        assert!(one.project(&two.manifest.root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_root_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        let workspace = GitWorkspace::open_project(&root).unwrap();
+        assert!(workspace.project(Path::new("escape")).is_err());
+        assert!(workspace.project(&outside).is_err());
+    }
+
+    #[test]
+    fn confirmed_revert_removes_new_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = GitWorkspace::initialize(dir.path(), GitTopology::Direct, vec![]).unwrap();
+        git(
+            dir.path(),
+            &["config", "user.email", "tau-tests@example.invalid"],
+        )
+        .unwrap();
+        git(dir.path(), &["config", "user.name", "tau-tests"]).unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "tracked").unwrap();
+        git(dir.path(), &["add", "--", "tracked.txt"]).unwrap();
+        git(dir.path(), &["commit", "-m", "initial"]).unwrap();
+
+        std::fs::write(dir.path().join("new.txt"), "new").unwrap();
+        workspace.stage(dir.path(), Path::new("new.txt")).unwrap();
+        workspace
+            .revert(dir.path(), Path::new("new.txt"), true)
+            .unwrap();
+        assert!(!dir.path().join("new.txt").exists());
+        let files = workspace.status(dir.path()).unwrap().files;
+        assert!(!files.iter().any(|file| file.path == "new.txt"));
     }
 }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +23,7 @@ use crate::picker::PickerAction;
 pub struct Backend {
     socket: PathBuf,
     cwd: String,
+    selected_project: Arc<Mutex<Option<SelectedProject>>>,
     model: String,
     runtime: tokio::runtime::Handle,
     session: Arc<tokio::sync::Mutex<Option<tau_client::Client>>>,
@@ -32,6 +33,12 @@ pub struct Backend {
     _daemon: Arc<Mutex<Option<Child>>>,
     auto_started: bool,
     status: Arc<Mutex<DaemonStatus>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedProject {
+    id: String,
+    root: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,8 +463,22 @@ impl Backend {
         T: Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Resolve the project synchronously, at dispatch time.  This both
+        // prevents an operation from silently using the GUI process cwd and
+        // ensures queued work keeps the root selected when it was submitted.
+        let project = match self.selected_project.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(project) = project else {
+            let _ = tx.send(Err("cannot run operation: select a project first".into()));
+            return rx;
+        };
+        // Git RPCs are authorized by the daemon project identity. The server
+        // resolves that identity to its canonical root; never send the GUI
+        // process cwd or an unregistered filesystem path on this seam.
+        let project_id = project.id;
         let socket = self.socket.clone();
-        let cwd = self.cwd.clone();
         let session = self.session.clone();
         let daemon = self._daemon.clone();
         let status = self.status.clone();
@@ -487,7 +508,7 @@ impl Backend {
                     }
                     status.lock().map(|mut s| *s = DaemonStatus::Ready).ok();
                 }
-                call(guard.as_ref().unwrap().clone(), cwd).await
+                call(guard.as_ref().unwrap().clone(), project_id).await
             }
             .await
             .map_err(|e: anyhow::Error| e.to_string());
@@ -568,6 +589,7 @@ impl Backend {
         Self {
             socket,
             cwd,
+            selected_project: Arc::new(Mutex::new(None)),
             model,
             runtime: handle,
             session: Arc::new(tokio::sync::Mutex::new(None)),
@@ -622,6 +644,66 @@ impl Backend {
 
     pub fn cwd(&self) -> &str {
         &self.cwd
+    }
+
+    /// Select the daemon project used by all subsequent Git operations.
+    /// Canonicalization happens before storing it so RPCs receive a stable,
+    /// explicit project identity rather than a process-relative path.
+    pub fn set_selected_project(
+        &self,
+        project_id: impl Into<String>,
+        root: impl AsRef<Path>,
+    ) -> Result<()> {
+        let project_id = project_id.into();
+        if project_id.trim().is_empty() {
+            anyhow::bail!("selected project id must not be empty");
+        }
+        let root = root.as_ref().canonicalize().with_context(|| {
+            format!(
+                "canonicalizing selected project root {}",
+                root.as_ref().display()
+            )
+        })?;
+        if !root.is_dir() {
+            anyhow::bail!(
+                "selected project root is not a directory: {}",
+                root.display()
+            );
+        }
+        *self
+            .selected_project
+            .lock()
+            .map_err(|_| anyhow::anyhow!("selected project root lock poisoned"))? =
+            Some(SelectedProject {
+                id: project_id,
+                root: root.to_string_lossy().into_owned(),
+            });
+        Ok(())
+    }
+
+    /// Compatibility helper for callers that only have a root. New project
+    /// selections should always provide the daemon project id as well.
+    pub fn set_selected_project_root(&self, root: impl AsRef<Path>) -> Result<()> {
+        let root = root.as_ref().to_path_buf();
+        let canonical = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing selected project root {}", root.display()))?;
+        self.set_selected_project(canonical.to_string_lossy().into_owned(), canonical)
+    }
+
+    pub fn clear_selected_project_root(&self) -> Result<()> {
+        *self
+            .selected_project
+            .lock()
+            .map_err(|_| anyhow::anyhow!("selected project root lock poisoned"))? = None;
+        Ok(())
+    }
+
+    pub fn selected_project_root(&self) -> Result<Option<String>> {
+        self.selected_project
+            .lock()
+            .map(|project| project.as_ref().map(|project| project.root.clone()))
+            .map_err(|_| anyhow::anyhow!("selected project root lock poisoned"))
     }
 
     pub fn auto_started(&self) -> bool {

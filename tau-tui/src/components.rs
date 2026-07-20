@@ -196,11 +196,13 @@ pub fn render_operations_panel(
             ListItem::new(format!("{selected}{marker} {}", file.path))
         })
         .collect::<Vec<_>>();
-    let list = List::new(files).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Operations [{}]", state.branch)),
-    );
+    let list = List::new(files).block(Block::default().borders(Borders::ALL).title(
+        if state.active() {
+            format!("Operations [{}]", state.branch)
+        } else {
+            "Operations [disabled: select a project]".to_owned()
+        },
+    ));
     frame.render_widget(list, columns[0]);
     let mut body = vec![tabs];
     body.push(Line::from(if loading {
@@ -212,6 +214,9 @@ pub fn render_operations_panel(
         Some(error) => format!(" Error: {error}"),
         None => " Error: —".to_owned(),
     }));
+    if !state.active() {
+        body.push(Line::from(" Select a daemon project to enable operations"));
+    }
     if let Some(acknowledgement) = acknowledgement {
         body.push(Line::from(format!(" Acknowledgement: {acknowledgement}")));
     }
@@ -449,7 +454,7 @@ mod tests {
             .collect::<String>();
         assert!(x.contains("Projects") && x.contains("Conversation"));
         assert!(x.contains("Permission required") && x.contains("run command"));
-        assert_eq!(t.get_cursor_position().unwrap(), (37, 28).into());
+        assert_eq!(t.get_cursor_position().unwrap(), (35, 25).into());
     }
 
     #[test]

@@ -261,6 +261,10 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
     if let Some(result) = apply_composer_action(s, &a) {
         return result;
     }
+    let operations_file_action = matches!(
+        &a,
+        Action::OperationsStage | Action::OperationsUnstage | Action::OperationsRevertConfirmed
+    );
     match a {
         Action::Insert(c) => {
             replace_selection(s);
@@ -579,17 +583,25 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
             }
         }
         Action::OperationsRefresh => {
-            s.operations_loading = true;
-            s.operations_error = None;
+            if s.operations.active() {
+                s.operations_loading = true;
+                s.operations_error = None;
+            } else {
+                s.operations_error = Some("operations require a selected project".into());
+            }
         }
         Action::OperationsOpen => {
-            if let Some(path) = s.operations.path().map(str::to_owned) {
+            if !s.operations.active() {
+                s.operations_error = Some("operations require a selected project".into());
+            } else if let Some(path) = s.operations.path().map(str::to_owned) {
                 crate::operations::reduce(&mut s.operations, crate::operations::Action::Open(path));
                 s.operations_loading = true;
             }
         }
         Action::OperationsKeep => {
-            if let Some(path) = s.operations.path().map(str::to_owned) {
+            if !s.operations.active() {
+                s.operations_error = Some("operations require a selected project".into());
+            } else if let Some(path) = s.operations.path().map(str::to_owned) {
                 crate::operations::reduce(&mut s.operations, crate::operations::Action::Keep(path));
             }
         }
@@ -598,7 +610,15 @@ pub fn apply(s: &mut AppState, a: Action) -> Option<String> {
         | Action::OperationsRevertConfirmed
         | Action::OperationsAcknowledge
         | Action::OperationsCreateBranch(_)
-        | Action::OperationsSwitchBranch(_) => s.operations_loading = true,
+        | Action::OperationsSwitchBranch(_) => {
+            if s.operations.active() && (!operations_file_action || s.operations.path().is_some()) {
+                s.operations_loading = true;
+            } else if s.operations.active() {
+                s.operations_error = Some("select a file before using this operation".into());
+            } else {
+                s.operations_error = Some("operations require a selected project".into());
+            }
+        }
     }
     sync_composer(s);
     None

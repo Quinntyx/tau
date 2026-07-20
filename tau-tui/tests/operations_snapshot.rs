@@ -68,6 +68,7 @@ fn operations_acknowledgement_is_reduced_as_typed_state() {
         operations_focused: true,
         ..AppState::default()
     };
+    state.select_project("project-id", "/workspace/project");
 
     let action = tau_tui::reducer::key_action(
         &state,
@@ -84,4 +85,30 @@ fn operations_acknowledgement_is_reduced_as_typed_state() {
         tau_tui::operations::Action::Acknowledge("operations".into(), true),
     );
     assert_eq!(state.operations.acknowledged.get("operations"), Some(&true));
+}
+
+#[test]
+fn operations_are_disabled_until_project_and_file_are_selected() {
+    let mut state = AppState {
+        operations_focused: true,
+        ..AppState::default()
+    };
+    reduce(&mut state, Action::OperationsStage);
+    assert!(!state.operations_loading);
+    assert!(
+        state
+            .operations_error
+            .as_deref()
+            .unwrap()
+            .contains("selected project")
+    );
+    state.select_project("daemon-id", "/canonical/root");
+    state.operations.files.push(GitFileStatus {
+        path: "a".into(),
+        staged: false,
+        modified: true,
+        untracked: false,
+    });
+    reduce(&mut state, Action::OperationsStage);
+    assert!(state.operations_loading);
 }

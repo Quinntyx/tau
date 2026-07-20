@@ -167,6 +167,18 @@ pub struct BufferSnapshot {
 }
 
 impl AppState {
+    /// Apply the selected project's canonical root to daemon-backed operations.
+    /// Switching projects (including repathing one) starts with a clean view.
+    pub fn select_project(&mut self, id: impl Into<String>, root: impl Into<String>) {
+        let id = id.into();
+        self.project_id = Some(id.clone());
+        self.project_root = root.into();
+        self.operations
+            .set_project_selection(id, self.project_root.clone());
+        self.operations_loading = false;
+        self.operations_error = None;
+        self.operations_ack = None;
+    }
     /// Build state with integration-owned identifiers; the composer keeps the
     /// values opaque while reducers pass the existing protocol fields through.
     pub fn with_ids(session_id: impl Into<String>, project_id: impl Into<String>) -> Self {
@@ -205,7 +217,7 @@ impl Default for AppState {
     fn default() -> Self {
         let mut state = Self {
             composer: Composer::new("", ""),
-            project_root: ".".into(),
+            project_root: String::new(),
             operations: crate::operations::OperationsState::default(),
             operations_tab: OperationsTab::Status,
             operations_focused: false,
@@ -270,5 +282,20 @@ impl Default for AppState {
         state.composer.set_model(state.model.clone());
         state.composer.set_agent(state.agent.clone());
         state
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn project_selection_uses_canonical_root_and_clears_operations() {
+        let mut state = AppState::default();
+        state.operations.branch = "main".into();
+        state.select_project("two", "/canonical/two");
+        assert_eq!(state.project_id.as_deref(), Some("two"));
+        assert_eq!(state.operations.project, "/canonical/two");
+        assert!(state.operations.branch.is_empty());
     }
 }

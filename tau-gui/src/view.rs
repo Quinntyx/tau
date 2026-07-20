@@ -434,7 +434,7 @@ pub struct TauView {
     preferences: crate::preferences::GuiPreferences,
     transcript_scroll: ScrollHandle,
     follow_output: bool,
-    selected_project_id: Option<String>,
+    selected_project: Option<SelectedProject>,
     sessions: Navigator,
     session_query: Entity<TextInput>,
     sessions_open: bool,
@@ -449,6 +449,15 @@ enum OperationsTab {
     Status,
     Git,
     Changes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedProject {
+    id: String,
+    /// Canonical root reported by the daemon project registry.  This is kept
+    /// separately from the identity because operations must never infer a
+    /// repository from the GUI process cwd.
+    root: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -506,7 +515,7 @@ impl TauView {
             input.set_model(initial_model);
             input.set_agent(agent.clone());
         });
-        let mut view = Self {
+        Self {
             input,
             picker_input,
             backend,
@@ -529,7 +538,7 @@ impl TauView {
             preferences,
             transcript_scroll: ScrollHandle::new(),
             follow_output: true,
-            selected_project_id: None,
+            selected_project: None,
             sessions: Navigator::default(),
             session_query,
             sessions_open: false,
@@ -537,19 +546,50 @@ impl TauView {
             operations_loading: false,
             operations_error: None,
             operations_tab: OperationsTab::Status,
-        };
+        }
         // Session loading begins only after an explicit project selection.
-        view.refresh_operations(cx);
-        view
+        // No project is selected during startup; operations are intentionally
+        // inert until the navigator supplies one.
     }
 
     /// Set the active project selected by the project navigator.  Turns are
     /// intentionally rejected until this explicit selection is supplied.
     pub fn select_project(&mut self, project_id: Option<String>) {
-        self.selected_project_id = project_id.filter(|id| !id.trim().is_empty());
+        // The identity-only API cannot safely authorize Git operations. Keep
+        // it for navigation/session callers, but require the daemon's root
+        // through `select_project_with_root` before enabling operations.
+        self.select_project_with_root(project_id.map(|id| (id, String::new())));
+    }
+
+    /// Select a daemon project and its canonical root.  The legacy selector
+    /// above remains available for callers that only have the daemon identity.
+    pub fn select_project_with_root(&mut self, project: Option<(String, String)>) {
+        self.selected_project = project
+            .filter(|(id, root)| !id.trim().is_empty() && !root.trim().is_empty())
+            .and_then(|(id, root)| {
+                // The project service supplies the daemon canonical root. Do
+                // not reinterpret it relative to the GUI process directory.
+                let root_path = std::path::PathBuf::from(&root);
+                self.backend
+                    .set_selected_project(id.clone(), &root_path)
+                    .ok()?;
+                Some(SelectedProject { id, root })
+            });
+        if self.selected_project.is_none() {
+            let _ = self.backend.clear_selected_project_root();
+        }
+        self.operations = OperationsModel::new();
+        self.operations_loading = false;
+        self.operations_error = None;
     }
 
     fn refresh_operations(&mut self, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            self.operations = OperationsModel::new();
+            self.operations_loading = false;
+            self.operations_error = None;
+            return;
+        }
         self.operations_loading = true;
         self.operations_error = None;
         let receiver = self.backend.operations_status();
@@ -577,6 +617,9 @@ impl TauView {
     }
 
     fn refresh_operation_branches(&mut self, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            return;
+        }
         let receiver = self.backend.operations_branches();
         cx.spawn(async move |view, cx| {
             if let Ok(Ok(result)) = receiver.await {
@@ -596,6 +639,9 @@ impl TauView {
     }
 
     fn open_operation_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            return;
+        }
         self.operations_loading = true;
         self.operations_error = None;
         let receiver = self.backend.operations_file(path);
@@ -635,6 +681,9 @@ impl TauView {
     }
 
     fn operation_mutation(&mut self, path: String, kind: &'static str, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            return;
+        }
         self.operations_loading = true;
         self.operations_error = None;
         let receiver = match kind {
@@ -671,6 +720,9 @@ impl TauView {
     }
 
     fn keep_operation(&mut self, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            return;
+        }
         if let Some(file) = self.operations.selected.as_ref() {
             let revision = crate::operations::content_revision(&file.content);
             self.operations.toggle_keep(file.path.clone(), revision);
@@ -679,6 +731,9 @@ impl TauView {
     }
 
     fn acknowledge_operation(&mut self, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            return;
+        }
         self.operations_loading = true;
         self.operations_error = None;
         let receiver = self.backend.operations_ack("operations".into(), true);
@@ -709,20 +764,40 @@ impl TauView {
     }
 
     fn create_operation_branch(&mut self, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            return;
+        }
         let receiver = self
             .backend
             .operations_create_branch("tau/gui-review".into());
-        cx.spawn(async move |view, cx| {
-            let _ = receiver.await;
-            let _ = view.update(cx, |view, cx| {
-                view.refresh_operation_branches(cx);
-                cx.notify();
-            });
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(_)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_error = None;
+                    view.refresh_operation_branches(cx);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_error = Some(error);
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
 
     fn switch_operation_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.selected_project.is_none() {
+            return;
+        }
         let receiver = self.backend.operations_switch_branch(name);
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(_)) => {
@@ -855,7 +930,10 @@ impl TauView {
     }
 
     fn operations_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = if self.operations_loading {
+        let has_project = self.selected_project.is_some();
+        let status = if !has_project {
+            "Select a daemon project to enable operations"
+        } else if self.operations_loading {
             "Loading…"
         } else if let Some(error) = &self.operations_error {
             error.as_str()
@@ -953,78 +1031,80 @@ impl TauView {
                     "modified"
                 })
         }));
-        if let Some(file) = &self.operations.selected {
-            let stage_path = file.path.clone();
-            let unstage_path = file.path.clone();
-            let revert_path = file.path.clone();
-            let revision = crate::operations::content_revision(&file.content);
-            let keep_label = if self.operations.is_kept(&file.path, &revision) {
-                "Unkeep"
-            } else {
-                "Keep"
-            };
-            let mut details = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().child(format!(
-                    "{}\n\nCONTENT\n{}\nDIFF\n{}",
-                    file.path, file.content, file.diff
-                )))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(toast_button(
-                            "Stage",
-                            0x33445f,
-                            cx.listener(move |view, _, _, cx| {
-                                view.operation_mutation(stage_path.clone(), "stage", cx)
-                            }),
-                        ))
-                        .child(toast_button(
-                            "Unstage",
-                            0x33445f,
-                            cx.listener(move |view, _, _, cx| {
-                                view.operation_mutation(unstage_path.clone(), "unstage", cx)
-                            }),
-                        ))
-                        .child(toast_button(
-                            "Revert (confirm)",
-                            0x7d3b3b,
-                            cx.listener(move |view, _, _, cx| {
-                                view.operation_mutation(revert_path.clone(), "revert", cx)
-                            }),
-                        ))
-                        .child(toast_button(
-                            keep_label,
-                            0x52627a,
-                            cx.listener(|view, _, _, cx| view.keep_operation(cx)),
-                        )),
-                )
-                .child(div().child("Branches"));
-            details = details.children(self.operations.branches.iter().map(|branch| {
-                let name = branch.name.clone();
-                let callback_name = name.clone();
-                toast_button(
-                    name,
-                    0x263348,
-                    cx.listener(move |view, _, _, cx| {
-                        view.switch_operation_branch(callback_name.clone(), cx)
-                    }),
-                )
-            }));
-            details = details.child(toast_button(
-                "Create tau/gui-review",
-                0x33445f,
-                cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
-            ));
-            details = details.child(toast_button(
-                "Acknowledge",
-                0x52627a,
-                cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
-            ));
-            panel = panel.child(details);
+        if has_project {
+            if let Some(file) = &self.operations.selected {
+                let stage_path = file.path.clone();
+                let unstage_path = file.path.clone();
+                let revert_path = file.path.clone();
+                let revision = crate::operations::content_revision(&file.content);
+                let keep_label = if self.operations.is_kept(&file.path, &revision) {
+                    "Unkeep"
+                } else {
+                    "Keep"
+                };
+                let mut details = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().child(format!(
+                        "{}\n\nCONTENT\n{}\nDIFF\n{}",
+                        file.path, file.content, file.diff
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(toast_button(
+                                "Stage",
+                                0x33445f,
+                                cx.listener(move |view, _, _, cx| {
+                                    view.operation_mutation(stage_path.clone(), "stage", cx)
+                                }),
+                            ))
+                            .child(toast_button(
+                                "Unstage",
+                                0x33445f,
+                                cx.listener(move |view, _, _, cx| {
+                                    view.operation_mutation(unstage_path.clone(), "unstage", cx)
+                                }),
+                            ))
+                            .child(toast_button(
+                                "Revert (confirm)",
+                                0x7d3b3b,
+                                cx.listener(move |view, _, _, cx| {
+                                    view.operation_mutation(revert_path.clone(), "revert", cx)
+                                }),
+                            ))
+                            .child(toast_button(
+                                keep_label,
+                                0x52627a,
+                                cx.listener(|view, _, _, cx| view.keep_operation(cx)),
+                            )),
+                    )
+                    .child(div().child("Branches"));
+                details = details.children(self.operations.branches.iter().map(|branch| {
+                    let name = branch.name.clone();
+                    let callback_name = name.clone();
+                    toast_button(
+                        name,
+                        0x263348,
+                        cx.listener(move |view, _, _, cx| {
+                            view.switch_operation_branch(callback_name.clone(), cx)
+                        }),
+                    )
+                }));
+                details = details.child(toast_button(
+                    "Create tau/gui-review",
+                    0x33445f,
+                    cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
+                ));
+                details = details.child(toast_button(
+                    "Acknowledge",
+                    0x52627a,
+                    cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
+                ));
+                panel = panel.child(details);
+            }
         }
         panel
     }
@@ -1042,7 +1122,11 @@ impl TauView {
     /// local session selected.
     fn new_chat(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let backend = self.backend.clone();
-        let Some(project_id) = self.selected_project_id.clone() else {
+        let Some(project_id) = self
+            .selected_project
+            .as_ref()
+            .map(|project| project.id.clone())
+        else {
             self.runtime = RuntimeState::Failed("select a project before creating a chat".into());
             cx.notify();
             return;
@@ -1077,7 +1161,9 @@ impl TauView {
     }
 
     fn session_project(&self) -> Option<ProjectId> {
-        self.selected_project_id.clone().map(ProjectId::new)
+        self.selected_project
+            .as_ref()
+            .map(|project| ProjectId::new(project.id.clone()))
     }
 
     fn load_sessions(&mut self, cx: &mut Context<Self>) {
@@ -1756,7 +1842,9 @@ impl TauView {
             self.chat.session_id.clone(),
             (!self.agent.is_empty()).then(|| self.agent.clone()),
             selected_model,
-            self.selected_project_id.clone(),
+            self.selected_project
+                .as_ref()
+                .map(|project| project.id.clone()),
         );
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;

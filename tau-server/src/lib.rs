@@ -877,15 +877,29 @@ fn ack_response(id: Id) -> String {
     .unwrap_or_default()
 }
 
-async fn git_status(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+/// Resolve the wire project identifier through the daemon's project registry.
+/// Git RPCs must never treat the request value as an arbitrary filesystem path.
+fn git_project_root(db: &tau_core::db::Db, project_id: &str) -> anyhow::Result<PathBuf> {
+    let project = db
+        .get_project(project_id)?
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+    if !project.active {
+        anyhow::bail!("project is inactive: {project_id}");
+    }
+    std::fs::canonicalize(project.root).context("canonicalizing project root")
+}
+
+async fn git_status(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
     let Ok(params) =
         parse_git::<tau_proto::git::GitStatusParams>(value, "invalid git status parameters")
     else {
         return git_error(id, "invalid git status parameters");
     };
+    let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        let workspace = tau_core::git::GitWorkspace::open(params.project)?;
-        let status = workspace.status(std::path::Path::new("."))?;
+        let root = git_project_root(&db, &params.project)?;
+        let workspace = tau_core::git::GitWorkspace::open_project(root.clone())?;
+        let status = workspace.status(&root)?;
         Ok::<_, anyhow::Error>(tau_proto::git::GitStatusResult {
             branch: status.branch,
             files: status
@@ -908,18 +922,17 @@ async fn git_status(id: Id, value: Option<serde_json::Value>, _state: &AppState)
     }
 }
 
-async fn git_file(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+async fn git_file(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
     let Ok(params) =
         parse_git::<tau_proto::git::GitFileParams>(value, "invalid git file parameters")
     else {
         return git_error(id, "invalid git file parameters");
     };
+    let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
-        let file = workspace.file(
-            std::path::Path::new("."),
-            std::path::Path::new(&params.path),
-        )?;
+        let root = git_project_root(&db, &params.project)?;
+        let workspace = tau_core::git::GitWorkspace::open_project(root.clone())?;
+        let file = workspace.file(&root, std::path::Path::new(&params.path))?;
         Ok::<_, anyhow::Error>(tau_proto::git::GitFileResult {
             path: file.path,
             content: file.content,
@@ -937,7 +950,7 @@ async fn git_file(id: Id, value: Option<serde_json::Value>, _state: &AppState) -
 async fn git_path_op(
     id: Id,
     value: Option<serde_json::Value>,
-    _state: &AppState,
+    state: &AppState,
     stage: bool,
 ) -> String {
     let Ok(params) =
@@ -945,9 +958,11 @@ async fn git_path_op(
     else {
         return git_error(id, "invalid git path parameters");
     };
+    let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
-        let project = std::path::Path::new(".");
+        let root = git_project_root(&db, &params.project)?;
+        let workspace = tau_core::git::GitWorkspace::open_project(root.clone())?;
+        let project = root.as_path();
         let path = std::path::Path::new(&params.path);
         if stage {
             workspace.stage(project, path)?;
@@ -964,7 +979,7 @@ async fn git_path_op(
     }
 }
 
-async fn git_revert(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+async fn git_revert(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
     let Ok(params) =
         parse_git::<tau_proto::git::GitRevertParams>(value, "invalid revert parameters")
     else {
@@ -973,13 +988,11 @@ async fn git_revert(id: Id, value: Option<serde_json::Value>, _state: &AppState)
     if !params.validate() {
         return git_error(id, "confirmation and safe path required");
     }
+    let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
-        workspace.revert(
-            std::path::Path::new("."),
-            std::path::Path::new(&params.path),
-            params.confirmed,
-        )
+        let root = git_project_root(&db, &params.project)?;
+        let workspace = tau_core::git::GitWorkspace::open_project(root.clone())?;
+        workspace.revert(&root, std::path::Path::new(&params.path), params.confirmed)
     })
     .await;
     match result {
@@ -995,9 +1008,12 @@ async fn git_ack(id: Id, value: Option<serde_json::Value>, state: &AppState) -> 
         return git_error(id, "invalid ack parameters");
     };
     let project = params.project.clone();
-    let valid =
-        tokio::task::spawn_blocking(move || tau_core::git::GitWorkspace::open(project).map(|_| ()))
-            .await;
+    let db = Arc::clone(&state.db);
+    let valid = tokio::task::spawn_blocking(move || {
+        let root = git_project_root(&db, &project)?;
+        tau_core::git::GitWorkspace::open_project(root).map(|_| ())
+    })
+    .await;
     match valid {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return git_error(id, error),
@@ -1013,17 +1029,19 @@ async fn git_ack(id: Id, value: Option<serde_json::Value>, state: &AppState) -> 
     .unwrap_or_default()
 }
 
-async fn git_branches(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+async fn git_branches(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
     let Ok(params) =
         parse_git::<tau_proto::git::GitBranchesParams>(value, "invalid branches parameters")
     else {
         return git_error(id, "invalid branches parameters");
     };
+    let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        let workspace = tau_core::git::GitWorkspace::open(params.project)?;
-        let current = workspace.status(std::path::Path::new("."))?.branch;
+        let root = git_project_root(&db, &params.project)?;
+        let workspace = tau_core::git::GitWorkspace::open_project(root.clone())?;
+        let current = workspace.status(&root)?.branch;
         let branches = workspace
-            .branches(std::path::Path::new("."))?
+            .branches(&root)?
             .into_iter()
             .map(|branch| tau_proto::git::GitBranch {
                 name: branch.name,
@@ -1040,15 +1058,17 @@ async fn git_branches(id: Id, value: Option<serde_json::Value>, _state: &AppStat
     }
 }
 
-async fn git_branch_create(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+async fn git_branch_create(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
     let Ok(params) =
         parse_git::<tau_proto::git::GitBranchCreateParams>(value, "invalid branch parameters")
     else {
         return git_error(id, "invalid branch parameters");
     };
+    let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
-        workspace.create_branch(std::path::Path::new("."), &params.name)
+        let root = git_project_root(&db, &params.project)?;
+        let workspace = tau_core::git::GitWorkspace::open_project(root.clone())?;
+        workspace.create_branch(&root, &params.name)
     })
     .await;
     match result {
@@ -1058,15 +1078,17 @@ async fn git_branch_create(id: Id, value: Option<serde_json::Value>, _state: &Ap
     }
 }
 
-async fn git_branch_switch(id: Id, value: Option<serde_json::Value>, _state: &AppState) -> String {
+async fn git_branch_switch(id: Id, value: Option<serde_json::Value>, state: &AppState) -> String {
     let Ok(params) =
         parse_git::<tau_proto::git::GitBranchSwitchParams>(value, "invalid branch parameters")
     else {
         return git_error(id, "invalid branch parameters");
     };
+    let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        let workspace = tau_core::git::GitWorkspace::open(&params.project)?;
-        workspace.switch_branch(std::path::Path::new("."), &params.name)
+        let root = git_project_root(&db, &params.project)?;
+        let workspace = tau_core::git::GitWorkspace::open_project(root.clone())?;
+        workspace.switch_branch(&root, &params.name)
     })
     .await;
     match result {
@@ -1742,6 +1764,11 @@ mod session_rpc_tests {
             Arc::new(tau_core::config::Config::default()),
             tau_core::db::Db::open_in_memory().unwrap(),
         );
+        let project_root = tempfile::tempdir().unwrap();
+        let project = state
+            .db()
+            .create_project("project-a", project_root.path())
+            .unwrap();
         let (out, _received) = mpsc::channel(1);
         let negotiated = Arc::new(Mutex::new(None));
         let request =
@@ -1751,7 +1778,7 @@ mod session_rpc_tests {
                 1,
                 METHOD_SESSION_CREATE,
                 serde_json::json!({
-                    "project_id": "project-a", "cwd": "/tmp/a"
+                    "project_id": project.id.clone(), "cwd": project.root.clone()
                 }),
             ),
             &state,
@@ -1763,7 +1790,7 @@ mod session_rpc_tests {
         let created: Response<serde_json::Value> = serde_json::from_str(&response).unwrap();
         let session: tau_proto::session::SessionRecord =
             serde_json::from_value(created.result.unwrap()).unwrap();
-        assert_eq!(session.project_id.as_str(), "project-a");
+        assert_eq!(session.project_id.as_str(), project.id.as_str());
         assert!(session.title.is_none());
 
         let response = handle_request(
@@ -1771,7 +1798,7 @@ mod session_rpc_tests {
                 2,
                 METHOD_SESSION_LIST,
                 serde_json::json!({
-                    "project_id": "project-a"
+                    "project_id": project.id.clone()
                 }),
             ),
             &state,
@@ -1790,7 +1817,7 @@ mod session_rpc_tests {
                 3,
                 METHOD_SESSION_RENAME,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id, "title": "Work"
+                    "project_id": project.id.clone(), "session_id": session.id, "title": "Work"
                 }),
             ),
             &state,
@@ -1809,7 +1836,7 @@ mod session_rpc_tests {
                 4,
                 METHOD_SESSION_ARCHIVE,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id
+                    "project_id": project.id.clone(), "session_id": session.id
                 }),
             ),
             &state,

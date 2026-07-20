@@ -73,6 +73,14 @@ impl ProjectState {
             .and_then(|id| self.projects.get(id))
     }
 
+    /// Return the daemon identity and canonical workspace root for the active
+    /// project.  Keeping this pair together prevents callers from falling back
+    /// to the GUI process working directory when dispatching operations.
+    pub fn active_selection(&self) -> Option<(&ProjectId, &Path)> {
+        self.active()
+            .map(|project| (&project.id, project.root.as_path()))
+    }
+
     pub fn apply(&mut self, action: ProjectAction) -> Result<Option<ProjectId>, ProjectError> {
         match action {
             ProjectAction::Create { name, root } => {
@@ -245,5 +253,16 @@ mod tests {
         assert_ne!(new, old);
         assert_eq!(state.projects[&new].root, PathBuf::from("/shared"));
         assert_eq!(state.active_project_id.as_deref(), Some(new.as_str()));
+    }
+
+    #[test]
+    fn active_selection_exposes_identity_and_canonical_root() {
+        let mut state = ProjectState::default();
+        let id = state
+            .create("workspace".into(), PathBuf::from("/canonical/root"))
+            .unwrap();
+        let (identity, root) = state.active_selection().unwrap();
+        assert_eq!(identity, &id);
+        assert_eq!(root, Path::new("/canonical/root"));
     }
 }

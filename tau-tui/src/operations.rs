@@ -10,7 +10,11 @@ use tau_proto::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationsState {
+    /// Canonical root used for local state and display; never sent as an
+    /// untrusted path to the daemon.
     pub project: String,
+    /// Durable daemon project identity used on Git RPCs.
+    pub project_id: Option<String>,
     pub branch: String,
     pub files: Vec<GitFileStatus>,
     pub selected: usize,
@@ -23,6 +27,7 @@ impl OperationsState {
     pub fn new(project: impl Into<String>) -> Self {
         Self {
             project: project.into(),
+            project_id: None,
             branch: String::new(),
             files: vec![],
             selected: 0,
@@ -31,6 +36,39 @@ impl OperationsState {
             acknowledged: HashMap::new(),
             keeps: HashMap::new(),
         }
+    }
+    pub fn set_project_selection(
+        &mut self,
+        project_id: impl Into<String>,
+        project: impl Into<String>,
+    ) {
+        let project = project.into();
+        let project_id = project_id.into();
+        if self.project != project || self.project_id.as_deref() != Some(project_id.as_str()) {
+            *self = Self::new(project);
+        }
+        self.project_id = Some(project_id);
+    }
+    pub fn set_project(&mut self, project: impl Into<String>) {
+        let project = project.into();
+        if self.project != project {
+            *self = Self::new(project);
+        }
+    }
+    pub fn active(&self) -> bool {
+        !self.project.trim().is_empty()
+            && self
+                .project_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+    }
+    /// The daemon receives the durable project ID and resolves it to the
+    /// canonical root registered in its project registry.
+    fn wire_project(&self) -> anyhow::Result<String> {
+        anyhow::ensure!(self.active(), "operations require a selected project");
+        self.project_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("operations require a daemon project selection"))
     }
     pub fn path(&self) -> Option<&str> {
         self.files.get(self.selected).map(|f| f.path.as_str())
@@ -47,7 +85,7 @@ impl OperationsState {
 }
 impl Default for OperationsState {
     fn default() -> Self {
-        Self::new(".")
+        Self::new("")
     }
 }
 
@@ -84,11 +122,8 @@ pub fn reduce(state: &mut OperationsState, action: Action) {
 }
 
 pub async fn status(client: &Client, state: &mut OperationsState) -> anyhow::Result<()> {
-    let r = client
-        .git_status(GitStatusParams {
-            project: state.project.clone(),
-        })
-        .await?;
+    let project = state.wire_project()?;
+    let r = client.git_status(GitStatusParams { project }).await?;
     state.branch = r.branch;
     state.files = r.files;
     state.selected = state.selected.min(state.files.len().saturating_sub(1));
@@ -99,13 +134,9 @@ pub async fn file(
     state: &mut OperationsState,
     path: impl Into<String>,
 ) -> anyhow::Result<()> {
+    let project = state.wire_project()?;
     let path = path.into();
-    let r = client
-        .git_file(GitFileParams {
-            project: state.project.clone(),
-            path,
-        })
-        .await?;
+    let r = client.git_file(GitFileParams { project, path }).await?;
     let revision = OperationsState::revision(&r.content);
     if state
         .content
@@ -119,26 +150,23 @@ pub async fn file(
     Ok(())
 }
 pub async fn stage(client: &Client, state: &OperationsState, path: String) -> anyhow::Result<()> {
+    let project = state.wire_project()?;
     client
-        .git_stage(GitPathParams {
-            project: state.project.clone(),
-            path,
-        })
+        .git_stage(GitPathParams { project, path })
         .await
         .map(|_| ())
 }
 pub async fn unstage(client: &Client, state: &OperationsState, path: String) -> anyhow::Result<()> {
+    let project = state.wire_project()?;
     client
-        .git_unstage(GitPathParams {
-            project: state.project.clone(),
-            path,
-        })
+        .git_unstage(GitPathParams { project, path })
         .await
         .map(|_| ())
 }
 pub async fn revert(client: &Client, state: &OperationsState, path: String) -> anyhow::Result<()> {
+    let project = state.wire_project()?;
     let p = GitRevertParams {
-        project: state.project.clone(),
+        project,
         path,
         confirmed: true,
     };
@@ -149,11 +177,8 @@ pub async fn revert(client: &Client, state: &OperationsState, path: String) -> a
     client.git_revert(p).await.map(|_| ())
 }
 pub async fn branches(client: &Client, state: &mut OperationsState) -> anyhow::Result<()> {
-    let r = client
-        .git_branches(GitBranchesParams {
-            project: state.project.clone(),
-        })
-        .await?;
+    let project = state.wire_project()?;
+    let r = client.git_branches(GitBranchesParams { project }).await?;
     state.branch = r.current;
     state.branches = r.branches;
     Ok(())
@@ -163,11 +188,9 @@ pub async fn create_branch(
     state: &OperationsState,
     name: String,
 ) -> anyhow::Result<()> {
+    let project = state.wire_project()?;
     client
-        .git_branch_create(GitBranchCreateParams {
-            project: state.project.clone(),
-            name,
-        })
+        .git_branch_create(GitBranchCreateParams { project, name })
         .await
         .map(|_| ())
 }
@@ -176,11 +199,9 @@ pub async fn switch_branch(
     state: &OperationsState,
     name: String,
 ) -> anyhow::Result<()> {
+    let project = state.wire_project()?;
     client
-        .git_branch_switch(GitBranchSwitchParams {
-            project: state.project.clone(),
-            name,
-        })
+        .git_branch_switch(GitBranchSwitchParams { project, name })
         .await
         .map(|_| ())
 }
@@ -190,9 +211,10 @@ pub async fn acknowledge(
     operation: String,
     acknowledged: bool,
 ) -> anyhow::Result<bool> {
+    let project = state.wire_project()?;
     Ok(client
         .git_ack(GitAckParams {
-            project: state.project.clone(),
+            project,
             operation,
             acknowledged,
         })
@@ -206,12 +228,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &OperationsState) {
         .iter()
         .map(|f| ListItem::new(format!("{} {}", if f.staged { "●" } else { "○" }, f.path)))
         .collect::<Vec<_>>();
+    let title = if !state.project.trim().is_empty() {
+        format!("Operations [{}]", state.branch)
+    } else {
+        "Operations [disabled: select a project]".to_owned()
+    };
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title(format!("Operations [{}]", state.branch))
-                .borders(Borders::ALL),
-        ),
+        List::new(items).block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
     if let Some(c) = &state.content {
@@ -253,6 +276,22 @@ mod tests {
             diff: String::new(),
         });
         assert!(!state.is_kept("tracked.txt", OperationsState::revision("two")));
+    }
+
+    #[test]
+    fn default_operations_have_no_project_and_switch_resets_view() {
+        let mut state = OperationsState::default();
+        assert!(!state.active());
+        state.set_project("/repo/one");
+        assert!(!state.active());
+        state.set_project_selection("one", "/repo/one");
+        assert!(state.active());
+        state.branch = "main".into();
+        state.set_project_selection("two", "/repo/two");
+        assert_eq!(state.project, "/repo/two");
+        assert!(state.branch.is_empty());
+        state.set_project("");
+        assert!(!state.active());
     }
 
     #[test]

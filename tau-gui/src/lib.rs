@@ -65,21 +65,13 @@ impl ProjectServiceAdapter for LocalProjectAdapter {
 
 impl ProjectShellRoot {
     fn new(backend: Backend, cx: &mut GpuiContext<Self>) -> Self {
-        let cwd = PathBuf::from(backend.cwd());
-        let mut state = ProjectState::new();
-        let id = state
-            .create("Current project".into(), cwd.clone())
-            .expect("fresh project");
-        let shell_state = shell::ProjectState::Ready(vec![ProjectItem {
-            id: id.clone(),
-            name: "Current project".into(),
-            path: cwd,
-        }]);
-        let shell = cx.new(|_: &mut GpuiContext<ProjectShell>| {
-            let mut project_shell = ProjectShell::new(shell_state.clone());
-            project_shell.select(id);
-            project_shell
-        });
+        // The GUI process cwd is not a daemon project selection.  Keep the
+        // shell empty until the project service supplies an acknowledged
+        // project id and canonical root; otherwise operations would dispatch
+        // an unregistered local path to the daemon.
+        let state = ProjectState::new();
+        let shell = cx
+            .new(|_: &mut GpuiContext<ProjectShell>| ProjectShell::new(shell::ProjectState::Empty));
         let view = cx.new(|cx| TauView::new(backend, cx));
         Self {
             shell,
@@ -134,6 +126,18 @@ impl ProjectShellRoot {
             }
             shell.selected = selected;
             cx.notify();
+        });
+        let selected_project = self.project_adapter.state.active().map(|project| {
+            (
+                project.id.clone(),
+                project.root.to_string_lossy().into_owned(),
+            )
+        });
+        self.view.update(cx, |view, _| {
+            // A project switch, repath, unregister, or reactivation all pass
+            // through this one seam. The view resets its operations model and
+            // the backend captures the new canonical root before any RPC.
+            view.select_project_with_root(selected_project);
         });
     }
 

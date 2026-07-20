@@ -83,11 +83,9 @@ async fn session(
     mut client: Client,
     socket: PathBuf,
 ) -> Result<()> {
-    let mut state = AppState {
-        project_root: std::env::current_dir()?.to_string_lossy().into_owned(),
-        ..AppState::default()
-    };
-    state.operations.project = state.project_root.clone();
+    // Git operations remain inert until the daemon project navigator supplies
+    // an explicit id and canonical root. Never infer either from process cwd.
+    let mut state = AppState::default();
     // Projects are a client-local projection.  Keep their lifecycle entirely
     // on this side of the daemon adapter: turns continue to use AppState and
     // no project wire protocol is implied by the shell.
@@ -287,15 +285,7 @@ async fn session(
 /// The working directory is deliberately only a UI-local registration; it is
 /// not sent to the daemon as a protocol request.
 fn initialize_projects(projects: &mut ProjectState) {
-    if let Ok(root) = std::env::current_dir() {
-        let root = root.to_string_lossy().into_owned();
-        let name = root
-            .rsplit(std::path::MAIN_SEPARATOR)
-            .find(|part| !part.is_empty())
-            .unwrap_or("project")
-            .to_owned();
-        let _ = apply_project_action(projects, ProjectAction::Register { name, root });
-    }
+    // Do not register cwd implicitly: it is not a selected daemon project.
     let saved = projects.selected.clone();
     projects.restore_active(saved.as_ref());
 }
@@ -333,21 +323,21 @@ async fn handle_operations(state: &mut AppState, client: &Client, action: reduce
             if let Some(p) = state.operations.path().map(str::to_owned) {
                 operations::stage(client, &state.operations, p).await
             } else {
-                Ok(())
+                Err(anyhow::anyhow!("select a file before using this operation"))
             }
         }
         Action::OperationsUnstage => {
             if let Some(p) = state.operations.path().map(str::to_owned) {
                 operations::unstage(client, &state.operations, p).await
             } else {
-                Ok(())
+                Err(anyhow::anyhow!("select a file before using this operation"))
             }
         }
         Action::OperationsRevertConfirmed => {
             if let Some(p) = state.operations.path().map(str::to_owned) {
                 operations::revert(client, &state.operations, p).await
             } else {
-                Ok(())
+                Err(anyhow::anyhow!("select a file before using this operation"))
             }
         }
         Action::OperationsAcknowledge => {
