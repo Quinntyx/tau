@@ -19,8 +19,8 @@ use rusqlite_migration::{M, Migrations};
 
 pub use domain::{
     ContentBlock, ContextEpochRecord, InteractivePrompt, Message, PlanRevision,
-    PolicyDecisionRecord, Project, QaRecord, Session, SteeringMode, SteeringRun, Usage,
-    default_db_path,
+    PolicyDecisionRecord, Project, ProjectError, QaRecord, Session, SteeringMode, SteeringRun,
+    Usage, default_db_path,
 };
 pub use journal::StoredArtifact;
 pub use sessions::{ProjectId, SessionRecord};
@@ -83,6 +83,14 @@ impl Db {
             updated_at: now,
         };
         let conn = self.conn.lock().unwrap();
+        let occupied = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE root = ?1 AND active = 1)",
+            [&project.root],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if occupied {
+            return Err(anyhow::Error::new(ProjectError::ActiveRootConflict));
+        }
         conn.execute("INSERT INTO projects (id,name,root,active,created_at,updated_at) VALUES (?1,?2,?3,1,?4,?4)", rusqlite::params![project.id, project.name, project.root, now])?;
         Ok(project)
     }
@@ -139,6 +147,14 @@ impl Db {
     pub fn repath_project(&self, id: &str, root: impl AsRef<Path>) -> Result<Project> {
         let root = domain::canonical_project_root(root)?;
         let conn = self.conn.lock().unwrap();
+        let occupied = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE root = ?1 AND active = 1 AND id <> ?2)",
+            rusqlite::params![&root, id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if occupied {
+            return Err(anyhow::Error::new(ProjectError::ActiveRootConflict));
+        }
         let changed = conn.execute(
             "UPDATE projects SET root=?1,updated_at=?2 WHERE id=?3",
             rusqlite::params![root, domain::now_ms(), id],
@@ -169,6 +185,16 @@ impl Db {
     }
     fn set_project_active(&self, id: &str, active: bool) -> Result<Project> {
         let conn = self.conn.lock().unwrap();
+        if active {
+            let conflict = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects AS other WHERE other.root = (SELECT root FROM projects WHERE id = ?1) AND other.active = 1 AND other.id <> ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if conflict {
+                return Err(anyhow::Error::new(ProjectError::ActiveRootConflict));
+            }
+        }
         let n = conn.execute(
             "UPDATE projects SET active=?1,updated_at=?2 WHERE id=?3",
             rusqlite::params![active as i64, domain::now_ms(), id],

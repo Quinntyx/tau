@@ -1,6 +1,6 @@
 //! Typed session navigator RPC messages.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const METHOD_SESSION_CREATE: &str = "session.create";
 pub const METHOD_SESSION_LIST: &str = "session.list";
@@ -13,7 +13,7 @@ pub const METHOD_SESSION_RESTORE: &str = "session.restore";
 /// to the session service.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ProjectId(String);
+pub struct ProjectId(#[serde(deserialize_with = "deserialize_non_empty")] String);
 
 impl ProjectId {
     pub fn new(value: impl Into<String>) -> Self {
@@ -27,7 +27,7 @@ impl ProjectId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SessionId(String);
+pub struct SessionId(#[serde(deserialize_with = "deserialize_non_empty")] String);
 
 impl SessionId {
     pub fn new(value: impl Into<String>) -> Self {
@@ -42,6 +42,7 @@ impl SessionId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateParams {
     pub project_id: ProjectId,
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub cwd: String,
 }
 
@@ -86,6 +87,18 @@ pub struct SessionRecord {
     pub archived_at: Option<i64>,
 }
 
+fn deserialize_non_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        Err(serde::de::Error::custom("value must not be empty"))
+    } else {
+        Ok(value)
+    }
+}
+
 pub type CreateResult = SessionRecord;
 pub type ListResult = Vec<SessionRecord>;
 pub type HistoryResult = Vec<crate::turn::SequencedEvent>;
@@ -106,5 +119,17 @@ mod tests {
         let decoded: RenameParams = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.project_id.as_str(), "opaque-project");
         assert_eq!(decoded.session_id.as_str(), "opaque-session");
+    }
+
+    #[test]
+    fn required_ids_and_cwd_reject_empty_wire_values() {
+        assert!(serde_json::from_value::<ProjectId>(serde_json::json!("")).is_err());
+        assert!(serde_json::from_value::<SessionId>(serde_json::json!("")).is_err());
+        assert!(
+            serde_json::from_value::<CreateParams>(serde_json::json!({
+                "project_id": "p", "cwd": ""
+            }))
+            .is_err()
+        );
     }
 }

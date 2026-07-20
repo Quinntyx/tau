@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProjectError {
+    #[error("project root is already registered by an active project")]
+    ActiveRootConflict,
+}
 
 /// Default database path: `~/.local/share/tau/tau.db` (XDG data dir).
 /// Creates the parent directory if missing.

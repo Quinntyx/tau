@@ -463,6 +463,16 @@ fn rpc_error(id: Id, code: i32, message: impl Into<String>) -> String {
     .unwrap_or_default()
 }
 
+fn require_active_project(db: &tau_core::db::Db, project_id: &str) -> anyhow::Result<()> {
+    let project = db
+        .get_project(project_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
+    if !project.active {
+        anyhow::bail!("project is inactive: {project_id}");
+    }
+    Ok(())
+}
+
 fn git_error(id: Id, error: impl std::fmt::Display) -> String {
     serde_json::to_string(&Response::<serde_json::Value>::err(
         id,
@@ -529,8 +539,11 @@ async fn project_rename(id: Id, value: Option<serde_json::Value>, state: &AppSta
         Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
     };
     let db = Arc::clone(&state.db);
-    match tokio::task::spawn_blocking(move || db.rename_project(&params.project_id, &params.name))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        require_active_project(&db, &params.project_id)?;
+        db.rename_project(&params.project_id, &params.name)
+    })
+    .await
     {
         Ok(Ok(project)) => serde_json::to_string(&Response::ok(
             id,
@@ -553,8 +566,11 @@ async fn project_repath(id: Id, value: Option<serde_json::Value>, state: &AppSta
         Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
     };
     let db = Arc::clone(&state.db);
-    match tokio::task::spawn_blocking(move || db.repath_project(&params.project_id, params.root))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        require_active_project(&db, &params.project_id)?;
+        db.repath_project(&params.project_id, params.root)
+    })
+    .await
     {
         Ok(Ok(project)) => serde_json::to_string(&Response::ok(
             id,
@@ -619,9 +635,7 @@ async fn project_new_id(id: Id, value: Option<serde_json::Value>, state: &AppSta
         Ok(params) => params,
         Err(error) => return rpc_error(id, INVALID_PARAMS, error.to_string()),
     };
-    let Some(source_id) = params.project_id else {
-        return rpc_error(id, INVALID_PARAMS, "project_id is required");
-    };
+    let source_id = params.project_id;
     let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || {
         let project = db.new_project_id(&source_id)?;
@@ -662,6 +676,7 @@ async fn session_create(id: Id, raw: Option<serde_json::Value>, state: &AppState
     };
     let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || {
+        require_active_project(&db, p.project_id.as_str())?;
         db.create_session_for_project(&tau_core::db::ProjectId::new(p.project_id.as_str()), &p.cwd)
     })
     .await
@@ -669,12 +684,7 @@ async fn session_create(id: Id, raw: Option<serde_json::Value>, state: &AppState
         Ok(Ok(r)) => {
             serde_json::to_string(&Response::ok(id, session_record(r))).unwrap_or_default()
         }
-        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
-            id,
-            INTERNAL_ERROR,
-            e.to_string(),
-        ))
-        .unwrap_or_default(),
+        Ok(Err(e)) => rpc_error(id, INVALID_PARAMS, e.to_string()),
         Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             INTERNAL_ERROR,
@@ -697,6 +707,7 @@ async fn session_list(id: Id, raw: Option<serde_json::Value>, state: &AppState) 
     };
     let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || {
+        require_active_project(&db, p.project_id.as_str())?;
         db.list_sessions_for_project(
             &tau_core::db::ProjectId::new(p.project_id.as_str()),
             p.include_archived,
@@ -709,12 +720,7 @@ async fn session_list(id: Id, raw: Option<serde_json::Value>, state: &AppState) 
             rs.into_iter().map(session_record).collect::<Vec<_>>(),
         ))
         .unwrap_or_default(),
-        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
-            id,
-            INTERNAL_ERROR,
-            e.to_string(),
-        ))
-        .unwrap_or_default(),
+        Ok(Err(e)) => rpc_error(id, INVALID_PARAMS, e.to_string()),
         Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             INTERNAL_ERROR,
@@ -738,6 +744,7 @@ async fn session_history(id: Id, raw: Option<serde_json::Value>, state: &AppStat
     let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || {
         let project_id = tau_core::db::ProjectId::new(p.project_id.as_str());
+        require_active_project(&db, project_id.as_str())?;
         if db
             .get_session_record_for_project(&project_id, p.session_id.as_str())?
             .is_none()
@@ -749,12 +756,7 @@ async fn session_history(id: Id, raw: Option<serde_json::Value>, state: &AppStat
     .await
     {
         Ok(Ok(r)) => serde_json::to_string(&Response::ok(id, r)).unwrap_or_default(),
-        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
-            id,
-            INTERNAL_ERROR,
-            e.to_string(),
-        ))
-        .unwrap_or_default(),
+        Ok(Err(e)) => rpc_error(id, INVALID_PARAMS, e.to_string()),
         Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             INTERNAL_ERROR,
@@ -835,22 +837,23 @@ where
         + 'static,
 {
     let db = Arc::clone(&state.db);
-    match tokio::task::spawn_blocking(move || f(&db)).await {
+    let requested_project = project_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        require_active_project(&db, requested_project.as_str())?;
+        f(&db)
+    })
+    .await
+    {
         Ok(Ok(Some(record))) => {
             serde_json::to_string(&Response::ok(id, session_record(record))).unwrap_or_default()
         }
         Ok(Ok(None)) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
-            METHOD_NOT_FOUND,
+            INVALID_PARAMS,
             format!("session not found in project {}", project_id.as_str()),
         ))
         .unwrap_or_default(),
-        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
-            id,
-            INTERNAL_ERROR,
-            e.to_string(),
-        ))
-        .unwrap_or_default(),
+        Ok(Err(e)) => rpc_error(id, INVALID_PARAMS, e.to_string()),
         Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             INTERNAL_ERROR,
@@ -1086,7 +1089,7 @@ async fn require_capability(
         return Some(
             serde_json::to_string(&Response::<serde_json::Value>::err(
                 id,
-                METHOD_NOT_FOUND,
+                INVALID_REQUEST,
                 "protocol negotiation required before session.turn.*; reconnect and call protocol.negotiate (the daemon may be stale)",
             ))
             .unwrap_or_default(),
@@ -1096,7 +1099,7 @@ async fn require_capability(
         return Some(
             serde_json::to_string(&Response::<serde_json::Value>::err(
                 id,
-                METHOD_NOT_FOUND,
+                INVALID_REQUEST,
                 format!(
                     "requested session capability is unavailable after negotiation: {required:?}; reconnect to a compatible daemon or negotiate that capability"
                 ),
@@ -1332,12 +1335,7 @@ async fn takeover_prompt(
     .await;
     match result {
         Ok(Ok(prompt)) => serde_json::to_string(&Response::ok(id, prompt)).unwrap_or_default(),
-        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
-            id,
-            INTERNAL_ERROR,
-            e.to_string(),
-        ))
-        .unwrap_or_default(),
+        Ok(Err(e)) => rpc_error(id, INVALID_PARAMS, e.to_string()),
         Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             INTERNAL_ERROR,
@@ -1414,7 +1412,14 @@ async fn start_turn(
                     }
                     id
                 }
-                None => db.create_session(&project_id)?.id,
+                None => {
+                    let cwd = params_for_db
+                        .cwd
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("cwd is required when creating a session"))?;
+                    let project_key = tau_core::db::ProjectId::new(project_id.clone());
+                    db.create_session_for_project(&project_key, cwd)?.id
+                }
             };
             let turn_id = uuid::Uuid::new_v4().to_string();
             let result = TurnStartResult { session_id: session_id.clone(), turn_id: turn_id.clone() };
@@ -1489,12 +1494,7 @@ async fn start_turn(
             ))
             .unwrap_or_default()
         }
-        Ok(Err(e)) => serde_json::to_string(&Response::<serde_json::Value>::err(
-            id,
-            INTERNAL_ERROR,
-            e.to_string(),
-        ))
-        .unwrap_or_default(),
+        Ok(Err(e)) => rpc_error(id, INVALID_PARAMS, e.to_string()),
         Err(e) => serde_json::to_string(&Response::<serde_json::Value>::err(
             id,
             INTERNAL_ERROR,
@@ -1742,6 +1742,11 @@ mod session_rpc_tests {
             Arc::new(tau_core::config::Config::default()),
             tau_core::db::Db::open_in_memory().unwrap(),
         );
+        let project = state
+            .db
+            .create_project("Project A", "/tmp/project-a")
+            .unwrap();
+        let project_id = project.id.clone();
         let (out, _received) = mpsc::channel(1);
         let negotiated = Arc::new(Mutex::new(None));
         let request =
@@ -1751,7 +1756,7 @@ mod session_rpc_tests {
                 1,
                 METHOD_SESSION_CREATE,
                 serde_json::json!({
-                    "project_id": "project-a", "cwd": "/tmp/a"
+                    "project_id": project_id.as_str(), "cwd": "/tmp/project-a/a"
                 }),
             ),
             &state,
@@ -1763,7 +1768,7 @@ mod session_rpc_tests {
         let created: Response<serde_json::Value> = serde_json::from_str(&response).unwrap();
         let session: tau_proto::session::SessionRecord =
             serde_json::from_value(created.result.unwrap()).unwrap();
-        assert_eq!(session.project_id.as_str(), "project-a");
+        assert_eq!(session.project_id.as_str(), project.id.as_str());
         assert!(session.title.is_none());
 
         let response = handle_request(
@@ -1771,7 +1776,7 @@ mod session_rpc_tests {
                 2,
                 METHOD_SESSION_LIST,
                 serde_json::json!({
-                    "project_id": "project-a"
+                    "project_id": project.id.as_str()
                 }),
             ),
             &state,
@@ -1790,7 +1795,7 @@ mod session_rpc_tests {
                 3,
                 METHOD_SESSION_RENAME,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id, "title": "Work"
+                    "project_id": project.id.as_str(), "session_id": session.id, "title": "Work"
                 }),
             ),
             &state,
@@ -1809,7 +1814,7 @@ mod session_rpc_tests {
                 4,
                 METHOD_SESSION_ARCHIVE,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id
+                    "project_id": project.id.as_str(), "session_id": session.id
                 }),
             ),
             &state,

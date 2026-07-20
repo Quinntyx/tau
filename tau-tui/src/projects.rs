@@ -56,6 +56,7 @@ pub enum ProjectAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectError {
+    DaemonRequired,
     EmptyName,
     EmptyRoot,
     AlreadyExists(ProjectId),
@@ -64,6 +65,23 @@ pub enum ProjectError {
     NotInactive(ProjectId),
     NoPendingConflict,
 }
+
+impl std::fmt::Display for ProjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DaemonRequired => f.write_str("project changes require daemon acknowledgement"),
+            Self::EmptyName => f.write_str("project name cannot be empty"),
+            Self::EmptyRoot => f.write_str("project path cannot be empty"),
+            Self::AlreadyExists(id) => write!(f, "project already exists: {}", id.0),
+            Self::NotFound(id) => write!(f, "project not found: {}", id.0),
+            Self::InactiveConflict(id) => write!(f, "project is inactive: {}", id.0),
+            Self::NotInactive(id) => write!(f, "project is already active: {}", id.0),
+            Self::NoPendingConflict => f.write_str("no inactive project conflict is pending"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InactiveConflict {
@@ -82,6 +100,31 @@ pub struct ProjectState {
 }
 
 impl ProjectState {
+    /// Replace the UI projection with records returned by the daemon.  The
+    /// registry owns the opaque IDs; the TUI never derives one from a path.
+    pub fn load_daemon_projects(
+        &mut self,
+        projects: impl IntoIterator<Item = (ProjectId, String, String, ProjectStatus)>,
+    ) {
+        self.projects.clear();
+        self.selected = None;
+        for (id, name, root, status) in projects {
+            let active = status == ProjectStatus::Active;
+            self.projects.insert(
+                id.clone(),
+                Project {
+                    id: id.clone(),
+                    name,
+                    root,
+                    status,
+                },
+            );
+            if active && self.selected.is_none() {
+                self.selected = Some(id);
+            }
+        }
+    }
+
     pub fn restore_active(&mut self, saved: Option<&ProjectId>) -> Option<&Project> {
         self.selected = saved.and_then(|id| {
             self.projects
@@ -103,21 +146,8 @@ impl ProjectState {
                 if root.is_empty() {
                     return Err(ProjectError::EmptyRoot);
                 }
-                let id = ProjectId(root.to_owned());
-                if let Some(existing) = self.projects.get(&id) {
-                    if existing.status == ProjectStatus::Inactive {
-                        self.inactive_conflict = Some(InactiveConflict {
-                            project: id,
-                            name: name.to_owned(),
-                            root: root.to_owned(),
-                        });
-                        return Err(ProjectError::InactiveConflict(ProjectId(root.to_owned())));
-                    }
-                    return Err(ProjectError::AlreadyExists(id));
-                }
-                self.insert_active(id.clone(), name, root);
-                self.selected = Some(id);
-                Ok(())
+                let _ = (name, root);
+                Err(ProjectError::DaemonRequired)
             }
             ProjectAction::Update { id, name, root } => {
                 let name = name.trim();
@@ -170,10 +200,8 @@ impl ProjectState {
                         self.apply(ProjectAction::Reactivate(conflict.project))
                     }
                     InactiveConflictChoice::CreateNew => {
-                        let id = self.next_id(&conflict.root);
-                        self.insert_active(id.clone(), &conflict.name, &conflict.root);
-                        self.selected = Some(id);
-                        Ok(())
+                        let _ = conflict;
+                        Err(ProjectError::DaemonRequired)
                     }
                     InactiveConflictChoice::Cancel => Ok(()),
                 }
@@ -194,29 +222,6 @@ impl ProjectState {
             },
         }
     }
-
-    fn insert_active(&mut self, id: ProjectId, name: &str, root: &str) {
-        self.projects.insert(
-            id.clone(),
-            Project {
-                id,
-                name: name.to_owned(),
-                root: root.to_owned(),
-                status: ProjectStatus::Active,
-            },
-        );
-    }
-
-    fn next_id(&self, root: &str) -> ProjectId {
-        let base = ProjectId(root.to_owned());
-        if !self.projects.contains_key(&base) {
-            return base;
-        }
-        (2..)
-            .map(|suffix| ProjectId(format!("{root}#{suffix}")))
-            .find(|id| !self.projects.contains_key(id))
-            .expect("unbounded project id space")
-    }
 }
 
 #[cfg(test)]
@@ -226,27 +231,16 @@ mod tests {
     #[test]
     fn scripted_crud_register_reactivate_and_restore() {
         let mut state = ProjectState::default();
-        state
-            .apply(ProjectAction::Register {
-                name: "demo".into(),
-                root: "/tmp/demo".into(),
-            })
-            .unwrap();
-        let id = ProjectId("/tmp/demo".into());
+        let id = ProjectId("daemon-demo".into());
+        state.load_daemon_projects([(
+            id.clone(),
+            "demo".into(),
+            "/tmp/demo".into(),
+            ProjectStatus::Active,
+        )]);
         state.local_restore.insert(id.clone(), "draft".into());
         state.apply(ProjectAction::Delete(id.clone())).unwrap();
-        assert_eq!(
-            state.apply(ProjectAction::Register {
-                name: "demo".into(),
-                root: "/tmp/demo".into()
-            }),
-            Err(ProjectError::InactiveConflict(id.clone()))
-        );
-        state
-            .apply(ProjectAction::ChooseInactiveConflict(
-                InactiveConflictChoice::Reactivate,
-            ))
-            .unwrap();
+        state.apply(ProjectAction::Reactivate(id.clone())).unwrap();
         state
             .apply(ProjectAction::RestoreLocal(id.clone()))
             .unwrap();
@@ -256,28 +250,20 @@ mod tests {
     #[test]
     fn inactive_registration_can_create_a_new_id_without_changing_root() {
         let mut state = ProjectState::default();
-        state
-            .apply(ProjectAction::Register {
-                name: "old".into(),
-                root: "/tmp/shared".into(),
-            })
-            .unwrap();
-        let old = ProjectId("/tmp/shared".into());
+        let old = ProjectId("daemon-old".into());
+        state.load_daemon_projects([(
+            old.clone(),
+            "old".into(),
+            "/tmp/shared".into(),
+            ProjectStatus::Active,
+        )]);
         state.apply(ProjectAction::Unregister(old.clone())).unwrap();
-        assert!(matches!(
+        assert_eq!(
             state.apply(ProjectAction::Register {
                 name: "new".into(),
-                root: "/tmp/shared".into(),
+                root: "/tmp/shared".into()
             }),
-            Err(ProjectError::InactiveConflict(_))
-        ));
-        state
-            .apply(ProjectAction::ChooseInactiveConflict(
-                InactiveConflictChoice::CreateNew,
-            ))
-            .unwrap();
-        let selected = state.selected.clone().unwrap();
-        assert_ne!(selected, old);
-        assert_eq!(state.projects[&selected].root, "/tmp/shared");
+            Err(ProjectError::DaemonRequired)
+        );
     }
 }

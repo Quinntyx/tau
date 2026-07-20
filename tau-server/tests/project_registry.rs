@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::StreamExt;
+use tau_client::{CreateSession, ProjectId as ClientProjectId};
 use tau_proto::prelude::*;
 use tokio::net::UnixListener;
 
@@ -50,7 +51,7 @@ async fn project_rpc_lifecycle_and_turn_validation_are_daemon_backed() -> Result
     assert!(!inactive.active);
     let new_id = client
         .project_new_id(ProjectNewIdParams {
-            project_id: Some(created.id.clone()),
+            project_id: created.id.clone(),
         })
         .await?
         .project_id;
@@ -59,6 +60,16 @@ async fn project_rpc_lifecycle_and_turn_validation_are_daemon_backed() -> Result
         client
             .project_reactivate(ProjectIdParams {
                 project_id: created.id.clone()
+            })
+            .await
+            .is_err()
+    );
+    // An inactive registry entry is not a session attachment target.
+    assert!(
+        client
+            .session_create(CreateSession {
+                project_id: ClientProjectId::new(created.id.clone()),
+                cwd: root.to_string_lossy().into_owned(),
             })
             .await
             .is_err()

@@ -263,10 +263,23 @@ fn project_sessions_are_filtered_flat_newest_first_and_recoverable() {
             .unwrap()
             .id,
     );
-    let first = db.create_session_for_project(&alpha, "/alpha/one").unwrap();
+    let first = db
+        .create_session_for_project(
+            &alpha,
+            &format!(
+                "{}/one",
+                db.get_project(alpha.as_str()).unwrap().unwrap().root
+            ),
+        )
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let second = db.create_session_for_project(&alpha, "/alpha/two").unwrap();
-    let foreign = db.create_session_for_project(&beta, "/beta").unwrap();
+    let alpha_root = db.get_project(alpha.as_str()).unwrap().unwrap().root;
+    let beta_root = db.get_project(beta.as_str()).unwrap().unwrap().root;
+    let second = db
+        .create_session_for_project(&alpha, &format!("{alpha_root}/two"))
+        .unwrap();
+    let foreign = db.create_session_for_project(&beta, &beta_root).unwrap();
+    assert_eq!(first.cwd, format!("{alpha_root}/one"));
 
     let visible = db.list_sessions_for_project(&alpha, false).unwrap();
     assert_eq!(
@@ -309,6 +322,21 @@ fn managed_session_creation_requires_a_project_id() {
         db.create_session_for_project(&ProjectId::new(""), "/tmp/no-project")
             .is_err()
     );
+}
+
+#[test]
+fn session_cwd_rejects_traversal_without_creating_outside_root() {
+    let db = test_db();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    let outside = parent.path().join("outside");
+    let project = db.create_project("project", &root).unwrap();
+
+    assert!(
+        db.create_session_for_project(&ProjectId::new(project.id), "../outside")
+            .is_err()
+    );
+    assert!(!outside.exists());
 }
 
 #[test]
@@ -388,12 +416,23 @@ fn project_registry_enforces_canonical_active_roots_and_lifecycle() {
     let second = db.new_project_id(&first.id).unwrap();
     assert_ne!(first.id, second.id);
     assert_eq!(first.root, second.root);
-    assert!(db.reactivate_project(&first.id).is_err());
+    let error = db.reactivate_project(&first.id).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::db::ProjectError>(),
+        Some(crate::db::ProjectError::ActiveRootConflict)
+    ));
+    let other_root = parent.path().join("other");
+    let other = db.create_project("Other", &other_root).unwrap();
+    let error = db.repath_project(&other.id, &first.root).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::db::ProjectError>(),
+        Some(crate::db::ProjectError::ActiveRootConflict)
+    ));
     assert_eq!(
         db.get_session(&session.id).unwrap().unwrap().project_id,
         first.id
     );
-    assert_eq!(db.list_projects(true).unwrap().len(), 2);
+    assert_eq!(db.list_projects(true).unwrap().len(), 3);
 }
 
 #[test]

@@ -12,6 +12,7 @@ pub const METHOD_PROJECT_NEW_ID: &str = "project.new_id";
 /// The durable project record exposed on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub id: String,
     pub name: String,
     pub root: String,
@@ -33,7 +34,9 @@ pub struct ProjectListResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectCreateParams {
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub name: String,
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub root: String,
 }
 
@@ -42,10 +45,17 @@ pub struct ProjectCreateResult {
     pub project: Project,
 }
 
+/// Canonical response shape for project operations returning a project.
+///
+/// The operation-specific names below remain aliases for wire/API
+/// compatibility, but all such responses have this single shape.
+pub type ProjectResult = ProjectCreateResult;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRenameParams {
     #[serde(deserialize_with = "deserialize_non_empty")]
     pub project_id: String,
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub name: String,
 }
 
@@ -53,13 +63,11 @@ pub struct ProjectRenameParams {
 pub struct ProjectRepathParams {
     #[serde(deserialize_with = "deserialize_non_empty")]
     pub project_id: String,
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub root: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectMutationResult {
-    pub project: Project,
-}
+pub type ProjectMutationResult = ProjectResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectIdParams {
@@ -67,23 +75,17 @@ pub struct ProjectIdParams {
     pub project_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectActionResult {
-    pub project: Project,
-}
+pub type ProjectActionResult = ProjectResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectNewIdParams {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_non_empty_option"
-    )]
-    pub project_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_non_empty")]
+    pub project_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectNewIdResult {
+    #[serde(deserialize_with = "deserialize_non_empty")]
     pub project_id: String,
 }
 
@@ -97,19 +99,6 @@ where
         return Err(serde::de::Error::custom("value must not be empty"));
     }
     Ok(value)
-}
-
-pub fn deserialize_non_empty_option<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
-        if value.is_empty() {
-            Err(serde::de::Error::custom("value must not be empty"))
-        } else {
-            Ok(Some(value))
-        }
-    })
 }
 
 #[cfg(test)]
