@@ -132,19 +132,27 @@ fn render_inner(frame: &mut Frame, s: &AppState, projects: Option<&ProjectState>
 fn session_navigator(frame: &mut Frame, s: &AppState) {
     let area = center(frame.area(), 70, 16);
     frame.render_widget(Clear, area);
-    let items = s
+    let mut items = s
         .sessions
         .visible()
         .into_iter()
         .map(|entry| ListItem::new(format!("{}  {}", entry.title, entry.id.as_str())))
         .collect::<Vec<_>>();
+    if items.is_empty() {
+        items.push(ListItem::new(if s.sessions.query.is_empty() {
+            "No sessions for this project"
+        } else {
+            "No sessions match the search"
+        }));
+    }
     let item_count = items.len();
+    let title = if s.sessions.show_archived {
+        " Sessions · archived · ↑↓ select · Enter open · n new chat · Ctrl-S close · search "
+    } else {
+        " Sessions · ↑↓ select · Enter open · n new chat · Ctrl-S close · Ctrl-A archived · search "
+    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Sessions · Ctrl-S close · Ctrl-A archived · search "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ratatui::widgets::ListState::default();
     if item_count != 0 {
@@ -449,7 +457,10 @@ mod tests {
             .collect::<String>();
         assert!(x.contains("Projects") && x.contains("Conversation"));
         assert!(x.contains("Permission required") && x.contains("run command"));
-        assert_eq!(t.get_cursor_position().unwrap(), (37, 28).into());
+        // The prompt is rendered inside the daemon-backed content column.  Keep
+        // this assertion tied to the current layout rather than the old
+        // pre-project-shell coordinates.
+        assert_eq!(t.get_cursor_position().unwrap(), (35, 25).into());
     }
 
     #[test]

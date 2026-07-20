@@ -20,10 +20,11 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, path::PathBuf, time::Duration};
-use tau_client::Client;
+use tau_client::{Client, CreateSession, ProjectId as ClientProjectId, SessionRef, SessionSummary};
 use tau_proto::prelude::{
-    Capability, ClientResponse, ProtocolNegotiateParams, ProtocolVersion, QuestionAnswer,
-    TurnPermissionChoice,
+    Capability, ClientResponse, ProjectCreateParams, ProjectIdParams, ProjectListParams,
+    ProjectNewIdParams, ProjectRenameParams, ProtocolNegotiateParams, ProtocolVersion,
+    QuestionAnswer, TurnPermissionChoice,
 };
 
 pub use adapter::{ClientEvent, ScriptedClient};
@@ -88,11 +89,13 @@ async fn session(
         ..AppState::default()
     };
     state.operations.project = state.project_root.clone();
-    // Projects are a client-local projection.  Keep their lifecycle entirely
-    // on this side of the daemon adapter: turns continue to use AppState and
-    // no project wire protocol is implied by the shell.
+    // Project records are a projection of daemon state.  The daemon, never the
+    // client cwd, is authoritative for IDs and lifecycle.
     let mut projects = ProjectState::default();
-    initialize_projects(&mut projects);
+    initialize_projects(&client, &mut projects, &mut state).await?;
+    if state.project_id.is_some() {
+        handle_operations(&mut state, &client, reducer::Action::OperationsRefresh).await;
+    }
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut event_task = tokio::spawn(adapter::persistent_events(
         client.clone(),
@@ -166,14 +169,39 @@ async fn session(
                         }),
                         _ => None,
                     };
-                     let prompt = reducer::apply(&mut state, action);
+                    // Project/session mutations are daemon-owned.  Keep the reducer as
+                    // the immediate UI projection, but issue the typed RPC alongside it
+                    // and only surface failures through the normal event channel.
+                    let rpc_action = action.clone();
+                    let refresh_operations = matches!(
+                        &rpc_action,
+                        reducer::Action::ProjectSelect(_)
+                            | reducer::Action::ProjectSelectWithRoot { .. }
+                            | reducer::Action::ProjectSelectCurrent
+                            | reducer::Action::ProjectCreateCurrent
+                            | reducer::Action::ProjectReactivateCurrent
+                            | reducer::Action::ProjectNewIdCurrent
+                            | reducer::Action::ProjectChooseInactive(_)
+                    );
+                    let prompt = reducer::apply(&mut state, action);
+                    dispatch_navigation_rpc(
+                        &client,
+                        &mut state,
+                        &mut projects,
+                        rpc_action,
+                        events_tx.clone(),
+                    );
                      if let Some(prompt) = prompt {
                          if is_submit {
                              adapter::complete(&mut state, &client, prompt, events_tx.clone()).await?;
                          }
                      }
                      handle_operations(&mut state, &client, operation_action).await;
-                    if let Some(response) = response {
+                     if refresh_operations && state.project_id.is_some() {
+                         state.operations_error = None;
+                         handle_operations(&mut state, &client, reducer::Action::OperationsRefresh).await;
+                     }
+                     if let Some(response) = response {
                         let snapshot = state.clone();
                         let c = client.clone();
                         let tx = events_tx.clone();
@@ -226,6 +254,52 @@ async fn session(
             }
             Some(message) = events_rx.recv() => {
                 match message {
+                    adapter::ClientEvent::ProjectsLoaded(records) => {
+                        projects.replace_projects(records);
+                        // Every refresh is authoritative.  Do not retain a
+                        // locally selected project that the daemon removed or
+                        // made inactive, and update the root used by turns and
+                        // operations when the daemon's record changes.
+                        let selected = state
+                            .project_id
+                            .as_ref()
+                            .map(|id| crate::projects::ProjectId(id.clone()))
+                            .or_else(|| projects.selected.clone());
+                        if let Some(id) = selected {
+                            if let Some(project) = projects.projects.get(&id).filter(|p| p.active) {
+                                projects.selected = Some(id.clone());
+                                activate_project(&mut state, project);
+                            } else {
+                                projects.selected = None;
+                                let root = std::env::current_dir()
+                                    .map(|path| path.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| state.project_root.clone());
+                                state.set_project(None, root.clone());
+                                state.operations.project = root;
+                                state.sessions.project = None;
+                                state.session_id = None;
+                                state.project_focus = true;
+                            }
+                        }
+                    }
+                    adapter::ClientEvent::ProjectReady(id) => {
+                        if let Some(project) = projects
+                            .projects
+                            .get(&crate::projects::ProjectId(id.clone()))
+                            .cloned()
+                        {
+                            activate_project(&mut state, &project);
+                            request_sessions(&client, &state, events_tx.clone());
+                            state.project_error = None;
+                            persist_selection(&state);
+                            handle_operations(
+                                &mut state,
+                                &client,
+                                reducer::Action::OperationsRefresh,
+                            )
+                            .await;
+                        }
+                    }
                     adapter::ClientEvent::Complete { session_id, turn_id } => {
                         state.session_id = Some(session_id);
                         let _ = turn_id;
@@ -253,6 +327,15 @@ async fn session(
                                 .apply(crate::composer::ComposerAction::SetSending(false));
                         }
                         reducer::sync_composer(&mut state);
+                    }
+                    event @ adapter::ClientEvent::SessionHistory(_) |
+                    event @ adapter::ClientEvent::SessionsLoaded { .. } |
+                    event @ adapter::ClientEvent::SessionCreated(_) => {
+                        let failed = false;
+                        adapter::ScriptedClient { events: vec![event] }.drive(&mut state);
+                        if failed { state.cancelling = false; }
+                        reducer::sync_composer(&mut state);
+                        persist_selection(&state);
                     }
                     adapter::ClientEvent::Disconnected => {
                         state.connection = state::Connection::Disconnected;
@@ -286,18 +369,567 @@ async fn session(
 /// Seed and restore the local project projection for a new client session.
 /// The working directory is deliberately only a UI-local registration; it is
 /// not sent to the daemon as a protocol request.
-fn initialize_projects(projects: &mut ProjectState) {
-    if let Ok(root) = std::env::current_dir() {
-        let root = root.to_string_lossy().into_owned();
-        let name = root
-            .rsplit(std::path::MAIN_SEPARATOR)
-            .find(|part| !part.is_empty())
-            .unwrap_or("project")
-            .to_owned();
-        let _ = apply_project_action(projects, ProjectAction::Register { name, root });
+async fn initialize_projects(
+    client: &Client,
+    projects: &mut ProjectState,
+    state: &mut AppState,
+) -> Result<()> {
+    let result = client
+        .project_list(ProjectListParams {
+            include_inactive: Some(true),
+        })
+        .await?;
+    projects.replace_projects(result.projects);
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let saved = load_selection().unwrap_or_else(|| state.last_selection());
+    let saved_project = saved
+        .project_id
+        .as_ref()
+        .map(|id| crate::projects::ProjectId(id.clone()));
+    if let Some(project) = projects
+        .restore_selection(saved_project.as_ref(), Some(&cwd))
+        .cloned()
+    {
+        state.session_id = saved.session_id.clone();
+        activate_project(state, &project);
+        state.sessions.project = Some(crate::sessions::ProjectId::new(project.id.0.clone()));
+        let sessions = client
+            .session_list(ClientProjectId::new(project.id.0.clone()))
+            .await?;
+        install_sessions(state, sessions);
+        if let Some(session_id) = saved.session_id {
+            if state
+                .sessions
+                .sessions
+                .iter()
+                .any(|s| s.id.as_str() == session_id)
+            {
+                let history = client
+                    .session_history(SessionRef {
+                        project_id: ClientProjectId::new(project.id.0.clone()),
+                        session_id: tau_client::SessionId::new(session_id),
+                    })
+                    .await?;
+                adapter::ScriptedClient {
+                    events: vec![adapter::ClientEvent::SessionHistory(history)],
+                }
+                .drive(state);
+            } else {
+                state.session_id = None;
+            }
+        }
+    } else if let Some(project) = projects.cwd_record(&cwd) {
+        if !project.active {
+            projects.inactive_conflict = Some(crate::projects::InactiveConflict {
+                project: project.id.clone(),
+                name: project.name.clone(),
+                root: project.root.clone(),
+            });
+        }
+        state.project_focus = true;
+    } else {
+        // The left panel explicitly offers create/reactivate/new-ID actions;
+        // no local project record is created here.
+        state.project_focus = true;
     }
-    let saved = projects.selected.clone();
-    projects.restore_active(saved.as_ref());
+    state.operations.project = state.project_root.clone();
+    Ok(())
+}
+
+fn activate_project(state: &mut AppState, project: &crate::projects::Project) {
+    state.set_project(Some(project.id.0.clone()), project.root.clone());
+    state.operations.project = project.root.clone();
+    state.operations.branch.clear();
+    state.operations.files.clear();
+    state.operations.branches.clear();
+    state.operations.content = None;
+    state.operations.selected = 0;
+    state.operations_error = None;
+    state.operations_ack = None;
+    state.sessions.project = Some(crate::sessions::ProjectId::new(project.id.0.clone()));
+    state.project_focus = false;
+}
+
+fn install_sessions(state: &mut AppState, sessions: Vec<SessionSummary>) {
+    state.sessions.sessions = sessions
+        .iter()
+        .map(crate::sessions::entry_from_summary)
+        .collect();
+    state
+        .sessions
+        .restart_selection(state.session_id.as_deref());
+}
+
+fn request_sessions(
+    client: &Client,
+    state: &AppState,
+    tx: tokio::sync::mpsc::UnboundedSender<adapter::ClientEvent>,
+) {
+    let Some(project_id) = state.project_id.clone() else {
+        return;
+    };
+    let client = client.clone();
+    tokio::spawn(async move {
+        match client
+            .session_list(ClientProjectId::new(project_id.clone()))
+            .await
+        {
+            Ok(sessions) => {
+                let _ = tx.send(adapter::ClientEvent::SessionsLoaded {
+                    project_id,
+                    sessions,
+                });
+            }
+            Err(error) => {
+                let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+            }
+        }
+    });
+}
+
+fn persist_selection(state: &AppState) {
+    let Some(path) = selection_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let selection = state.last_selection();
+    let value = selection.to_json();
+    if let Ok(value) = serde_json::to_vec_pretty(&value) {
+        let _ = std::fs::write(path, value);
+    }
+}
+
+fn load_selection() -> Option<state::LastSelection> {
+    let path = selection_path()?;
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    state::LastSelection::from_json(&value)
+}
+
+fn selection_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("TAU_TUI_STATE_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".local/state/tau/tui-selection.json"))
+}
+
+fn dispatch_navigation_rpc(
+    client: &Client,
+    state: &mut AppState,
+    projects: &mut ProjectState,
+    action: reducer::Action,
+    tx: tokio::sync::mpsc::UnboundedSender<adapter::ClientEvent>,
+) {
+    use reducer::Action;
+    match action {
+        Action::FocusProjects => {
+            state.project_focus = !state.project_focus;
+        }
+        Action::ProjectMove(delta) => {
+            let ids = projects.ordered_ids();
+            if !ids.is_empty() {
+                let current = state.project_index.min(ids.len() - 1);
+                state.project_index = if delta < 0 {
+                    current.saturating_sub(1)
+                } else {
+                    (current + 1).min(ids.len() - 1)
+                };
+                projects.selected = Some(ids[state.project_index].clone());
+            }
+        }
+        Action::ProjectSelectCurrent => {
+            let id = projects.ordered_ids().get(state.project_index).cloned();
+            if let Some(id) = id {
+                if projects.projects.get(&id).is_some_and(|p| p.active) {
+                    select_project(client, state, projects, id, tx);
+                } else if let Some(project) = projects.projects.get(&id) {
+                    projects.inactive_conflict = Some(crate::projects::InactiveConflict {
+                        project: id,
+                        name: project.name.clone(),
+                        root: project.root.clone(),
+                    });
+                }
+            } else {
+                create_current_project(client, state, tx);
+            }
+        }
+        Action::ProjectSelect(id) => {
+            select_project(client, state, projects, id, tx);
+        }
+        Action::ProjectSelectWithRoot { id, root } => {
+            // The daemon record remains authoritative, but retain the root
+            // carried by the typed intent when selecting an already-known
+            // active record.  This makes selection synchronous for callers
+            // that already have the acknowledged project payload.
+            if let Some(project) = projects.projects.get(&id).cloned() {
+                if project.active {
+                    let mut project = project;
+                    project.root = root;
+                    state.session_id = None;
+                    projects.selected = Some(id);
+                    activate_project(state, &project);
+                    state.project_error = None;
+                    request_sessions(client, state, tx);
+                    persist_selection(state);
+                }
+            }
+        }
+        Action::ProjectCreateCurrent => create_current_project(client, state, tx),
+        Action::ProjectCreate { name, root } => create_project(client, name, root, tx),
+        Action::ProjectReactivate(id) => {
+            mutate_project(client, id, ProjectMutation::Reactivate, tx)
+        }
+        Action::ProjectChooseInactive(choice) => {
+            let conflict = projects.inactive_conflict.take();
+            match choice {
+                crate::projects::InactiveConflictChoice::Reactivate => {
+                    if let Some(conflict) = conflict {
+                        mutate_project(client, conflict.project, ProjectMutation::Reactivate, tx);
+                    }
+                }
+                crate::projects::InactiveConflictChoice::CreateNew => {
+                    let root = conflict
+                        .map(|conflict| conflict.root)
+                        .unwrap_or_else(|| state.project_root.clone());
+                    let name = std::path::Path::new(&root)
+                        .file_name()
+                        .and_then(|part| part.to_str())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("project")
+                        .to_owned();
+                    create_project(client, name, root, tx);
+                }
+                crate::projects::InactiveConflictChoice::Cancel => {}
+            }
+        }
+        Action::ProjectRename { id, name } => {
+            let client = client.clone();
+            tokio::spawn(async move {
+                match client
+                    .project_rename(ProjectRenameParams {
+                        project_id: id.0,
+                        name,
+                    })
+                    .await
+                {
+                    Ok(result) => {
+                        let refreshed = client
+                            .project_list(ProjectListParams {
+                                include_inactive: Some(true),
+                            })
+                            .await;
+                        match refreshed {
+                            Ok(list) => {
+                                let _ =
+                                    tx.send(adapter::ClientEvent::ProjectsLoaded(list.projects));
+                                let _ =
+                                    tx.send(adapter::ClientEvent::ProjectReady(result.project.id));
+                            }
+                            Err(error) => {
+                                let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+                    }
+                }
+            });
+        }
+        Action::ProjectReactivateCurrent => {
+            let id = projects.selected.clone().or_else(|| {
+                projects
+                    .cwd_record(&state.project_root)
+                    .map(|p| p.id.clone())
+            });
+            if let Some(id) = id {
+                mutate_project(client, id, ProjectMutation::Reactivate, tx);
+            }
+        }
+        Action::ProjectNewIdCurrent => {
+            let id = projects.selected.clone().or_else(|| {
+                projects
+                    .cwd_record(&state.project_root)
+                    .map(|p| p.id.clone())
+            });
+            if let Some(id) = id {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    match c
+                        .project_new_id(ProjectNewIdParams {
+                            project_id: Some(id.0.clone()),
+                        })
+                        .await
+                    {
+                        Ok(result) => {
+                            if let Ok(list) = c
+                                .project_list(ProjectListParams {
+                                    include_inactive: Some(true),
+                                })
+                                .await
+                            {
+                                let _ =
+                                    tx.send(adapter::ClientEvent::ProjectsLoaded(list.projects));
+                                let _ =
+                                    tx.send(adapter::ClientEvent::ProjectReady(result.project_id));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        Action::NewChat => {
+            if let Some(pid) = state.project_id.clone() {
+                let c = client.clone();
+                let cwd = state.project_root.clone();
+                let tx2 = tx.clone();
+                tokio::spawn(async move {
+                    match c
+                        .session_create(CreateSession {
+                            project_id: ClientProjectId::new(pid),
+                            cwd,
+                        })
+                        .await
+                    {
+                        Ok(session) => {
+                            let _ = tx2.send(adapter::ClientEvent::SessionCreated(session));
+                        }
+                        Err(error) => {
+                            let _ = tx2.send(adapter::ClientEvent::Error(error.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        Action::SessionSelect => {
+            if let (Some(pid), Some(sid)) = (
+                state.project_id.clone(),
+                state
+                    .sessions
+                    .selected_id()
+                    .map(|id| id.as_str().to_owned()),
+            ) {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    match c
+                        .session_history(SessionRef {
+                            project_id: ClientProjectId::new(pid),
+                            session_id: tau_client::SessionId::new(sid),
+                        })
+                        .await
+                    {
+                        Ok(history) => {
+                            let _ = tx.send(adapter::ClientEvent::SessionHistory(history));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        Action::SessionRename(title) => {
+            if let (Some(pid), Some(sid)) = (
+                state.project_id.clone(),
+                state.sessions.selected_id().map(|s| s.as_str().to_owned()),
+            ) {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    let result = c
+                        .session_rename(tau_client::SessionRename {
+                            project_id: ClientProjectId::new(pid.clone()),
+                            session_id: tau_client::SessionId::new(sid),
+                            title,
+                        })
+                        .await;
+                    match result {
+                        Ok(_) => match c
+                            .session_list_with_archived(ClientProjectId::new(pid.clone()), true)
+                            .await
+                        {
+                            Ok(sessions) => {
+                                let _ = tx.send(adapter::ClientEvent::SessionsLoaded {
+                                    project_id: pid,
+                                    sessions,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+                            }
+                        },
+                        Err(error) => {
+                            let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        Action::SessionArchive | Action::SessionRestore => {
+            if let (Some(pid), Some(sid)) = (
+                state.project_id.clone(),
+                state.sessions.selected_id().map(|s| s.as_str().to_owned()),
+            ) {
+                let c = client.clone();
+                let tx2 = tx.clone();
+                let archive = matches!(action, Action::SessionArchive);
+                tokio::spawn(async move {
+                    let project_id = pid.clone();
+                    let r = SessionRef {
+                        project_id: ClientProjectId::new(pid),
+                        session_id: tau_client::SessionId::new(sid),
+                    };
+                    let result = if archive {
+                        c.session_archive(r.clone()).await.map(|_| ())
+                    } else {
+                        c.session_restore(r).await.map(|_| ())
+                    };
+                    match result {
+                        Ok(_) => match c
+                            .session_list_with_archived(
+                                ClientProjectId::new(project_id.clone()),
+                                true,
+                            )
+                            .await
+                        {
+                            Ok(sessions) => {
+                                let _ = tx2.send(adapter::ClientEvent::SessionsLoaded {
+                                    project_id,
+                                    sessions,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = tx2.send(adapter::ClientEvent::Error(error.to_string()));
+                            }
+                        },
+                        Err(error) => {
+                            let _ = tx2.send(adapter::ClientEvent::Error(error.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn select_project(
+    _client: &Client,
+    state: &mut AppState,
+    projects: &mut ProjectState,
+    id: crate::projects::ProjectId,
+    tx: tokio::sync::mpsc::UnboundedSender<adapter::ClientEvent>,
+) {
+    let Some(project) = projects.projects.get(&id).cloned() else {
+        return;
+    };
+    if !project.active {
+        return;
+    }
+    state.session_id = None;
+    state.turn_id = None;
+    state.sequence = 0;
+    state.raw_events.clear();
+    state.transcript = vec!["New chat".into()];
+    state.human_messages.clear();
+    state.tools.clear();
+    state.tool_call_ids.clear();
+    state.assistant_index = None;
+    state.sessions.sessions.clear();
+    projects.selected = Some(id.clone());
+    activate_project(state, &project);
+    state.project_error = None;
+    request_sessions(_client, state, tx);
+    persist_selection(state);
+}
+
+fn create_current_project(
+    client: &Client,
+    state: &mut AppState,
+    tx: tokio::sync::mpsc::UnboundedSender<adapter::ClientEvent>,
+) {
+    let root = state.project_root.clone();
+    let name = std::path::Path::new(&root)
+        .file_name()
+        .and_then(|part| part.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("project")
+        .to_owned();
+    create_project(client, name, root, tx);
+}
+
+fn create_project(
+    client: &Client,
+    name: String,
+    root: String,
+    tx: tokio::sync::mpsc::UnboundedSender<adapter::ClientEvent>,
+) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        match client
+            .project_create(ProjectCreateParams { name, root })
+            .await
+        {
+            Ok(result) => {
+                if let Ok(list) = client
+                    .project_list(ProjectListParams {
+                        include_inactive: Some(true),
+                    })
+                    .await
+                {
+                    let _ = tx.send(adapter::ClientEvent::ProjectsLoaded(list.projects));
+                    let _ = tx.send(adapter::ClientEvent::ProjectReady(result.project.id));
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+            }
+        }
+    });
+}
+
+enum ProjectMutation {
+    Reactivate,
+}
+
+fn mutate_project(
+    client: &Client,
+    id: crate::projects::ProjectId,
+    mutation: ProjectMutation,
+    tx: tokio::sync::mpsc::UnboundedSender<adapter::ClientEvent>,
+) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let result = match mutation {
+            ProjectMutation::Reactivate => client
+                .project_reactivate(ProjectIdParams {
+                    project_id: id.0.clone(),
+                })
+                .await
+                .map(|result| result.project.id),
+        };
+        match result {
+            Ok(id) => match client
+                .project_list(ProjectListParams {
+                    include_inactive: Some(true),
+                })
+                .await
+            {
+                Ok(list) => {
+                    let _ = tx.send(adapter::ClientEvent::ProjectsLoaded(list.projects));
+                    let _ = tx.send(adapter::ClientEvent::ProjectReady(id));
+                }
+                Err(error) => {
+                    let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+                }
+            },
+            Err(error) => {
+                let _ = tx.send(adapter::ClientEvent::Error(error.to_string()));
+            }
+        }
+    });
 }
 
 /// Narrow adapter seam for project intents.  Project actions remain typed and
@@ -397,8 +1029,7 @@ mod tests {
     #[test]
     fn initial_buffer_has_client_chrome() {
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut projects = ProjectState::default();
-        initialize_projects(&mut projects);
+        let projects = ProjectState::default();
         t.draw(|f| shell::render_with_projects(f, &AppState::default(), &projects))
             .unwrap();
         let text: String = t

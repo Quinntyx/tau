@@ -102,7 +102,7 @@ fn project_list<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) -> 
     ))];
     match projects {
         Some(projects) if projects.projects.is_empty() => items.push(ListItem::new(Span::styled(
-            "No projects yet",
+            "No daemon projects",
             Style::default().fg(Color::DarkGray),
         ))),
         Some(projects) => {
@@ -113,11 +113,18 @@ fn project_list<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) -> 
                     "  "
                 };
                 let inactive = if project.status == ProjectStatus::Inactive {
-                    " (inactive)"
+                    " (inactive · Enter to reactivate)"
                 } else {
                     ""
                 };
-                items.push(ListItem::new(format!("{marker}{}{inactive}", project.name)));
+                // Keep the acknowledged id visible: names are user-editable,
+                // while the id is the durable daemon/session relationship.
+                items.push(ListItem::new(format!(
+                    "{marker}{} · {}{}{inactive}",
+                    project.name,
+                    id.0,
+                    if project.active { "" } else { " [inactive]" }
+                )));
             }
         }
         None if state.servers.is_empty() => items.push(ListItem::new(Span::styled(
@@ -135,12 +142,54 @@ fn project_list<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) -> 
             }
         }
     }
+    // This must also be shown when the daemon returned zero records.  An
+    // unresolved cwd is an explicit create/reactivate decision, not an empty
+    // project list, and hiding it makes the first-project flow unusable.
+    if let Some(projects) = projects {
+        let cwd_registered = projects.projects.values().any(|project| {
+            project.root == state.project_root && project.status == ProjectStatus::Active
+        });
+        if !cwd_registered {
+            items.push(ListItem::new(Span::styled(
+                format!("  cwd: {} (unresolved)", state.project_root),
+                Style::default().fg(Color::Yellow),
+            )));
+            items.push(ListItem::new(Span::styled(
+                "  Enter: register current directory",
+                Style::default().fg(ACCENT),
+            )));
+        }
+    }
+    if let Some(projects) = projects {
+        if let Some(conflict) = &projects.inactive_conflict {
+            items.push(ListItem::new(Span::styled(
+                format!("! {} already inactive", conflict.name),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            items.push(ListItem::new(
+                "  [r] reactivate  [n] create new  [Esc] cancel",
+            ));
+        }
+    }
     items.push(ListItem::new(""));
     items.push(ListItem::new(Span::styled(
         "+ New project",
         Style::default().fg(ACCENT),
     )));
-    List::new(items).block(Block::default().borders(Borders::RIGHT).title(" Projects "))
+    List::new(items).block(
+        Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(if state.project_focus {
+                Style::default().fg(ACCENT)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(if state.project_focus {
+                " Projects · ↑↓ select · Enter open · n new chat "
+            } else {
+                " Projects · Tab focus "
+            }),
+    )
 }
 
 fn content_panel<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) -> impl Widget + 'a {
@@ -164,6 +213,12 @@ fn content_panel<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) ->
                 .iter()
                 .map(|line| Line::from(line.as_str())),
         );
+    }
+    if let Some(error) = &state.project_error {
+        lines.push(Line::from(Span::styled(
+            format!("Project error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
     }
     for tool in &state.tools {
         let status = match tool.status {
@@ -202,6 +257,17 @@ fn content_panel<'a>(state: &'a AppState, projects: Option<&'a ProjectState>) ->
             .map(|project| format!("Selected project: {}", project.name))
             .unwrap_or_else(|| "Select a project to begin".to_owned());
         lines.push(Line::from(project_line));
+        if let Some(conflict) = &projects.inactive_conflict {
+            lines.push(Line::from(Span::styled(
+                format!("Project choice required: {} is inactive", conflict.name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(
+                "[r] Reactivate  [n] Create new project  [Esc] Cancel",
+            ));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![

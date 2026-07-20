@@ -1,4 +1,4 @@
-//! Typed, client-local project shell state.
+//! Typed daemon-backed project shell state.
 //!
 //! This module intentionally stops at the UI boundary: actions describe an
 //! intent and the reducer only changes the local projection.  A daemon adapter
@@ -22,6 +22,30 @@ pub struct Project {
     pub name: String,
     pub root: String,
     pub status: ProjectStatus,
+    /// The daemon's active flag, retained separately for wire fidelity.
+    pub active: bool,
+}
+
+impl From<tau_proto::projects::Project> for Project {
+    fn from(value: tau_proto::projects::Project) -> Self {
+        Self {
+            id: ProjectId(value.id),
+            name: value.name,
+            root: value.root,
+            status: if value.active {
+                ProjectStatus::Active
+            } else {
+                ProjectStatus::Inactive
+            },
+            active: value.active,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CwdProject {
+    Registered(ProjectId),
+    Unresolved(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,11 +106,80 @@ pub struct ProjectState {
 }
 
 impl ProjectState {
+    /// Replace the projection with records acknowledged by the daemon.
+    pub fn replace_projects<I>(&mut self, projects: I)
+    where
+        I: IntoIterator<Item = tau_proto::projects::Project>,
+    {
+        self.projects = projects
+            .into_iter()
+            .map(Project::from)
+            .map(|project| (project.id.clone(), project))
+            .collect();
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.projects.get(id).is_none_or(|project| !project.active))
+        {
+            self.selected = None;
+        }
+        // Conflicts are UI intents against a previous daemon projection and
+        // must not survive an authoritative refresh.
+        self.inactive_conflict = None;
+    }
+
+    /// Match a cwd against daemon roots without registering or inventing an id.
+    pub fn matching_cwd(&self, cwd: &str) -> CwdProject {
+        self.projects
+            .values()
+            .find(|p| p.root == cwd && p.active)
+            .map(|p| CwdProject::Registered(p.id.clone()))
+            .unwrap_or_else(|| CwdProject::Unresolved(cwd.to_owned()))
+    }
+
+    /// Return the daemon record for a cwd, including inactive records.  This
+    /// is used only to present the explicit reactivate/new-ID choice; it never
+    /// turns an unregistered cwd into a local project.
+    pub fn cwd_record(&self, cwd: &str) -> Option<&Project> {
+        self.projects.values().find(|project| project.root == cwd)
+    }
+
+    pub fn ordered_ids(&self) -> Vec<ProjectId> {
+        self.projects.keys().cloned().collect()
+    }
+
+    pub fn select_active(&mut self, id: Option<&ProjectId>) -> Option<&Project> {
+        self.selected = id.and_then(|id| {
+            self.projects
+                .get(id)
+                .filter(|p| p.active)
+                .map(|p| p.id.clone())
+        });
+        self.selected.as_ref().and_then(|id| self.projects.get(id))
+    }
+
+    /// Restore by daemon id first, then by its acknowledged root.
+    pub fn restore_selection(
+        &mut self,
+        id: Option<&ProjectId>,
+        root: Option<&str>,
+    ) -> Option<&Project> {
+        let candidate = id
+            .and_then(|id| self.projects.get(id).filter(|p| p.active))
+            .or_else(|| {
+                root.and_then(|root| self.projects.values().find(|p| p.root == root && p.active))
+            });
+        self.selected = candidate.map(|p| p.id.clone());
+        self.selected
+            .as_ref()
+            .and_then(|selected| self.projects.get(selected))
+    }
+
     pub fn restore_active(&mut self, saved: Option<&ProjectId>) -> Option<&Project> {
         self.selected = saved.and_then(|id| {
             self.projects
                 .get(id)
-                .filter(|project| project.status == ProjectStatus::Active)
+                .filter(|project| project.active)
                 .map(|project| project.id.clone())
         });
         self.selected.as_ref().and_then(|id| self.projects.get(id))
@@ -105,7 +198,7 @@ impl ProjectState {
                 }
                 let id = ProjectId(root.to_owned());
                 if let Some(existing) = self.projects.get(&id) {
-                    if existing.status == ProjectStatus::Inactive {
+                    if !existing.active {
                         self.inactive_conflict = Some(InactiveConflict {
                             project: id,
                             name: name.to_owned(),
@@ -142,6 +235,7 @@ impl ProjectState {
                     .get_mut(&id)
                     .ok_or_else(|| ProjectError::NotFound(id.clone()))?;
                 project.status = ProjectStatus::Inactive;
+                project.active = false;
                 if self.selected.as_ref() == Some(&id) {
                     self.selected = None;
                 }
@@ -152,10 +246,11 @@ impl ProjectState {
                     .projects
                     .get_mut(&id)
                     .ok_or_else(|| ProjectError::NotFound(id.clone()))?;
-                if project.status != ProjectStatus::Inactive {
+                if project.active {
                     return Err(ProjectError::NotInactive(id));
                 }
                 project.status = ProjectStatus::Active;
+                project.active = true;
                 self.selected = Some(id);
                 self.inactive_conflict = None;
                 Ok(())
@@ -179,7 +274,7 @@ impl ProjectState {
                 }
             }
             ProjectAction::RestoreLocal(id) => match self.projects.get(&id) {
-                Some(project) if project.status == ProjectStatus::Active => {
+                Some(project) if project.active => {
                     self.selected = Some(id);
                     Ok(())
                 }
@@ -203,6 +298,7 @@ impl ProjectState {
                 name: name.to_owned(),
                 root: root.to_owned(),
                 status: ProjectStatus::Active,
+                active: true,
             },
         );
     }
@@ -279,5 +375,70 @@ mod tests {
         let selected = state.selected.clone().unwrap();
         assert_ne!(selected, old);
         assert_eq!(state.projects[&selected].root, "/tmp/shared");
+    }
+
+    #[test]
+    fn daemon_active_flag_is_authoritative_for_selection_and_conflicts() {
+        let id = ProjectId("/tmp/daemon".into());
+        let mut state = ProjectState {
+            projects: [(
+                id.clone(),
+                Project {
+                    id: id.clone(),
+                    name: "daemon".into(),
+                    root: "/tmp/daemon".into(),
+                    // Deliberately disagree: `active` is the wire value.
+                    status: ProjectStatus::Inactive,
+                    active: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..ProjectState::default()
+        };
+
+        state
+            .apply(ProjectAction::Select(Some(id.clone())))
+            .unwrap();
+        assert_eq!(state.selected, Some(id.clone()));
+        assert_eq!(
+            state.apply(ProjectAction::Reactivate(id)),
+            Err(ProjectError::NotInactive(ProjectId("/tmp/daemon".into())))
+        );
+    }
+
+    #[test]
+    fn ordering_and_cwd_matching_are_deterministic() {
+        let mut state = ProjectState::default();
+        state.replace_projects([
+            tau_proto::projects::Project {
+                id: "z".into(),
+                name: "z".into(),
+                root: "/tmp/work".into(),
+                active: false,
+                created_at: 0,
+                updated_at: 0,
+            },
+            tau_proto::projects::Project {
+                id: "a".into(),
+                name: "a".into(),
+                root: "/tmp/work".into(),
+                active: true,
+                created_at: 0,
+                updated_at: 0,
+            },
+        ]);
+        assert_eq!(
+            state.ordered_ids(),
+            [ProjectId("a".into()), ProjectId("z".into())]
+        );
+        assert_eq!(
+            state.matching_cwd("/tmp/work"),
+            CwdProject::Registered(ProjectId("a".into()))
+        );
+        assert_eq!(
+            state.matching_cwd("/tmp/missing"),
+            CwdProject::Unresolved("/tmp/missing".into())
+        );
     }
 }

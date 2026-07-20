@@ -32,6 +32,21 @@ pub struct SessionEntry {
     pub archived: bool,
 }
 
+/// Convert the daemon's typed session summary into the navigator projection.
+/// The navigator never allocates or derives durable identifiers locally.
+pub fn entry_from_summary(summary: &tau_client::SessionSummary) -> SessionEntry {
+    SessionEntry {
+        id: SessionId::new(summary.session_id.as_str()),
+        project_id: ProjectId::new(summary.project_id.as_str()),
+        title: summary
+            .title
+            .clone()
+            .unwrap_or_else(|| "new conversation".into()),
+        updated_at: summary.updated_at.max(0) as u64,
+        archived: summary.archived_at.is_some(),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Navigator {
     pub project: Option<ProjectId>,
@@ -43,6 +58,26 @@ pub struct Navigator {
 }
 
 impl Navigator {
+    /// Replace the daemon snapshot, retaining selection only when its
+    /// durable daemon id is still present in the active project projection.
+    ///
+    /// The project is supplied by the request/response envelope rather than
+    /// inferred from the first row; an empty response therefore cannot leak a
+    /// previous project's selection.
+    pub fn replace_sessions(
+        &mut self,
+        project: ProjectId,
+        sessions: Vec<SessionEntry>,
+        persisted_id: Option<&str>,
+    ) {
+        self.project = Some(project.clone());
+        self.sessions = sessions
+            .into_iter()
+            .filter(|session| session.project_id == project)
+            .collect();
+        self.restart_selection(persisted_id);
+    }
+
     pub fn visible(&self) -> Vec<&SessionEntry> {
         let q = self.query.to_lowercase();
         let mut result: Vec<_> = self
@@ -96,6 +131,7 @@ impl Navigator {
         if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
             s.archived = false;
         }
+        self.selected = self.selected.min(self.visible().len().saturating_sub(1));
     }
 
     pub fn toggle_archived(&mut self) {
@@ -103,19 +139,15 @@ impl Navigator {
         self.selected = 0;
     }
 
-    /// The daemon/client adapter supplies the durable ID in production; this
-    /// helper keeps the presentation model immediately selectable in tests.
-    pub fn new_chat(&mut self, project_id: ProjectId, now: u64) -> SessionId {
-        let id = SessionId::new(format!("local-{now}"));
-        self.sessions.push(SessionEntry {
-            id: id.clone(),
-            project_id,
-            title: String::new(),
-            updated_at: now,
-            archived: false,
-        });
+    /// Prepare the navigator for a daemon-backed new-chat request.
+    ///
+    /// Creation is asynchronous, so no placeholder entry (and, in
+    /// particular, no fabricated local identifier) is inserted here.  The
+    /// acknowledged `SessionCreated` response supplies the durable entry.
+    pub fn prepare_new_chat(&mut self, project_id: ProjectId) {
+        self.project = Some(project_id);
         self.selected = 0;
-        id
+        self.open = false;
     }
 }
 
@@ -157,14 +189,31 @@ mod tests {
     }
 
     #[test]
-    fn restart_selection_and_new_chat_are_project_bound() {
+    fn new_chat_does_not_fabricate_an_id() {
         let mut n = Navigator {
             project: Some(ProjectId::new("p")),
             ..Default::default()
         };
-        let id = n.new_chat(ProjectId::new("p"), 10);
-        n.restart_selection(Some(id.as_str()));
-        assert_eq!(n.selected_id(), Some(id));
-        assert_eq!(n.visible()[0].title, "");
+        n.prepare_new_chat(ProjectId::new("p"));
+        assert!(n.sessions.is_empty());
+        assert_eq!(n.selected_id(), None);
+    }
+
+    #[test]
+    fn replacement_is_project_bound_and_restarts_by_daemon_id() {
+        let mut n = Navigator::default();
+        n.replace_sessions(
+            ProjectId::new("p"),
+            vec![
+                SessionEntry {
+                    project_id: ProjectId::new("other"),
+                    ..item("wrong", "Wrong", 3)
+                },
+                item("kept", "Kept", 2),
+            ],
+            Some("kept"),
+        );
+        assert_eq!(n.sessions.len(), 1);
+        assert_eq!(n.selected_id().unwrap().as_str(), "kept");
     }
 }

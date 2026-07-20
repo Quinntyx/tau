@@ -1744,6 +1744,11 @@ mod session_rpc_tests {
         );
         let (out, _received) = mpsc::channel(1);
         let negotiated = Arc::new(Mutex::new(None));
+        let project = state
+            .db()
+            .create_project("project-a", "/tmp/a")
+            .expect("session test project");
+        let project_id = project.id.clone();
         let request =
             |id, method, params| Request::new(Id::num(id), method, Some(serde_json::json!(params)));
         let response = handle_request(
@@ -1751,7 +1756,7 @@ mod session_rpc_tests {
                 1,
                 METHOD_SESSION_CREATE,
                 serde_json::json!({
-                    "project_id": "project-a", "cwd": "/tmp/a"
+                    "project_id": project_id.clone(), "cwd": "/tmp/a"
                 }),
             ),
             &state,
@@ -1763,7 +1768,7 @@ mod session_rpc_tests {
         let created: Response<serde_json::Value> = serde_json::from_str(&response).unwrap();
         let session: tau_proto::session::SessionRecord =
             serde_json::from_value(created.result.unwrap()).unwrap();
-        assert_eq!(session.project_id.as_str(), "project-a");
+        assert_eq!(session.project_id.as_str(), project.id.as_str());
         assert!(session.title.is_none());
 
         let response = handle_request(
@@ -1771,7 +1776,7 @@ mod session_rpc_tests {
                 2,
                 METHOD_SESSION_LIST,
                 serde_json::json!({
-                    "project_id": "project-a"
+                    "project_id": project_id.clone()
                 }),
             ),
             &state,
@@ -1790,7 +1795,7 @@ mod session_rpc_tests {
                 3,
                 METHOD_SESSION_RENAME,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id, "title": "Work"
+                    "project_id": project_id.clone(), "session_id": session.id.clone(), "title": "Work"
                 }),
             ),
             &state,
@@ -1809,7 +1814,7 @@ mod session_rpc_tests {
                 4,
                 METHOD_SESSION_ARCHIVE,
                 serde_json::json!({
-                    "project_id": "project-a", "session_id": session.id
+                    "project_id": project_id, "session_id": session.id
                 }),
             ),
             &state,

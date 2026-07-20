@@ -115,6 +115,11 @@ pub struct AppState {
     /// Explicitly selected active project.  There is intentionally no default
     /// or cwd-based fallback: turns must name the user's selection.
     pub project_id: Option<String>,
+    /// Whether keyboard navigation is currently directed at the left project
+    /// panel rather than the composer.
+    pub project_focus: bool,
+    pub project_index: usize,
+    pub project_error: Option<String>,
     pub turn_id: Option<String>,
     pub sequence: u64,
     pub model: String,
@@ -166,7 +171,71 @@ pub struct BufferSnapshot {
     pub selection: Option<usize>,
 }
 
+/// Small, JSON-safe record used by the UI's local preference store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastSelection {
+    pub session_id: Option<String>,
+    pub project_id: Option<String>,
+    pub project_root: Option<String>,
+}
+
+impl LastSelection {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "session_id": self.session_id,
+            "project_id": self.project_id,
+            "project_root": self.project_root,
+        })
+    }
+
+    pub fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            session_id: value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            project_id: value
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            project_root: value
+                .get("project_root")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+}
+
 impl AppState {
+    pub fn set_project(&mut self, project_id: Option<String>, project_root: impl Into<String>) {
+        let project_changed = self.project_id != project_id;
+        self.project_id = project_id.clone();
+        self.project_root = project_root.into();
+        if project_changed {
+            if let Some(project) = project_id {
+                self.composer = Composer::new(self.session_id.clone().unwrap_or_default(), project);
+            }
+            self.composer.set_model(self.model.clone());
+            self.composer.set_agent(self.agent.clone());
+        }
+    }
+
+    pub fn last_selection(&self) -> LastSelection {
+        LastSelection {
+            session_id: self.session_id.clone(),
+            project_id: self.project_id.clone(),
+            project_root: Some(self.project_root.clone()),
+        }
+    }
+
+    pub fn restore_last_selection(&mut self, selection: LastSelection) {
+        self.session_id = selection.session_id;
+        self.set_project(
+            selection.project_id,
+            selection.project_root.unwrap_or_else(|| ".".into()),
+        );
+    }
+
     /// Build state with integration-owned identifiers; the composer keeps the
     /// values opaque while reducers pass the existing protocol fields through.
     pub fn with_ids(session_id: impl Into<String>, project_id: impl Into<String>) -> Self {
@@ -223,6 +292,9 @@ impl Default for AppState {
             assistant_index: None,
             session_id: None,
             project_id: None,
+            project_focus: false,
+            project_index: 0,
+            project_error: None,
             turn_id: None,
             sequence: 0,
             model: "openai/gpt-4o".into(),
@@ -270,5 +342,23 @@ impl Default for AppState {
         state.composer.set_model(state.model.clone());
         state.composer.set_agent(state.agent.clone());
         state
+    }
+}
+
+#[cfg(test)]
+mod project_selection_tests {
+    use super::*;
+
+    #[test]
+    fn last_selection_round_trips() {
+        let mut state = AppState::with_ids("session", "project");
+        state.set_project(Some("project".into()), "/workspace/project");
+        let encoded = state.last_selection().to_json();
+        let selection = LastSelection::from_json(&encoded).unwrap();
+        let mut restored = AppState::default();
+        restored.restore_last_selection(selection);
+        assert_eq!(restored.session_id.as_deref(), Some("session"));
+        assert_eq!(restored.project_id.as_deref(), Some("project"));
+        assert_eq!(restored.project_root, "/workspace/project");
     }
 }
