@@ -810,14 +810,28 @@ impl ActiveSessionStore {
         Ok(())
     }
     /// Restore the locally selected session after reconnecting, if one exists.
+    ///
+    /// Include archived records here: the selected session is durable client
+    /// state, and archiving it while the client was closed must not make a
+    /// reopen silently lose the selection.  Use the daemon's restore method
+    /// so the returned session is usable by the reopened client.
     pub async fn restore(&self, client: &Client) -> Result<Option<SessionSummary>> {
         let Some(reference) = self.load()? else {
             return Ok(None);
         };
-        let sessions = client.session_list(reference.project_id.clone()).await?;
-        Ok(sessions
+        let sessions = client
+            .session_list_with_archived(reference.project_id.clone(), true)
+            .await?;
+        let Some(session) = sessions
             .into_iter()
-            .find(|session| session.session_id == reference.session_id))
+            .find(|session| session.session_id == reference.session_id)
+        else {
+            return Ok(None);
+        };
+        if session.archived_at.is_some() {
+            return client.session_restore(reference).await.map(Some);
+        }
+        Ok(Some(session))
     }
 }
 
@@ -1043,14 +1057,27 @@ mod tests {
 
     #[test]
     fn active_session_store_round_trips_typed_reference() {
-        let path = std::env::temp_dir().join(format!("tau-client-session-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "tau-client-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let store = ActiveSessionStore::new(&path);
         let reference = SessionRef {
             project_id: super::ProjectId::new("project"),
             session_id: super::SessionId::new("session"),
         };
         store.save(&reference).unwrap();
-        assert_eq!(store.load().unwrap(), Some(reference));
+        assert_eq!(store.load().unwrap(), Some(reference.clone()));
+
+        // Reopening the store must read the same selected session from disk;
+        // the selection is client state, not state held by the Client object.
+        let reopened = ActiveSessionStore::new(&path);
+        assert_eq!(reopened.load().unwrap(), Some(reference));
+
         store.clear().unwrap();
         assert_eq!(store.load().unwrap(), None);
     }
