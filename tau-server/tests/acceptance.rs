@@ -282,7 +282,41 @@ async fn typed_git_operations_are_contained_and_safe() -> Result<()> {
     let git = fixtures::GitFixture::new()?;
     let fixture = fixtures::ServerFixture::start().await?;
     let client = fixtures::client(&fixture).await?;
-    let project = git.root.to_string_lossy().into_owned();
+    let project = client
+        .project_create(ProjectCreateParams {
+            name: "git fixture".into(),
+            root: git.root.to_string_lossy().into_owned(),
+        })
+        .await?
+        .project
+        .id;
+
+    assert!(
+        client
+            .git_status(GitStatusParams {
+                project: "missing-project".into(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .project_unregister(ProjectIdParams {
+            project_id: project.clone(),
+        })
+        .await?;
+    assert!(
+        client
+            .git_status(GitStatusParams {
+                project: project.clone(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .project_reactivate(ProjectIdParams {
+            project_id: project.clone(),
+        })
+        .await?;
 
     let status = client
         .git_status(GitStatusParams {

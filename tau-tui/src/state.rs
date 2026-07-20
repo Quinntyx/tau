@@ -209,8 +209,14 @@ impl LastSelection {
 impl AppState {
     pub fn set_project(&mut self, project_id: Option<String>, project_root: impl Into<String>) {
         let project_changed = self.project_id != project_id;
+        let project_root = project_root.into();
         self.project_id = project_id.clone();
-        self.project_root = project_root.into();
+        self.project_root = project_root.clone();
+        if let Some(id) = project_id.clone() {
+            self.operations.set_project_selection(id, project_root);
+        } else {
+            self.operations = crate::operations::OperationsState::new(project_root);
+        }
         if project_changed {
             if let Some(project) = project_id {
                 self.composer = Composer::new(self.session_id.clone().unwrap_or_default(), project);
@@ -218,6 +224,14 @@ impl AppState {
             self.composer.set_model(self.model.clone());
             self.composer.set_agent(self.agent.clone());
         }
+    }
+
+    pub fn select_project(
+        &mut self,
+        project_id: impl Into<String>,
+        project_root: impl Into<String>,
+    ) {
+        self.set_project(Some(project_id.into()), project_root);
     }
 
     pub fn last_selection(&self) -> LastSelection {
