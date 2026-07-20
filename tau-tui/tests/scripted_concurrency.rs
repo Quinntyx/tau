@@ -15,7 +15,10 @@ fn event(sequence: u64, event: TurnEvent) -> SequencedEvent {
 
 #[test]
 fn concurrent_stream_events_are_ordered_and_duplicate_replay_is_ignored() {
-    let mut state = AppState::default();
+    let mut state = AppState {
+        project_id: Some("project-1".into()),
+        ..AppState::default()
+    };
     state.transcript.push(String::new());
     ScriptedClient {
         events: vec![
@@ -107,7 +110,8 @@ fn autonomy_tier_prompt_and_diff_replies_are_scriptable() {
     reducer::apply(&mut state, reducer::Action::Tier(2));
     assert!(state.autonomous);
     assert_eq!(state.task_tier, 3);
-    let params = reducer::params(&state, "inspect this".into(), Some("/tmp".into()));
+    state.project_id = Some("project-1".into());
+    let params = reducer::params(&state, "inspect this".into(), Some("/tmp".into())).unwrap();
     assert_eq!(params.task_tier, Some(3));
     assert_eq!(params.autonomous, Some(true));
 
@@ -117,6 +121,14 @@ fn autonomy_tier_prompt_and_diff_replies_are_scriptable() {
         Some("diff:accept".into())
     );
     assert_eq!(state.diff_reply.as_ref().unwrap().accepted, Some(true));
+}
+
+#[test]
+fn turn_params_reject_missing_project_selection() {
+    let state = AppState::default();
+    let error = reducer::params(&state, "inspect this".into(), None)
+        .expect_err("turns must require an explicitly selected project");
+    assert!(error.to_string().contains("select an active project first"));
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, Stream, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tau_proto::prelude::*;
 use tokio::{
     net::UnixStream,
@@ -20,6 +20,86 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 // the compatibility name.
 const METHOD_DIFF_REPLY: &str = METHOD_DIFF_DECISION;
 
+fn require_non_empty(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    Ok(())
+}
+
+/// Opaque project identifier supplied by the application.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(String);
+
+impl ProjectId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Opaque durable session identifier returned by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    #[serde(rename = "id")]
+    pub session_id: SessionId,
+    pub project_id: ProjectId,
+    pub cwd: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistory {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub entries: Vec<SequencedEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSession {
+    pub project_id: ProjectId,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRename {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRef {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+}
+
+pub const METHOD_SESSION_CREATE: &str = "session.create";
+pub const METHOD_SESSION_LIST: &str = "session.list";
+pub const METHOD_SESSION_HISTORY: &str = "session.get_history";
+pub const METHOD_SESSION_RENAME: &str = "session.rename";
+pub const METHOD_SESSION_ARCHIVE: &str = "session.archive";
+pub const METHOD_SESSION_RESTORE: &str = "session.restore";
+
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
@@ -27,6 +107,12 @@ mod compatibility_tests {
     #[test]
     fn diff_reply_uses_protocol_decision_method() {
         assert_eq!(METHOD_DIFF_REPLY, METHOD_DIFF_DECISION);
+    }
+
+    #[test]
+    fn identifiers_are_not_allowed_to_be_empty() {
+        assert!(require_non_empty("", "project_id").is_err());
+        assert!(require_non_empty("session", "session_id").is_ok());
     }
 }
 
@@ -347,6 +433,58 @@ impl Client {
     pub async fn health(&self) -> Result<HealthResult> {
         serde_json::from_value(self.call0(METHOD_HEALTH).await?).context("decoding health result")
     }
+
+    /// Return the working-tree status for a project.
+    pub async fn git_status(&self, params: GitStatusParams) -> Result<GitStatusResult> {
+        serde_json::from_value(self.call(METHOD_GIT_STATUS, Some(params)).await?)
+            .context("decoding git status result")
+    }
+
+    /// Fetch both the complete file contents and its current diff.
+    pub async fn git_file(&self, params: GitFileParams) -> Result<GitFileResult> {
+        serde_json::from_value(self.call(METHOD_GIT_FILE, Some(params)).await?)
+            .context("decoding git file result")
+    }
+
+    pub async fn git_stage(&self, params: GitPathParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_STAGE, Some(params)).await?)
+            .context("decoding git stage acknowledgement")
+    }
+
+    pub async fn git_unstage(&self, params: GitPathParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_UNSTAGE, Some(params)).await?)
+            .context("decoding git unstage acknowledgement")
+    }
+
+    /// Revert a file only when the caller explicitly confirms the operation.
+    pub async fn git_revert(&self, params: GitRevertParams) -> Result<GitAckResult> {
+        if !params.validate() {
+            anyhow::bail!("git revert requires explicit confirmation and a safe project path");
+        }
+        serde_json::from_value(self.call(METHOD_GIT_REVERT, Some(params)).await?)
+            .context("decoding git revert acknowledgement")
+    }
+
+    pub async fn git_ack(&self, params: GitAckParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_ACK, Some(params)).await?)
+            .context("decoding git acknowledgement")
+    }
+
+    pub async fn git_branches(&self, params: GitBranchesParams) -> Result<GitBranchesResult> {
+        serde_json::from_value(self.call(METHOD_GIT_BRANCHES, Some(params)).await?)
+            .context("decoding git branches result")
+    }
+
+    pub async fn git_branch_create(&self, params: GitBranchCreateParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_BRANCH_CREATE, Some(params)).await?)
+            .context("decoding git branch create acknowledgement")
+    }
+
+    pub async fn git_branch_switch(&self, params: GitBranchSwitchParams) -> Result<GitAckResult> {
+        serde_json::from_value(self.call(METHOD_GIT_BRANCH_SWITCH, Some(params)).await?)
+            .context("decoding git branch switch acknowledgement")
+    }
+
     pub async fn permission_reply(&self, params: PermissionReply) -> Result<serde_json::Value> {
         self.call(METHOD_PERMISSION_REPLY, Some(params)).await
     }
@@ -373,6 +511,88 @@ impl Client {
     }
     pub async fn prompt_takeover(&self, params: PromptTakeover) -> Result<serde_json::Value> {
         self.call(METHOD_PROMPT_TAKEOVER, Some(params)).await
+    }
+
+    pub async fn session_create(&self, params: CreateSession) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(&params.cwd, "cwd")?;
+        let wire = tau_proto::session::CreateParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            cwd: params.cwd,
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_CREATE, Some(wire)).await?)
+            .context("decoding created session")
+    }
+    pub async fn session_list(&self, project_id: ProjectId) -> Result<Vec<SessionSummary>> {
+        self.session_list_with_archived(project_id, false).await
+    }
+    pub async fn session_list_with_archived(
+        &self,
+        project_id: ProjectId,
+        include_archived: bool,
+    ) -> Result<Vec<SessionSummary>> {
+        require_non_empty(project_id.as_str(), "project_id")?;
+        let params = tau_proto::session::ListParams {
+            project_id: tau_proto::session::ProjectId::new(project_id.as_str()),
+            include_archived,
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_LIST, Some(params)).await?)
+            .context("decoding session list")
+    }
+    pub async fn session_history(&self, params: SessionRef) -> Result<SessionHistory> {
+        self.session_history_page(params, 0, None).await
+    }
+    pub async fn session_history_page(
+        &self,
+        params: SessionRef,
+        after_sequence: u64,
+        limit: Option<u32>,
+    ) -> Result<SessionHistory> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
+        let wire = tau_proto::session::HistoryParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+            after_sequence,
+            limit,
+        };
+        let entries = serde_json::from_value(self.call(METHOD_SESSION_HISTORY, Some(wire)).await?)
+            .context("decoding session history")?;
+        Ok(SessionHistory {
+            session_id: params.session_id,
+            entries,
+        })
+    }
+    pub async fn session_rename(&self, params: SessionRename) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
+        let wire = tau_proto::session::RenameParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+            title: params.title,
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_RENAME, Some(wire)).await?)
+            .context("decoding renamed session")
+    }
+    pub async fn session_archive(&self, params: SessionRef) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
+        let wire = tau_proto::session::SessionIdParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_ARCHIVE, Some(wire)).await?)
+            .context("decoding archived session")
+    }
+    pub async fn session_restore(&self, params: SessionRef) -> Result<SessionSummary> {
+        require_non_empty(params.project_id.as_str(), "project_id")?;
+        require_non_empty(params.session_id.as_str(), "session_id")?;
+        let wire = tau_proto::session::SessionIdParams {
+            project_id: tau_proto::session::ProjectId::new(params.project_id.as_str()),
+            session_id: tau_proto::session::SessionId::new(params.session_id.as_str()),
+        };
+        serde_json::from_value(self.call(METHOD_SESSION_RESTORE, Some(wire)).await?)
+            .context("decoding restored session")
     }
 
     pub async fn negotiate(
@@ -402,15 +622,70 @@ impl Client {
     }
     pub async fn turn_cancel(&self, params: TurnCancelParams) -> Result<TurnCancelResult> {
         self.ensure_capability(Capability::TurnCancellation).await?;
+        require_non_empty(&params.session_id, "session_id")?;
+        require_non_empty(&params.turn_id, "turn_id")?;
         serde_json::from_value(self.call(METHOD_TURN_CANCEL, Some(params)).await?)
             .context("decoding cancellation")
     }
+
+    pub async fn project_list(&self, params: ProjectListParams) -> Result<ProjectListResult> {
+        serde_json::from_value(self.call(METHOD_PROJECT_LIST, Some(params)).await?)
+            .context("decoding project list")
+    }
+
+    pub async fn project_create(&self, params: ProjectCreateParams) -> Result<ProjectCreateResult> {
+        require_non_empty(&params.name, "name")?;
+        require_non_empty(&params.root, "root")?;
+        serde_json::from_value(self.call(METHOD_PROJECT_CREATE, Some(params)).await?)
+            .context("decoding project creation")
+    }
+
+    pub async fn project_rename(
+        &self,
+        params: ProjectRenameParams,
+    ) -> Result<ProjectMutationResult> {
+        require_non_empty(&params.project_id, "project_id")?;
+        require_non_empty(&params.name, "name")?;
+        serde_json::from_value(self.call(METHOD_PROJECT_RENAME, Some(params)).await?)
+            .context("decoding project rename")
+    }
+
+    pub async fn project_repath(
+        &self,
+        params: ProjectRepathParams,
+    ) -> Result<ProjectMutationResult> {
+        require_non_empty(&params.project_id, "project_id")?;
+        require_non_empty(&params.root, "root")?;
+        serde_json::from_value(self.call(METHOD_PROJECT_REPATH, Some(params)).await?)
+            .context("decoding project repath")
+    }
+
+    pub async fn project_unregister(&self, params: ProjectIdParams) -> Result<ProjectActionResult> {
+        require_non_empty(&params.project_id, "project_id")?;
+        serde_json::from_value(self.call(METHOD_PROJECT_UNREGISTER, Some(params)).await?)
+            .context("decoding project unregister")
+    }
+
+    pub async fn project_reactivate(&self, params: ProjectIdParams) -> Result<ProjectActionResult> {
+        require_non_empty(&params.project_id, "project_id")?;
+        serde_json::from_value(self.call(METHOD_PROJECT_REACTIVATE, Some(params)).await?)
+            .context("decoding project reactivation")
+    }
+
+    pub async fn project_new_id(&self, params: ProjectNewIdParams) -> Result<ProjectNewIdResult> {
+        require_non_empty(&params.project_id, "project_id")?;
+        serde_json::from_value(self.call(METHOD_PROJECT_NEW_ID, Some(params)).await?)
+            .context("decoding project id")
+    }
     pub async fn turn_response(&self, params: TurnResponseParams) -> Result<TurnResponseResult> {
+        require_non_empty(&params.session_id, "session_id")?;
+        require_non_empty(&params.turn_id, "turn_id")?;
         serde_json::from_value(self.call(METHOD_TURN_RESPONSE, Some(params)).await?)
             .context("decoding turn response")
     }
     pub async fn turn_replay(&self, params: TurnReplayParams) -> Result<TurnReplayResult> {
         self.ensure_capability(Capability::EventReplay).await?;
+        require_non_empty(&params.session_id, "session_id")?;
         serde_json::from_value(self.call(METHOD_TURN_REPLAY, Some(params)).await?)
             .context("decoding replay")
     }
@@ -429,6 +704,10 @@ impl Client {
     }
     pub async fn turn_start(&self, params: TurnStartParams) -> Result<TurnStream> {
         self.ensure_capability(Capability::TurnStreaming).await?;
+        require_non_empty(&params.project_id, "project_id")?;
+        if let Some(session_id) = params.session_id.as_deref() {
+            require_non_empty(session_id, "session_id")?;
+        }
         let (id, rx) = self.send(METHOD_TURN_START, Some(params)).await?;
         Ok(TurnStream {
             rx,
@@ -498,6 +777,83 @@ impl Client {
         });
         PolicyEventStream::from_receiver(rx)
     }
+}
+
+/// Small client-side persistence for the active session. The daemon remains
+/// stateless with respect to which session a UI had selected.
+#[derive(Debug, Clone)]
+pub struct ActiveSessionStore {
+    path: std::path::PathBuf,
+}
+
+impl ActiveSessionStore {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+    pub fn load(&self) -> Result<Option<SessionRef>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&std::fs::read(&self.path)?)?))
+    }
+    pub fn save(&self, session: &SessionRef) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&self.path, serde_json::to_vec_pretty(session)?)?;
+        Ok(())
+    }
+    pub fn clear(&self) -> Result<()> {
+        if self.path.exists() {
+            std::fs::remove_file(&self.path)?;
+        }
+        Ok(())
+    }
+    /// Restore the locally selected session after reconnecting, if one exists.
+    ///
+    /// Include archived records here: the selected session is durable client
+    /// state, and archiving it while the client was closed must not make a
+    /// reopen silently lose the selection.  Use the daemon's restore method
+    /// so the returned session is usable by the reopened client.
+    pub async fn restore(&self, client: &Client) -> Result<Option<SessionSummary>> {
+        let Some(reference) = self.load()? else {
+            return Ok(None);
+        };
+        let sessions = client
+            .session_list_with_archived(reference.project_id.clone(), true)
+            .await?;
+        let Some(session) = sessions
+            .into_iter()
+            .find(|session| session.session_id == reference.session_id)
+        else {
+            return Ok(None);
+        };
+        if session.archived_at.is_some() {
+            return client.session_restore(reference).await.map(Some);
+        }
+        Ok(Some(session))
+    }
+}
+
+/// Create and persist the session selected by a new chat, without touching
+/// GUI/TUI state or introducing server-side active-session state.
+pub async fn create_session_for_new_chat(
+    client: &Client,
+    store: &ActiveSessionStore,
+    project_id: ProjectId,
+    cwd: impl Into<String>,
+) -> Result<SessionSummary> {
+    let session = client
+        .session_create(CreateSession {
+            project_id: project_id.clone(),
+            cwd: cwd.into(),
+        })
+        .await?;
+    store.save(&SessionRef {
+        project_id,
+        session_id: session.session_id.clone(),
+    })?;
+    Ok(session)
 }
 
 impl Drop for CompletionStream {
@@ -697,5 +1053,32 @@ mod tests {
         );
         assert_eq!(result.compatibility, ProtocolCompatibility::Degraded);
         assert!(result.is_usable());
+    }
+
+    #[test]
+    fn active_session_store_round_trips_typed_reference() {
+        let path = std::env::temp_dir().join(format!(
+            "tau-client-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ActiveSessionStore::new(&path);
+        let reference = SessionRef {
+            project_id: super::ProjectId::new("project"),
+            session_id: super::SessionId::new("session"),
+        };
+        store.save(&reference).unwrap();
+        assert_eq!(store.load().unwrap(), Some(reference.clone()));
+
+        // Reopening the store must read the same selected session from disk;
+        // the selection is client state, not state held by the Client object.
+        let reopened = ActiveSessionStore::new(&path);
+        assert_eq!(reopened.load().unwrap(), Some(reference));
+
+        store.clear().unwrap();
+        assert_eq!(store.load().unwrap(), None);
     }
 }

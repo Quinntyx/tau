@@ -85,6 +85,7 @@ async fn stale_daemon_reports_actionable_incompatibility_without_killing_socket(
     assert!(message.contains("-32601") || message.contains("Method not found"));
     let turn = client
         .turn_start(TurnStartParams {
+            project_id: "stale-project".into(),
             model: "stale-model".into(),
             prompt: "must not submit".into(),
             session_id: None,
@@ -130,9 +131,11 @@ async fn gui_negotiates_before_turn_and_replays_after_reconnect() -> Result<()> 
         report.is_usable(),
         "GUI should get a classified compatibility report"
     );
-    let session = state.db().create_session("/tmp/gui-compat")?;
+    let project = state.db().create_project("gui-compat", "/tmp/gui-compat")?;
+    let session = state.db().create_session(&project.id)?;
     let _turn = client
         .turn_start(TurnStartParams {
+            project_id: project.id.clone(),
             model: "missing-model".into(),
             prompt: "probe".into(),
             session_id: Some(session.id.clone()),

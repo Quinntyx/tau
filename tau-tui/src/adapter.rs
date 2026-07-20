@@ -4,16 +4,33 @@ use crate::{
 };
 use anyhow::Result;
 use futures_util::StreamExt;
-use tau_client::{Client, TurnStreamEvent};
+use tau_client::{Client, SessionHistory, SessionSummary, TurnStreamEvent};
 use tau_proto::prelude::{
     BoundedOutput, ClientResponse, IdempotencyKey, SequencedEvent, TurnEvent, TurnResponseParams,
 };
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
+    ProjectsLoaded(Vec<tau_proto::projects::Project>),
+    ProjectReady(String),
+    SessionsLoaded {
+        project_id: String,
+        sessions: Vec<SessionSummary>,
+    },
+    SessionCreated(SessionSummary),
+    SessionHistory(SessionHistory),
     Turn(SequencedEvent),
-    Complete { session_id: String, turn_id: String },
-    Tool { name: String, output: BoundedOutput },
-    Permission { tool: String, summary: String },
+    Complete {
+        session_id: String,
+        turn_id: String,
+    },
+    Tool {
+        name: String,
+        output: BoundedOutput,
+    },
+    Permission {
+        tool: String,
+        summary: String,
+    },
     Disconnected,
     Reconnected,
     Error(String),
@@ -26,13 +43,96 @@ impl ScriptedClient {
     pub fn drive(&self, s: &mut AppState) {
         for e in &self.events {
             match e {
+                ClientEvent::ProjectsLoaded(_) | ClientEvent::ProjectReady(_) => {}
+                ClientEvent::SessionsLoaded {
+                    project_id,
+                    sessions,
+                } => {
+                    if s.project_id.as_deref() == Some(project_id.as_str()) {
+                        s.sessions.sessions = sessions
+                            .iter()
+                            .map(crate::sessions::entry_from_summary)
+                            .collect();
+                        s.sessions.project = Some(crate::sessions::ProjectId::new(project_id));
+                        s.sessions.restart_selection(s.session_id.as_deref());
+                    }
+                }
+                ClientEvent::SessionCreated(session) => {
+                    if s.project_id.as_deref() != Some(session.project_id.as_str()) {
+                        continue;
+                    }
+                    s.session_id = Some(session.session_id.as_str().to_owned());
+                    s.sessions
+                        .sessions
+                        .retain(|entry| entry.id.as_str() != session.session_id.as_str());
+                    s.sessions
+                        .sessions
+                        .push(crate::sessions::entry_from_summary(session));
+                    s.sessions
+                        .restart_selection(Some(session.session_id.as_str()));
+                    s.sessions.open = false;
+                    s.raw_events.clear();
+                    s.transcript = vec!["New chat".into()];
+                    s.sequence = 0;
+                    s.turn_id = None;
+                    // The daemon acknowledgement is the point at which a new
+                    // session is usable.  Do not leave the composer blocked by
+                    // the asynchronous create request.
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetDisabled(false));
+                }
+                ClientEvent::SessionHistory(history) => {
+                    if s.session_id.as_deref() != Some(history.session_id.as_str()) {
+                        continue;
+                    }
+                    // A late history response must not roll a live projection
+                    // back to an older snapshot.
+                    let history_sequence = history.entries.iter().map(|event| event.sequence).max();
+                    if !s.raw_events.is_empty()
+                        && history_sequence.is_none_or(|sequence| sequence <= s.sequence)
+                    {
+                        continue;
+                    }
+                    s.session_id = Some(history.session_id.as_str().to_owned());
+                    s.raw_events.clear();
+                    s.transcript.clear();
+                    s.human_messages.clear();
+                    s.tools.clear();
+                    s.tool_call_ids.clear();
+                    s.assistant_index = None;
+                    s.turn_id = None;
+                    s.sequence = 0;
+                    let mut entries = history.entries.clone();
+                    entries.sort_by_key(|event| event.sequence);
+                    for event in entries {
+                        reduce_event(s, event);
+                    }
+                    if s.transcript.is_empty() {
+                        s.transcript.push("No conversation yet".into());
+                    }
+                }
                 ClientEvent::Turn(event) => reduce_event(s, event.clone()),
                 ClientEvent::Complete {
                     session_id,
                     turn_id,
                 } => {
+                    if s.session_id.as_deref() != Some(session_id.as_str()) {
+                        continue;
+                    }
                     s.session_id = Some(session_id.clone());
-                    s.turn_id = Some(turn_id.clone());
+                    // The stream completion is terminal; IDs are retained by
+                    // the protocol response only and must not leave an active
+                    // composer turn behind for a later cancel.
+                    let _ = turn_id;
+                    s.turn_id = None;
+                    s.cancelling = false;
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
                 }
                 ClientEvent::Tool { name, output } => {
                     s.tools.push(crate::state::ToolCard {
@@ -53,9 +153,21 @@ impl ScriptedClient {
                         stage: crate::state::PermissionStage::Choose,
                     })
                 }
-                ClientEvent::Disconnected => s.connection = Connection::Disconnected,
+                ClientEvent::Disconnected => {
+                    s.connection = Connection::Disconnected;
+                    s.cancelling = false;
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
+                }
                 ClientEvent::Reconnected => s.connection = Connection::Connected,
-                ClientEvent::Error(message) => s.transcript.push(format!("tau error: {message}")),
+                ClientEvent::Error(message) => {
+                    s.transcript.push(format!("tau error: {message}"));
+                    s.cancelling = false;
+                    let _ = s
+                        .composer
+                        .apply(crate::composer::ComposerAction::SetSending(false));
+                }
             }
         }
     }
@@ -98,13 +210,13 @@ pub async fn complete(
     prompt: String,
     tx: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<()> {
+    let Some(_) = s.project_id.as_deref() else {
+        anyhow::bail!("cannot start turn: select an active project first");
+    };
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let params = reducer::params(s, prompt, Some(cwd))?;
     s.transcript.push("tau: ".into());
     s.assistant_index = Some(s.transcript.len() - 1);
-    let params = reducer::params(
-        s,
-        prompt,
-        Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-    );
     tokio::spawn(turn_task(client.clone(), params, tx));
     Ok(())
 }
@@ -191,10 +303,20 @@ pub async fn replay_task(
 }
 
 pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
+    if s.session_id
+        .as_deref()
+        .is_some_and(|session_id| session_id != event.session_id)
+    {
+        return;
+    }
     if event.sequence <= s.sequence {
         return;
     }
     s.sequence = s.sequence.max(event.sequence);
+    // The event envelope is the authoritative correlation source.  Keep the
+    // session projection current even when a replay reconnects to a session
+    // before its first TurnStarted event arrives.
+    s.session_id = Some(event.session_id.clone());
     s.raw_events.push(event.clone());
     match event.event {
         TurnEvent::TurnStarted { turn_id } => {
@@ -352,14 +474,18 @@ pub fn reduce_event(s: &mut AppState, event: SequencedEvent) {
         TurnEvent::TurnCompleted { .. } => {
             s.cancelling = false;
             s.assistant_index = None;
+            s.turn_id = None;
         }
         TurnEvent::TurnCancelled { .. } => {
             s.cancelling = false;
             s.assistant_index = None;
+            s.turn_id = None;
         }
         TurnEvent::TurnFailed { message, .. } => {
             s.transcript.push(format!("tau error: {message}"));
+            s.cancelling = false;
             s.assistant_index = None;
+            s.turn_id = None;
         }
     }
 }

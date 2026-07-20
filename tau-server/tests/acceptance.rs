@@ -278,6 +278,179 @@ async fn websocket_protocol_negotiation_and_scripted_provider_round_trip() -> Re
 }
 
 #[tokio::test]
+async fn typed_git_operations_are_contained_and_safe() -> Result<()> {
+    let git = fixtures::GitFixture::new()?;
+    let fixture = fixtures::ServerFixture::start().await?;
+    let client = fixtures::client(&fixture).await?;
+    let project = client
+        .project_create(ProjectCreateParams {
+            name: "git fixture".into(),
+            root: git.root.to_string_lossy().into_owned(),
+        })
+        .await?
+        .project
+        .id;
+
+    assert!(
+        client
+            .git_status(GitStatusParams {
+                project: "missing-project".into(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .project_unregister(ProjectIdParams {
+            project_id: project.clone(),
+        })
+        .await?;
+    assert!(
+        client
+            .git_status(GitStatusParams {
+                project: project.clone(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .project_reactivate(ProjectIdParams {
+            project_id: project.clone(),
+        })
+        .await?;
+
+    let status = client
+        .git_status(GitStatusParams {
+            project: project.clone(),
+        })
+        .await?;
+    assert_eq!(status.branch, "master");
+    assert!(status.files.is_empty());
+
+    std::fs::write(git.root.join("tracked.txt"), "changed\n")?;
+    let file = client
+        .git_file(GitFileParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+        })
+        .await?;
+    assert_eq!(file.content, "changed\n");
+    assert!(file.diff.contains("-base"));
+    assert!(
+        client
+            .git_stage(GitPathParams {
+                project: project.clone(),
+                path: "tracked.txt".into(),
+            })
+            .await?
+            .acknowledged
+    );
+    assert!(
+        client
+            .git_status(GitStatusParams {
+                project: project.clone(),
+            })
+            .await?
+            .files[0]
+            .staged
+    );
+    client
+        .git_unstage(GitPathParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+        })
+        .await?;
+
+    assert!(
+        client
+            .git_revert(GitRevertParams {
+                project: project.clone(),
+                path: "tracked.txt".into(),
+                confirmed: false,
+            })
+            .await
+            .is_err()
+    );
+    client
+        .git_revert(GitRevertParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+            confirmed: true,
+        })
+        .await?;
+    assert_eq!(
+        std::fs::read_to_string(git.root.join("tracked.txt"))?,
+        "base\n"
+    );
+
+    client
+        .git_branch_create(GitBranchCreateParams {
+            project: project.clone(),
+            name: "feature".into(),
+        })
+        .await?;
+    assert!(
+        client
+            .git_branches(GitBranchesParams {
+                project: project.clone(),
+            })
+            .await?
+            .branches
+            .iter()
+            .any(|branch| branch.name == "feature")
+    );
+    std::fs::write(git.root.join("tracked.txt"), "dirty\n")?;
+    assert!(
+        client
+            .git_branch_switch(GitBranchSwitchParams {
+                project: project.clone(),
+                name: "feature".into(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .git_revert(GitRevertParams {
+            project: project.clone(),
+            path: "tracked.txt".into(),
+            confirmed: true,
+        })
+        .await?;
+    client
+        .git_branch_switch(GitBranchSwitchParams {
+            project: project.clone(),
+            name: "feature".into(),
+        })
+        .await?;
+
+    assert!(
+        client
+            .git_file(GitFileParams {
+                project: project.clone(),
+                path: "../outside".into(),
+            })
+            .await
+            .is_err()
+    );
+    let first = client
+        .git_ack(GitAckParams {
+            project: project.clone(),
+            operation: "revert".into(),
+            acknowledged: false,
+        })
+        .await?;
+    let second = client
+        .git_ack(GitAckParams {
+            project,
+            operation: "revert".into(),
+            acknowledged: true,
+        })
+        .await?;
+    assert_eq!(first, second);
+    fixture.task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_and_lsp_scripted_processes_support_discovery_restart_and_queries() -> Result<()> {
     let script = fixtures::StdioScript::new()?;
     let mut mcp = tau_core::integrations::McpClient::connect(script.mcp_config()).await?;
@@ -409,7 +582,8 @@ fn production_plan_gate_migration_and_git_preview_are_not_fixture_state() -> Res
     assert!(tau_core::plan::allows_tool(&plan, true, "write").is_err());
 
     let db = tau_core::db::Db::open_in_memory()?;
-    let session = db.create_session("/tmp/acceptance")?;
+    let project = db.create_project("acceptance", "/tmp/acceptance")?;
+    let session = db.create_session(&project.id)?;
     let event = tau_proto::turn::TurnEvent::TextDelta {
         turn_id: "turn".into(),
         text: "replayed".into(),
@@ -500,7 +674,10 @@ async fn mandatory_production_agent_workflow_closure() -> Result<()> {
     ]);
     let state = tau_server::AppState::default()
         .with_provider(tau_core::provider::Provider::scripted(scripted));
-    let session = state.db().create_session("/tmp/m13-production")?;
+    let project = state
+        .db()
+        .create_project("m13-production", "/tmp/m13-production")?;
+    let session = state.db().create_session(&project.id)?;
     let qa = state
         .db()
         .record_qa(&session.id, "May the actor edit?", "Yes, only tracked.txt")?;
@@ -574,6 +751,7 @@ async fn mandatory_production_agent_workflow_closure() -> Result<()> {
     let first_text = run_typed_turn(
         &client,
         TurnStartParams {
+            project_id: project.id.clone(),
             model: "scripted/model".into(),
             prompt: "run the authorized mutation".into(),
             session_id: Some(session.id.clone()),
@@ -614,6 +792,7 @@ async fn mandatory_production_agent_workflow_closure() -> Result<()> {
     let second_text = run_typed_turn(
         &client,
         TurnStartParams {
+            project_id: project.id.clone(),
             model: "scripted/model".into(),
             prompt: "continue after review".into(),
             session_id: Some(session.id.clone()),
@@ -632,6 +811,7 @@ async fn mandatory_production_agent_workflow_closure() -> Result<()> {
     // fixture event directly to the database.
     let _turn = client
         .turn_start(tau_proto::turn::TurnStartParams {
+            project_id: project.id.clone(),
             model: "scripted/model".into(),
             prompt: "replay the authorized mutation".into(),
             session_id: Some(session.id.clone()),

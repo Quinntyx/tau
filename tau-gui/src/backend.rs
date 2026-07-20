@@ -6,9 +6,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tau_client::TurnStreamEvent;
+use tau_client::{
+    ActiveSessionStore, CreateSession, ProjectId, SessionHistory, SessionRef, SessionRename,
+    SessionSummary,
+};
+use tau_proto::git::{GitAckResult, GitBranchesResult, GitFileResult, GitStatusResult};
 use tau_proto::prelude::{
     Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
     RequestAction, TurnCancelParams, TurnReplayParams, TurnResponseParams, TurnStartParams,
+};
+use tau_proto::projects::{
+    ProjectActionResult, ProjectCreateParams, ProjectCreateResult, ProjectIdParams,
+    ProjectListParams, ProjectListResult, ProjectMutationResult, ProjectNewIdParams,
+    ProjectNewIdResult, ProjectRenameParams, ProjectRepathParams,
 };
 use tokio::sync::mpsc;
 
@@ -63,6 +73,7 @@ pub enum DaemonStatus {
 pub struct TurnRequest {
     pub prompt: String,
     pub session_id: Option<String>,
+    pub project_id: String,
     pub model: Option<String>,
     pub agent: Option<String>,
 }
@@ -88,8 +99,12 @@ impl TurnRequest {
         }
     }
 
-    pub fn into_params(self, cwd: String, default_model: String) -> TurnStartParams {
-        TurnStartParams {
+    pub fn into_params(self, cwd: String, default_model: String) -> Result<TurnStartParams> {
+        if self.project_id.trim().is_empty() {
+            anyhow::bail!("cannot start turn: select an active project first")
+        }
+        Ok(TurnStartParams {
+            project_id: self.project_id,
             model: self.model.unwrap_or(default_model),
             prompt: self.prompt,
             session_id: self.session_id,
@@ -104,7 +119,7 @@ impl TurnRequest {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_nanos())
             )),
-        }
+        })
     }
 }
 
@@ -204,6 +219,436 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    fn require_project_id(project_id: &str) -> Result<()> {
+        if project_id.trim().is_empty() {
+            anyhow::bail!("cannot access session: select an active project first")
+        }
+        Ok(())
+    }
+
+    async fn typed_client(&self) -> Result<tau_client::Client> {
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            *guard = Some(connect_or_start(&self.socket, &self._daemon).await?);
+            guard
+                .as_ref()
+                .unwrap()
+                .negotiate_checked(ProtocolNegotiateParams {
+                    version: ProtocolVersion { major: 1, minor: 0 },
+                    capabilities: vec![],
+                })
+                .await?;
+        }
+        Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Typed session-navigation operations used by the GPUI view.  Keeping
+    /// these behind Backend ensures buttons never mutate the local navigator
+    /// without first asking the daemon.
+    pub fn session_create(
+        &self,
+        project_id: ProjectId,
+        cwd: String,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
+            let client = backend.typed_client().await?;
+            let summary = client
+                .session_create(CreateSession {
+                    project_id: project_id.clone(),
+                    cwd,
+                })
+                .await?;
+            Ok(summary)
+        })
+    }
+
+    pub fn session_list(
+        &self,
+        project_id: ProjectId,
+        include_archived: bool,
+    ) -> tokio::task::JoinHandle<Result<Vec<SessionSummary>>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
+            let client = backend.typed_client().await?;
+            client
+                .session_list_with_archived(project_id, include_archived)
+                .await
+        })
+    }
+
+    /// List projects known by the daemon.  The daemon, rather than a local
+    /// adapter, is authoritative for both active and inactive records.
+    pub fn project_list(
+        &self,
+        include_inactive: bool,
+    ) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_list(ProjectListParams {
+                    include_inactive: Some(include_inactive),
+                })
+                .await
+        })
+    }
+
+    pub fn project_list_active(&self) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
+        self.project_list(false)
+    }
+
+    pub fn project_list_inactive(&self) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            let result = backend
+                .typed_client()
+                .await?
+                .project_list(ProjectListParams {
+                    include_inactive: Some(true),
+                })
+                .await?;
+            Ok(ProjectListResult {
+                projects: result
+                    .projects
+                    .into_iter()
+                    .filter(|project| !project.active)
+                    .collect(),
+            })
+        })
+    }
+
+    /// Register the GUI working directory as a daemon project.
+    pub fn project_create(
+        &self,
+        name: String,
+        root: String,
+    ) -> tokio::task::JoinHandle<Result<ProjectCreateResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_create(ProjectCreateParams { name, root })
+                .await
+        })
+    }
+
+    pub fn project_rename(
+        &self,
+        params: ProjectRenameParams,
+    ) -> tokio::task::JoinHandle<Result<ProjectMutationResult>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.project_rename(params).await })
+    }
+
+    pub fn project_repath(
+        &self,
+        params: ProjectRepathParams,
+    ) -> tokio::task::JoinHandle<Result<ProjectMutationResult>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.project_repath(params).await })
+    }
+
+    pub fn project_unregister(
+        &self,
+        project_id: String,
+    ) -> tokio::task::JoinHandle<Result<ProjectActionResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_unregister(ProjectIdParams { project_id })
+                .await
+        })
+    }
+
+    pub fn project_reactivate(
+        &self,
+        project_id: String,
+    ) -> tokio::task::JoinHandle<Result<ProjectActionResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_reactivate(ProjectIdParams { project_id })
+                .await
+        })
+    }
+
+    pub fn project_new_id(
+        &self,
+        project_id: String,
+    ) -> tokio::task::JoinHandle<Result<ProjectNewIdResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_new_id(ProjectNewIdParams { project_id })
+                .await
+        })
+    }
+
+    /// The daemon-backed operations seam.  Keep repository effects here so
+    /// the GPUI view only deals in typed results and never touches Git.
+    pub fn operations_status(
+        &self,
+        project: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitStatusResult, String>> {
+        self.operations_call(project, |client, project| async move {
+            client
+                .git_status(tau_proto::git::GitStatusParams { project })
+                .await
+        })
+    }
+
+    pub fn session_rename(
+        &self,
+        params: SessionRename,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_rename(params).await
+        })
+    }
+
+    pub fn session_archive(
+        &self,
+        params: SessionRef,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_archive(params).await
+        })
+    }
+
+    pub fn session_restore(
+        &self,
+        params: SessionRef,
+    ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_restore(params).await
+        })
+    }
+
+    pub fn session_history(
+        &self,
+        params: SessionRef,
+    ) -> tokio::task::JoinHandle<Result<SessionHistory>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            Self::require_project_id(params.project_id.as_str())?;
+            backend.typed_client().await?.session_history(params).await
+        })
+    }
+
+    /// The active session is a GUI-local preference; the daemon only owns the
+    /// durable session and its event history.
+    fn active_session_store() -> Result<ActiveSessionStore> {
+        Ok(ActiveSessionStore::new(
+            crate::preferences::path()?.with_file_name("active-session.json"),
+        ))
+    }
+
+    pub fn restore_active_session(
+        &self,
+        project_id: ProjectId,
+    ) -> tokio::task::JoinHandle<Result<Option<SessionSummary>>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
+            let store = Self::active_session_store()?;
+            let restored = store.restore(&backend.typed_client().await?).await?;
+            Ok(restored.filter(|session| session.project_id.as_str() == project_id.as_str()))
+        })
+    }
+
+    pub fn save_active_session(
+        &self,
+        project_id: ProjectId,
+        session_id: impl Into<String>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let session_id = session_id.into();
+        self.runtime.spawn(async move {
+            Self::require_project_id(project_id.as_str())?;
+            if session_id.trim().is_empty() {
+                anyhow::bail!("cannot save active session: session ID is empty");
+            }
+            let store = Self::active_session_store()?;
+            store.save(&SessionRef {
+                project_id,
+                session_id: tau_client::SessionId::new(session_id),
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn operations_file(
+        &self,
+        project: String,
+        path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitFileResult, String>> {
+        self.operations_call(project, move |client, project| async move {
+            client
+                .git_file(tau_proto::git::GitFileParams { project, path })
+                .await
+        })
+    }
+
+    pub fn operations_stage(
+        &self,
+        project: String,
+        path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(project, move |client, project| async move {
+            client
+                .git_stage(tau_proto::git::GitPathParams { project, path })
+                .await
+        })
+    }
+
+    pub fn operations_unstage(
+        &self,
+        project: String,
+        path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(project, move |client, project| async move {
+            client
+                .git_unstage(tau_proto::git::GitPathParams { project, path })
+                .await
+        })
+    }
+
+    pub fn operations_revert(
+        &self,
+        project: String,
+        path: String,
+        confirmed: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(project, move |client, project| async move {
+            client
+                .git_revert(tau_proto::git::GitRevertParams {
+                    project,
+                    path,
+                    confirmed,
+                })
+                .await
+        })
+    }
+
+    pub fn operations_branches(
+        &self,
+        project: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitBranchesResult, String>> {
+        self.operations_call(project, |client, project| async move {
+            client
+                .git_branches(tau_proto::git::GitBranchesParams { project })
+                .await
+        })
+    }
+
+    pub fn operations_create_branch(
+        &self,
+        project: String,
+        name: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(project, move |client, project| async move {
+            client
+                .git_branch_create(tau_proto::git::GitBranchCreateParams { project, name })
+                .await
+        })
+    }
+
+    pub fn operations_switch_branch(
+        &self,
+        project: String,
+        name: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(project, move |client, project| async move {
+            client
+                .git_branch_switch(tau_proto::git::GitBranchSwitchParams { project, name })
+                .await
+        })
+    }
+
+    pub fn operations_ack(
+        &self,
+        project: String,
+        operation: String,
+        acknowledged: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
+        self.operations_call(project, move |client, project| async move {
+            client
+                .git_ack(tau_proto::git::GitAckParams {
+                    project,
+                    operation,
+                    acknowledged,
+                })
+                .await
+        })
+    }
+
+    fn operations_call<F, Fut, T>(
+        &self,
+        project: String,
+        call: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, String>>
+    where
+        F: FnOnce(tau_client::Client, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let socket = self.socket.clone();
+        let session = self.session.clone();
+        let daemon = self._daemon.clone();
+        let status = self.status.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut guard = session.lock().await;
+                if guard.is_none() {
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Connecting)
+                        .ok();
+                    *guard = Some(connect_or_start(&socket, &daemon).await?);
+                    status
+                        .lock()
+                        .map(|mut s| *s = DaemonStatus::Negotiating)
+                        .ok();
+                    let report = guard
+                        .as_ref()
+                        .unwrap()
+                        .negotiate_checked(ProtocolNegotiateParams {
+                            version: ProtocolVersion { major: 1, minor: 0 },
+                            capabilities: vec![],
+                        })
+                        .await?;
+                    if !report.is_usable() {
+                        anyhow::bail!("daemon protocol incompatible")
+                    }
+                    status.lock().map(|mut s| *s = DaemonStatus::Ready).ok();
+                }
+                call(guard.as_ref().unwrap().clone(), project).await
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx
+    }
     /// Return configured agent identifiers from the daemon's shared config
     /// schema. The current protocol has no catalog/list RPC, so this explicit
     /// typed boundary avoids inferring agents from rendered labels while
@@ -448,6 +893,15 @@ impl Backend {
         self.turn_with_options(prompt, session_id, agent, None)
     }
 
+    pub fn turn_with_project(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        project_id: String,
+    ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
+        self.turn_with_project_options(prompt, session_id, None, None, Some(project_id))
+    }
+
     pub fn turn_with_options(
         &self,
         prompt: String,
@@ -455,7 +909,30 @@ impl Backend {
         agent: Option<String>,
         model: Option<String>,
     ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
+        self.turn_with_project_options(prompt, session_id, agent, model, None)
+    }
+
+    /// Start a turn for an explicitly selected active project.
+    pub fn turn_with_project_options(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        agent: Option<String>,
+        model: Option<String>,
+        project_id: Option<String>,
+    ) -> mpsc::UnboundedReceiver<Result<TurnStreamEvent, String>> {
         let (sender, receiver) = mpsc::unbounded_channel();
+        if project_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            let _ = sender.send(Err(
+                "cannot start turn: select an active project first".to_string()
+            ));
+            return receiver;
+        }
         let socket = self.socket.clone();
         let cwd = self.cwd.clone();
         let model = model.unwrap_or_else(|| self.model.clone());
@@ -535,10 +1012,11 @@ impl Backend {
                 let params = TurnRequest {
                     prompt,
                     session_id,
+                    project_id: project_id.expect("validated project selection"),
                     model: Some(model),
                     agent,
                 }
-                .into_params(cwd, String::new());
+                .into_params(cwd, String::new())?;
                 let mut stream = client.turn_start(params).await?;
                 while let Some(event) = stream.next().await {
                     let event = event?;
@@ -883,10 +1361,13 @@ mod tests {
     #[test]
     fn picker_actions_build_typed_turn_values() {
         let mut request = TurnRequest::new("hello".into(), Some("session-1".into()));
+        request.project_id = "project-1".into();
         request.apply(PickerAction::SelectModel("provider/model".into()));
         request.apply(PickerAction::SelectAgent("build".into()));
 
-        let params = request.into_params("/tmp/project".into(), "fallback/model".into());
+        let params = request
+            .into_params("/tmp/project".into(), "fallback/model".into())
+            .unwrap();
         assert_eq!(params.model, "provider/model");
         assert_eq!(params.agent.as_deref(), Some("build"));
         assert_eq!(params.prompt, "hello");
@@ -897,10 +1378,22 @@ mod tests {
 
     #[test]
     fn turn_request_uses_default_model_without_label_parsing() {
-        let params = TurnRequest::new("hello".into(), None)
-            .into_params("/tmp".into(), "default/model".into());
+        let mut request = TurnRequest::new("hello".into(), None);
+        request.project_id = "project-1".into();
+        let params = request
+            .into_params("/tmp".into(), "default/model".into())
+            .unwrap();
         assert_eq!(params.model, "default/model");
         assert_eq!(params.agent, None);
+        assert_eq!(params.project_id, "project-1");
+    }
+
+    #[test]
+    fn turn_request_rejects_missing_project_selection() {
+        let error = TurnRequest::new("hello".into(), None)
+            .into_params("/tmp".into(), "default/model".into())
+            .unwrap_err();
+        assert!(error.to_string().contains("select an active project"));
     }
 
     #[test]

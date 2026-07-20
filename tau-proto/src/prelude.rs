@@ -7,7 +7,10 @@ pub use crate::completion::{
 };
 pub use crate::constants::*;
 pub use crate::envelope::{Id, JsonRpc, Notification, Request, Response, RpcError};
+pub use crate::git::*;
 pub use crate::health::{HealthResult, METHOD_HEALTH};
 pub use crate::ping::METHOD_PING;
 pub use crate::policy::*;
+pub use crate::projects::*;
+pub use crate::session::*;
 pub use crate::turn::*;

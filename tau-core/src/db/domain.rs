@@ -1,9 +1,16 @@
 //! Domain types and path helpers for the persistence layer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProjectError {
+    #[error("project root is already registered by an active project")]
+    ActiveRootConflict,
+}
 
 /// Default database path: `~/.local/share/tau/tau.db` (XDG data dir).
 /// Creates the parent directory if missing.
@@ -24,10 +31,43 @@ pub(crate) fn now_ms() -> i64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    pub project_id: String,
     pub cwd: String,
     pub title: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub root: String,
+    pub active: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub(crate) fn canonical_project_root(path: impl AsRef<Path>) -> Result<String> {
+    let path = path.as_ref();
+    let canonical = if path.exists() {
+        if !path.is_dir() {
+            anyhow::bail!("project root is not a directory: {}", path.display());
+        }
+        std::fs::canonicalize(path)
+    } else {
+        let parent = path.parent().context("project root has no parent")?;
+        if !parent.exists() || !parent.is_dir() || path.file_name().is_none() {
+            anyhow::bail!("project root must exist or be one missing final directory");
+        }
+        // Deliberately use `create_dir`, not `create_dir_all`: registration may
+        // create exactly one missing final directory and never manufacture a
+        // missing ancestor by accident.
+        std::fs::create_dir(path)
+            .with_context(|| format!("creating project root {}", path.display()))?;
+        std::fs::canonicalize(path)
+    }?;
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

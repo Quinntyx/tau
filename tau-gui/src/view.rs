@@ -2,15 +2,23 @@ use gpui::{
     App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, ScrollHandle,
     StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb,
 };
+use std::path::PathBuf;
+use tau_client::ProjectId;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
 
 use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
+use crate::composer::ComposerAction;
+use crate::feed;
 use crate::input::{TextInput, command_mode};
+use crate::operations::OperationsModel;
 use crate::picker::{
     AgentOption, ModelOption, PickerAction, command_action, command_suggestions, model_groups,
     next_agent, parse_command,
+};
+use crate::sessions::{
+    Navigator, ProjectId as NavigatorProjectId, SessionSummary as NavigatorSession,
 };
 
 gpui::actions!(
@@ -24,7 +32,19 @@ gpui::actions!(
         PickerDown,
         PickItem,
         ToggleSidebar,
-        ToggleFollow
+        ToggleFollow,
+        ToggleSessions,
+        OperationsStatus,
+        OperationsGit,
+        OperationsChanges,
+        OperationsRefresh,
+        OperationsStage,
+        OperationsUnstage,
+        OperationsRevert,
+        OperationsKeep,
+        OperationsAcknowledge,
+        OperationsCreateBranch,
+        OperationsSwitchBranch
     ]
 );
 
@@ -43,6 +63,35 @@ pub fn next_sidebar_visibility(visible: bool) -> bool {
 
 pub fn next_follow_state(following: bool) -> bool {
     !following
+}
+
+fn feed_policy_request_id(item: &feed::FeedItem) -> Option<&str> {
+    match item.category {
+        feed::FeedCategory::Permission => item.actions.permission_id.as_deref(),
+        feed::FeedCategory::Question => item.actions.question_id.as_deref(),
+        feed::FeedCategory::Diff => item.actions.diff_request_id.as_deref(),
+        _ => None,
+    }
+}
+
+fn feed_item_is_pending(chat: &ChatState, item: &feed::FeedItem) -> bool {
+    feed_policy_request_id(item)
+        .and_then(|id| chat.policy_states.get(id))
+        .is_none_or(|state| !matches!(state, crate::chat::PolicyState::Ack))
+}
+
+/// Render one projected feed body with a typography-first hierarchy.  The
+/// reducer remains the source of truth; this seam deliberately accepts the
+/// already projected label/text pair so protocol actions stay on `TauView`.
+fn feed_body(label: &str, text: String) -> gpui::Div {
+    let primary = matches!(label, "You" | "tau");
+    div()
+        .max_w(px(820.))
+        .p_3()
+        .rounded_lg()
+        .when(primary, |element| element.text_base())
+        .when(!primary, |element| element.text_sm())
+        .child(text)
 }
 
 /// Build presentation data without requiring a GPUI window.  Typed protocol
@@ -355,6 +404,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", PickerUp, None),
         KeyBinding::new("down", PickerDown, None),
         KeyBinding::new("enter", PickItem, Some("Picker")),
+        KeyBinding::new("ctrl-shift-r", OperationsRefresh, None),
     ]);
 }
 
@@ -385,6 +435,24 @@ pub struct TauView {
     preferences: crate::preferences::GuiPreferences,
     transcript_scroll: ScrollHandle,
     follow_output: bool,
+    selected_project_id: Option<String>,
+    /// Root paired with `selected_project_id`; project ids are not paths.
+    selected_project_root: Option<PathBuf>,
+    project_generation: u64,
+    sessions: Navigator,
+    session_query: Entity<TextInput>,
+    sessions_open: bool,
+    operations: OperationsModel,
+    operations_loading: bool,
+    operations_error: Option<String>,
+    operations_tab: OperationsTab,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationsTab {
+    Status,
+    Git,
+    Changes,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -398,6 +466,7 @@ impl TauView {
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
         let picker_input = cx.new(TextInput::new);
+        let session_query = cx.new(TextInput::new);
         let toast_visible = backend.auto_started();
         let preferences = crate::preferences::path()
             .ok()
@@ -433,6 +502,14 @@ impl TauView {
                 in_tab_cycle: true,
             });
         }
+        let initial_model = models
+            .get(model_index)
+            .cloned()
+            .unwrap_or_else(|| default_model.clone());
+        input.update(cx, |input, _| {
+            input.set_model(initial_model);
+            input.set_agent(agent.clone());
+        });
         Self {
             input,
             picker_input,
@@ -456,7 +533,636 @@ impl TauView {
             preferences,
             transcript_scroll: ScrollHandle::new(),
             follow_output: true,
+            selected_project_id: None,
+            selected_project_root: None,
+            project_generation: 0,
+            sessions: Navigator::default(),
+            session_query,
+            sessions_open: false,
+            operations: OperationsModel::new(),
+            operations_loading: false,
+            operations_error: None,
+            operations_tab: OperationsTab::Status,
         }
+    }
+
+    /// Set the active project selected by the project navigator.  Turns are
+    /// intentionally rejected until this explicit selection is supplied.
+    pub fn select_project(
+        &mut self,
+        project_id: Option<String>,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let project_id = project_id.filter(|id| !id.trim().is_empty());
+        if self.selected_project_id == project_id && self.selected_project_root == root {
+            return;
+        }
+        self.selected_project_id = project_id;
+        self.selected_project_root = root;
+        self.project_generation = self.project_generation.wrapping_add(1);
+        // Nothing from the previous repository may be displayed while the
+        // daemon request for the new one is in flight.
+        self.chat = ChatState::default();
+        self.sessions = Navigator::default();
+        self.operations = OperationsModel::new();
+        self.operations_loading = false;
+        self.operations_error = None;
+        self.task = None;
+        self.ack_tasks.clear();
+        self.runtime = RuntimeState::NotNegotiated;
+        if self.selected_project_id.is_some() {
+            self.load_sessions(cx);
+            self.refresh_operations(cx);
+        }
+        cx.notify();
+    }
+
+    fn operation_project(&self) -> Option<String> {
+        self.selected_project_root
+            .as_ref()
+            .map(|root| root.to_string_lossy().into_owned())
+    }
+
+    fn project_is_current(&self, generation: u64, project_id: &str, root: &str) -> bool {
+        self.project_generation == generation
+            && self.selected_project_id.as_deref() == Some(project_id)
+            && self.operation_project().as_deref() == Some(root)
+    }
+
+    fn refresh_operations(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = self.backend.operations_status(project_root.clone());
+        cx.spawn(async move |view, cx| {
+            let _ = match receiver.await {
+                Ok(Ok(result)) => view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations.apply_status(result.branch, result.files);
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    cx.notify();
+                }),
+                Ok(Err(error)) => view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                }),
+                Err(error) => view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                }),
+            };
+        })
+        .detach();
+        self.refresh_operation_branches(cx);
+    }
+
+    fn refresh_operation_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        let receiver = self.backend.operations_branches(project_root.clone());
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(result)) = receiver.await {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations.branch = result.current;
+                    view.operations.apply_branches(result.branches);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn set_operations_tab(&mut self, tab: OperationsTab, cx: &mut Context<Self>) {
+        self.operations_tab = tab;
+        cx.notify();
+    }
+
+    fn open_operation_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = self.backend.operations_file(project_root.clone(), path);
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(file)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    let revision = crate::operations::content_revision(&file.content);
+                    view.operations.invalidate_revision(&file.path, &revision);
+                    view.operations.select_file(file);
+                    view.operations_loading = false;
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn operation_path(&self) -> Option<String> {
+        self.operations
+            .selected
+            .as_ref()
+            .map(|file| file.path.clone())
+    }
+
+    fn operation_mutation(&mut self, path: String, kind: &'static str, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        self.operations_loading = true;
+        self.operations_error = None;
+        let receiver = match kind {
+            "stage" => self.backend.operations_stage(project_root.clone(), path),
+            "unstage" => self.backend.operations_unstage(project_root.clone(), path),
+            "revert" => self
+                .backend
+                .operations_revert(project_root.clone(), path, true),
+            _ => return,
+        };
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(_)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations.acknowledge(true);
+                    view.refresh_operations(cx);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn keep_operation(&mut self, cx: &mut Context<Self>) {
+        if let Some(file) = self.operations.selected.as_ref() {
+            let revision = crate::operations::content_revision(&file.content);
+            self.operations.toggle_keep(file.path.clone(), revision);
+            cx.notify();
+        }
+    }
+
+    fn acknowledge_operation(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        self.operations_loading = true;
+        self.operations_error = None;
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        let receiver = self
+            .backend
+            .operations_ack(project_root.clone(), "operations".into(), true);
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(result)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations.acknowledge(result.acknowledged);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error);
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_loading = false;
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn create_operation_branch(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        let receiver = self
+            .backend
+            .operations_create_branch(project_root.clone(), "tau/gui-review".into());
+        cx.spawn(async move |view, cx| {
+            let _ = receiver.await;
+            let _ = view.update(cx, |view, cx| {
+                if !view.project_is_current(generation, &project_id, &project_root) {
+                    return;
+                }
+                view.refresh_operation_branches(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn switch_operation_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        let receiver = self
+            .backend
+            .operations_switch_branch(project_root.clone(), name);
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(_)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.refresh_operations(cx);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
+                    view.operations_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn operations_refresh_action(
+        &mut self,
+        _: &OperationsRefresh,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_operations(cx);
+    }
+
+    fn operations_status_action(
+        &mut self,
+        _: &OperationsStatus,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_operations_tab(OperationsTab::Status, cx);
+    }
+
+    fn operations_git_action(&mut self, _: &OperationsGit, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_operations_tab(OperationsTab::Git, cx);
+    }
+
+    fn operations_changes_action(
+        &mut self,
+        _: &OperationsChanges,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_operations_tab(OperationsTab::Changes, cx);
+    }
+
+    fn operations_stage_action(
+        &mut self,
+        _: &OperationsStage,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.operation_path() {
+            self.operation_mutation(path, "stage", cx);
+        }
+    }
+
+    fn operations_unstage_action(
+        &mut self,
+        _: &OperationsUnstage,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.operation_path() {
+            self.operation_mutation(path, "unstage", cx);
+        }
+    }
+
+    fn operations_revert_action(
+        &mut self,
+        _: &OperationsRevert,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.operation_path() {
+            self.operation_mutation(path, "revert", cx);
+        }
+    }
+
+    fn operations_keep_action(
+        &mut self,
+        _: &OperationsKeep,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.keep_operation(cx);
+    }
+
+    fn operations_acknowledge_action(
+        &mut self,
+        _: &OperationsAcknowledge,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.acknowledge_operation(cx);
+    }
+
+    fn operations_create_action(
+        &mut self,
+        _: &OperationsCreateBranch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.create_operation_branch(cx);
+    }
+
+    fn operations_switch_action(
+        &mut self,
+        _: &OperationsSwitchBranch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(branch) = self
+            .operations
+            .branches
+            .iter()
+            .find(|branch| !branch.current)
+        {
+            self.switch_operation_branch(branch.name.clone(), cx);
+        }
+    }
+
+    fn operations_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = if self.operations_loading {
+            "Loading…"
+        } else if let Some(error) = &self.operations_error {
+            error.as_str()
+        } else {
+            "Ready"
+        };
+        let branch = if self.operations.branch.is_empty() {
+            "(unknown)"
+        } else {
+            &self.operations.branch
+        };
+        let acknowledgement = self
+            .operations
+            .acknowledgement
+            .map(|value| {
+                if value {
+                    "acknowledged"
+                } else {
+                    "not acknowledged"
+                }
+            })
+            .unwrap_or("—");
+        let active_tab = match self.operations_tab {
+            OperationsTab::Status => "Status",
+            OperationsTab::Git => "Git",
+            OperationsTab::Changes => "Changes",
+        };
+        let mut panel = div()
+            .w(px(340.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .border_l_1()
+            .border_color(rgb(0x2c3340))
+            .child(div().text_lg().child("Status / Git / Changes"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8994a8))
+                    .child(format!("Status · {status}")),
+            )
+            .child(div().child(format!("Branch: {branch}")))
+            .child(div().text_xs().child(format!("Ack · {acknowledgement}")))
+            .child(div().text_xs().child(format!("Tab · {active_tab}")))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(toast_button(
+                        "Status",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.set_operations_tab(OperationsTab::Status, cx)
+                        }),
+                    ))
+                    .child(toast_button(
+                        "Git",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.set_operations_tab(OperationsTab::Git, cx)
+                        }),
+                    ))
+                    .child(toast_button(
+                        "Changes",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| {
+                            view.set_operations_tab(OperationsTab::Changes, cx)
+                        }),
+                    ))
+                    .child(toast_button(
+                        "Refresh",
+                        0x33445f,
+                        cx.listener(|view, _, _, cx| view.refresh_operations(cx)),
+                    )),
+            );
+        panel = panel.children(self.operations.files.iter().map(|file| {
+            let path = file.path.clone();
+            let callback_path = path.clone();
+            div()
+                .flex()
+                .justify_between()
+                .child(toast_button(
+                    path,
+                    0x263348,
+                    cx.listener(move |view, _, _, cx| {
+                        view.open_operation_file(callback_path.clone(), cx)
+                    }),
+                ))
+                .child(if file.staged {
+                    "staged"
+                } else if file.untracked {
+                    "untracked"
+                } else {
+                    "modified"
+                })
+        }));
+        if let Some(file) = &self.operations.selected {
+            let stage_path = file.path.clone();
+            let unstage_path = file.path.clone();
+            let revert_path = file.path.clone();
+            let revision = crate::operations::content_revision(&file.content);
+            let keep_label = if self.operations.is_kept(&file.path, &revision) {
+                "Unkeep"
+            } else {
+                "Keep"
+            };
+            let mut details = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().child(format!(
+                    "{}\n\nCONTENT\n{}\nDIFF\n{}",
+                    file.path, file.content, file.diff
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(toast_button(
+                            "Stage",
+                            0x33445f,
+                            cx.listener(move |view, _, _, cx| {
+                                view.operation_mutation(stage_path.clone(), "stage", cx)
+                            }),
+                        ))
+                        .child(toast_button(
+                            "Unstage",
+                            0x33445f,
+                            cx.listener(move |view, _, _, cx| {
+                                view.operation_mutation(unstage_path.clone(), "unstage", cx)
+                            }),
+                        ))
+                        .child(toast_button(
+                            "Revert (confirm)",
+                            0x7d3b3b,
+                            cx.listener(move |view, _, _, cx| {
+                                view.operation_mutation(revert_path.clone(), "revert", cx)
+                            }),
+                        ))
+                        .child(toast_button(
+                            keep_label,
+                            0x52627a,
+                            cx.listener(|view, _, _, cx| view.keep_operation(cx)),
+                        )),
+                )
+                .child(div().child("Branches"));
+            details = details.children(self.operations.branches.iter().map(|branch| {
+                let name = branch.name.clone();
+                let callback_name = name.clone();
+                toast_button(
+                    name,
+                    0x263348,
+                    cx.listener(move |view, _, _, cx| {
+                        view.switch_operation_branch(callback_name.clone(), cx)
+                    }),
+                )
+            }));
+            details = details.child(toast_button(
+                "Create tau/gui-review",
+                0x33445f,
+                cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
+            ));
+            details = details.child(toast_button(
+                "Acknowledge",
+                0x52627a,
+                cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
+            ));
+            panel = panel.child(details);
+        }
+        panel
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -467,9 +1173,381 @@ impl TauView {
         self.send(window, cx);
     }
 
+    /// Create through the daemon before changing the active chat.  This is
+    /// deliberately asynchronous so a failed create cannot leave a phantom
+    /// local session selected.
+    fn new_chat(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        let Some(project_id) = self.selected_project_id.clone() else {
+            self.runtime = RuntimeState::Failed("select a project before creating a chat".into());
+            cx.notify();
+            return;
+        };
+        let project = ProjectId::new(project_id);
+        let Some(project_root) = self
+            .selected_project_root
+            .as_ref()
+            .map(|root| root.to_string_lossy().into_owned())
+        else {
+            self.runtime =
+                RuntimeState::Failed("select a project root before creating a chat".into());
+            cx.notify();
+            return;
+        };
+        let project_id = project.as_str().to_owned();
+        let generation = self.project_generation;
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let result = match backend.session_create(project, project_root.clone()).await {
+                Ok(task) => task.ok(),
+                Err(_) => None,
+            };
+            if let Some(summary) = result.as_ref() {
+                let _ = backend
+                    .save_active_session(
+                        summary.project_id.clone(),
+                        summary.session_id.as_str().to_owned(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|task| task.ok());
+            }
+            let _ = this.update(cx, |view, cx| {
+                if view.project_is_current(generation, &project_id, &project_root) {
+                    if let Some(summary) = result {
+                        view.chat.session_id = Some(summary.session_id.as_str().to_owned());
+                        view.chat.cards.clear();
+                        view.chat.events.clear();
+                        view.chat.status = ChatStatus::Ready;
+                        view.load_sessions(cx);
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    fn session_project(&self) -> Option<ProjectId> {
+        self.selected_project_id.clone().map(ProjectId::new)
+    }
+
+    fn load_sessions(&mut self, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        let Some(project) = self.session_project() else {
+            self.sessions.set_project(None);
+            return;
+        };
+        let navigator_project = NavigatorProjectId::new(project.as_str());
+        self.sessions.set_project(Some(navigator_project));
+        let include_archived = self.sessions.show_archived();
+        let selected_id = project.as_str().to_owned();
+        let generation = self.project_generation;
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let listed = backend
+                .session_list(project.clone(), include_archived)
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let restored = backend
+                .restore_active_session(project)
+                .await
+                .ok()
+                .and_then(|task| task.ok())
+                .flatten();
+            let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(selected_id.as_str())
+                {
+                    return;
+                }
+                if let Some(records) = listed {
+                    view.sessions
+                        .ingest(records.into_iter().map(to_navigator_session));
+                }
+                if let Some(active) = restored {
+                    view.sessions
+                        .restore_selection(Some(active.session_id.as_str()));
+                    view.chat.session_id = Some(active.session_id.as_str().to_owned());
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn toggle_sessions(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.sessions_open = !self.sessions_open;
+        if self.sessions_open {
+            self.load_sessions(cx);
+        }
+        cx.notify();
+    }
+
+    fn select_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let backend = self.backend.clone();
+        let project = ProjectId::new(project_id);
+        let selected_project_id = project.as_str().to_owned();
+        let generation = self.project_generation;
+        let reference = tau_client::SessionRef {
+            project_id: project.clone(),
+            session_id: tau_client::SessionId::new(session_id.clone()),
+        };
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let history = backend
+                .session_history(reference)
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let _ = backend
+                .save_active_session(project, session_id.clone())
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(selected_project_id.as_str())
+                {
+                    return;
+                }
+                if let Some(history) = history {
+                    view.chat.cards.clear();
+                    view.chat.events.clear();
+                    view.chat.session_id = Some(session_id);
+                    for event in history.entries {
+                        view.chat.reduce(ChatAction::SessionEvent(event));
+                    }
+                }
+                view.sessions
+                    .restore_selection(view.chat.session_id.as_deref());
+                view.sessions_open = false;
+                cx.notify();
+            });
+        }));
+    }
+
+    fn rename_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = self.session_query.read(cx).content();
+        let title = if title.trim().is_empty() {
+            "Untitled".into()
+        } else {
+            title
+        };
+        let backend = self.backend.clone();
+        if self.selected_project_id.as_deref() != Some(project_id.as_str()) {
+            return;
+        }
+        let generation = self.project_generation;
+        let update_project_id = project_id.clone();
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let _ = backend
+                .session_rename(tau_client::SessionRename {
+                    project_id: ProjectId::new(project_id),
+                    session_id: tau_client::SessionId::new(session_id),
+                    title,
+                })
+                .await
+                .ok()
+                .and_then(|task| task.ok());
+            let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(update_project_id.as_str())
+                {
+                    return;
+                }
+                view.load_sessions(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn archive_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_lifecycle(project_id, session_id, false, cx);
+    }
+
+    fn restore_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_lifecycle(project_id, session_id, true, cx);
+    }
+
+    fn session_lifecycle(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        restore: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let backend = self.backend.clone();
+        if self.selected_project_id.as_deref() != Some(project_id.as_str()) {
+            return;
+        }
+        let generation = self.project_generation;
+        let update_project_id = project_id.clone();
+        self.ack_tasks.push(cx.spawn(async move |this, cx| {
+            let reference = tau_client::SessionRef {
+                project_id: ProjectId::new(project_id),
+                session_id: tau_client::SessionId::new(session_id),
+            };
+            let result = if restore {
+                backend.session_restore(reference).await
+            } else {
+                backend.session_archive(reference).await
+            };
+            let _ = result.ok().and_then(|task| task.ok());
+            let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(update_project_id.as_str())
+                {
+                    return;
+                }
+                view.load_sessions(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn session_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sessions
+            .set_query(self.session_query.read(cx).content());
+        let rows = self
+            .sessions
+            .visible()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let show_archived = self.sessions.show_archived();
+        div()
+            .id("session-navigator")
+            .p_3()
+            .bg(rgb(0x1b1f27))
+            .border_b_1()
+            .border_color(rgb(0x2c3340))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_sm().child("Sessions · newest first"))
+            .child(self.session_query.clone())
+            .child(toast_button(
+                if show_archived {
+                    "Hide archived"
+                } else {
+                    "Show archived"
+                },
+                0x33445f,
+                cx.listener(|view, _, _, cx| {
+                    view.sessions
+                        .set_show_archived(!view.sessions.show_archived());
+                    view.load_sessions(cx);
+                    cx.notify();
+                }),
+            ))
+            .children(rows.into_iter().enumerate().map(|(index, record)| {
+                let project_id = record.project_id.as_str().to_owned();
+                let session_id = record.id.clone();
+                let title = record.title.clone().unwrap_or_else(|| "Untitled".into());
+                let archived = record.archived;
+                let select_project = project_id.clone();
+                let select_id = session_id.clone();
+                let rename_project = project_id.clone();
+                let rename_id = session_id.clone();
+                let archive_project = project_id.clone();
+                let archive_id = session_id.clone();
+                let lifecycle_button = toast_button(
+                    if archived { "Restore" } else { "Archive" },
+                    if archived { 0x39734a } else { 0x7d3b3b },
+                    cx.listener(move |view, event, window, cx| {
+                        if archived {
+                            view.restore_session(
+                                archive_project.clone(),
+                                archive_id.clone(),
+                                event,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            view.archive_session(
+                                archive_project.clone(),
+                                archive_id.clone(),
+                                event,
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+                );
+                let mut row = div()
+                    .id(("session", index))
+                    .p_2()
+                    .bg(rgb(
+                        if self.sessions.selected() == Some(session_id.as_str()) {
+                            0x293b52
+                        } else {
+                            0x202630
+                        },
+                    ))
+                    .child(format!("{}  {}", title, session_id))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |view, event, window, cx| {
+                            view.select_session(
+                                select_project.clone(),
+                                select_id.clone(),
+                                event,
+                                window,
+                                cx,
+                            )
+                        }),
+                    );
+                row = row.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(toast_button(
+                            "Rename",
+                            0x52627a,
+                            cx.listener(move |view, event, window, cx| {
+                                view.rename_session(
+                                    rename_project.clone(),
+                                    rename_id.clone(),
+                                    event,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        ))
+                        .child(lifecycle_button),
+                );
+                row
+            }))
+    }
+
     fn switch_agent(&mut self, _: &SwitchAgent, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(next) = next_agent(&self.agents, Some(&self.agent), false) {
-            self.select_agent(next);
+            self.select_agent(next, cx);
         }
         self.chat.status = ChatStatus::Ready;
         cx.notify();
@@ -553,8 +1631,8 @@ impl TauView {
         let items = self.picker_items_for(kind, &query);
         if let Some(item) = items.get(self.picker_index).cloned() {
             match kind {
-                PickerKind::Model => self.select_model(item),
-                PickerKind::Agent => self.select_agent(item),
+                PickerKind::Model => self.select_model(item, cx),
+                PickerKind::Agent => self.select_agent(item, cx),
                 PickerKind::Command => self.accept_command(item, &query, cx),
             }
         }
@@ -595,7 +1673,9 @@ impl TauView {
         } else {
             format!("{query}{item}")
         };
-        self.input.update(cx, |input, _| input.set_content(value));
+        self.input.update(cx, |input, _| {
+            input.dispatch(ComposerAction::ChooseCompletion(value));
+        });
         self.picker = None;
     }
 
@@ -621,6 +1701,27 @@ impl TauView {
     ) {
         self.chat.reduce(ChatAction::ToggleTool(index));
         cx.notify();
+    }
+
+    fn card_index_for_request(
+        &self,
+        request_id: &str,
+        category: feed::FeedCategory,
+    ) -> Option<usize> {
+        self.chat
+            .cards
+            .iter()
+            .position(|card| match (category, card) {
+                (feed::FeedCategory::Permission, Card::Permission { request_id: id, .. })
+                | (feed::FeedCategory::Diff, Card::Diff { request_id: id, .. }) => id == request_id,
+                (
+                    feed::FeedCategory::Question,
+                    Card::Question {
+                        question_id: id, ..
+                    },
+                ) => id == request_id,
+                _ => false,
+            })
     }
 
     fn choose_diff(
@@ -767,6 +1868,9 @@ impl TauView {
     }
 
     fn cancel_turn(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, _| {
+            input.dispatch(ComposerAction::Cancel);
+        });
         self.backend.cancel();
         self.chat.active_assistant = None;
         self.chat.status = ChatStatus::Ready;
@@ -797,13 +1901,18 @@ impl TauView {
         if prompt.trim().is_empty() {
             return;
         }
+        if self.selected_project_id.is_none() {
+            self.runtime = RuntimeState::Failed("select a project before sending".into());
+            cx.notify();
+            return;
+        }
         if let Some(command) = parse_command(&prompt) {
             if let Some(action) = command_action(command) {
                 match action {
                     PickerAction::OpenModels => self.open_picker(PickerKind::Model, window, cx),
                     PickerAction::OpenAgents => self.open_picker(PickerKind::Agent, window, cx),
-                    PickerAction::SelectModel(model) => self.select_model(model),
-                    PickerAction::SelectAgent(agent) => self.select_agent(agent),
+                    PickerAction::SelectModel(model) => self.select_model(model, cx),
+                    PickerAction::SelectAgent(agent) => self.select_agent(agent, cx),
                     PickerAction::ToggleFavorite(model) => {
                         let _ = self.backend.toggle_favorite(model.clone());
                         self.preferences.toggle_favorite(model);
@@ -820,6 +1929,7 @@ impl TauView {
             }
         }
         self.input.update(cx, |input, _| {
+            input.dispatch(ComposerAction::Send);
             input.record_submission(prompt.clone());
             input.reset();
             input.set_disabled(true);
@@ -830,17 +1940,22 @@ impl TauView {
         window.focus(&self.input.focus_handle(cx));
 
         let selected_model = self.models.get(self.model_index).cloned();
-        let receiver = self.backend.turn_with_options(
+        let generation = self.project_generation;
+        let receiver = self.backend.turn_with_project_options(
             prompt,
             self.chat.session_id.clone(),
             (!self.agent.is_empty()).then(|| self.agent.clone()),
             selected_model,
+            self.selected_project_id.clone(),
         );
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut receiver = receiver;
             while let Some(event) = receiver.recv().await {
                 let done = matches!(event, Ok(TurnStreamEvent::Complete(_)) | Err(_));
                 let _ = this.update(cx, |view, cx| {
+                    if view.project_generation != generation {
+                        return;
+                    }
                     view.apply_event(event, cx);
                 });
                 if done {
@@ -850,7 +1965,9 @@ impl TauView {
         }));
     }
 
-    fn select_model(&mut self, model: String) {
+    fn select_model(&mut self, model: String, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, _| input.set_model(model.clone()));
         if let Some(index) = self.models.iter().position(|value| value == &model) {
             self.model_index = index;
         }
@@ -862,7 +1979,9 @@ impl TauView {
         let _ = self.preferences.save();
     }
 
-    fn select_agent(&mut self, agent: String) {
+    fn select_agent(&mut self, agent: String, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, _| input.set_agent(agent.clone()));
         self.agent = agent.clone();
         self.preferences.selected_agent = Some(agent);
         if let Some(selected) = self.preferences.selected_agent.clone() {
@@ -1024,6 +2143,12 @@ impl TauView {
             Ok(TurnStreamEvent::Event(event)) => {
                 self.runtime = RuntimeState::Ready;
                 self.chat.reduce(ChatAction::SessionEvent(event));
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    let project_id = self.backend.cwd().to_owned();
+                    self.input.update(cx, |input, _| {
+                        input.set_ids(session_id, project_id);
+                    });
+                }
                 cx.notify();
             }
             Ok(TurnStreamEvent::Complete(_)) => {
@@ -1057,6 +2182,7 @@ impl Render for TauView {
             .map(String::as_str)
             .unwrap_or(self.backend.model());
         let description = describe_chat(&self.chat, &self.agent, current_model, self.backend.cwd());
+        let typed_feed = feed::FeedProjection::from_events(&self.chat.events);
         if self.follow_output {
             self.transcript_scroll.scroll_to_bottom();
         }
@@ -1078,6 +2204,20 @@ impl Render for TauView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(toast_button(
+                        "New Chat",
+                        0x39734a,
+                        cx.listener(Self::new_chat),
+                    ))
+                    .child(toast_button(
+                        if self.sessions_open {
+                            "Hide sessions"
+                        } else {
+                            "Sessions"
+                        },
+                        0x52627a,
+                        cx.listener(Self::toggle_sessions),
+                    ))
                     .child(toast_button(
                         if self.sidebar_visible {
                             "Hide sidebar"
@@ -1321,18 +2461,7 @@ impl Render for TauView {
                     .flex_col()
                     .when(align_end, |element| element.items_end())
                     .child(div().text_xs().text_color(rgb(0x8994a8)).child(label))
-                    .child(
-                        div()
-                            .id(("card-content", index))
-                            .flex()
-                            .max_w(px(820.))
-                            .max_h(px(360.))
-                            .overflow_y_scroll()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(background))
-                            .child(text),
-                    );
+                    .child(feed_body(label, text).bg(rgb(background)));
                 if matches!(card, Card::Tool { .. }) {
                     card_view = card_view.on_mouse_up(
                         MouseButton::Left,
@@ -1415,20 +2544,26 @@ impl Render for TauView {
                 card_view
             }))
             .children(
-                description
-                    .transcript
+                typed_feed
+                    .items
                     .iter()
-                    .skip(self.chat.cards.len())
-                    .map(|(label, text)| {
-                        div()
+                    .filter(|item| feed_item_is_pending(&self.chat, item))
+                    .map(|item| {
+                        let category = item.category;
+                        // Policy ids live in the typed EventKind payload.  The
+                        // envelope request id is a different correlation field and
+                        // must never be substituted for it.
+                        let request_id = feed_policy_request_id(item).unwrap_or_default();
+                        let label = format!(
+                            "{} {} · #{} · {}",
+                            item.avatar, item.role_mark, item.sequence, item.timestamp
+                        );
+                        let mut item_view = div()
                             .flex()
                             .flex_col()
                             .gap_1()
                             .p_3()
                             .rounded_md()
-                            // The event kind already selected this projection;
-                            // presentation never reparses the label text to
-                            // recover protocol semantics.
                             .bg(rgb(0x202630))
                             .child(
                                 div()
@@ -1436,7 +2571,85 @@ impl Render for TauView {
                                     .text_color(rgb(0x8994a8))
                                     .child(label.clone()),
                             )
-                            .child(text.clone())
+                            .child(feed_body(item.role_mark, item.visible_detail().to_owned()));
+                        if item.actions.permission {
+                            item_view = item_view.child(
+                                div().flex().gap_2().children(
+                                    [
+                                        (PermissionChoice::AllowOnce, "Allow once", 0x39734a),
+                                        (PermissionChoice::Reject, "Reject", 0x7d3b3b),
+                                    ]
+                                    .into_iter()
+                                    .map(
+                                        |(choice, label, color)| {
+                                            let request_id = request_id.to_owned();
+                                            toast_button(
+                                                label,
+                                                color,
+                                                cx.listener(move |view, event, window, cx| {
+                                                    if let Some(index) = view
+                                                        .card_index_for_request(
+                                                            &request_id,
+                                                            category,
+                                                        )
+                                                    {
+                                                        view.choose_permission(
+                                                            index, choice, event, window, cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                        },
+                                    ),
+                                ),
+                            );
+                        } else if item.actions.question {
+                            item_view = item_view.child(div().flex().gap_2().children(
+                                ["yes", "no"].into_iter().map(|answer| {
+                                    let request_id = request_id.to_owned();
+                                    toast_button(
+                                        answer,
+                                        if answer == "yes" { 0x39734a } else { 0x7d3b3b },
+                                        cx.listener(move |view, event, window, cx| {
+                                            if let Some(index) =
+                                                view.card_index_for_request(&request_id, category)
+                                            {
+                                                view.answer_question(
+                                                    index, answer, event, window, cx,
+                                                );
+                                            }
+                                        }),
+                                    )
+                                }),
+                            ));
+                        } else if item.actions.diff {
+                            item_view = item_view.child(
+                                div().flex().gap_2().children(
+                                    [(true, "Accept", 0x39734a), (false, "Reject", 0x7d3b3b)]
+                                        .into_iter()
+                                        .map(|(approved, label, color)| {
+                                            let request_id = request_id.to_owned();
+                                            toast_button(
+                                                label,
+                                                color,
+                                                cx.listener(move |view, event, window, cx| {
+                                                    if let Some(index) = view
+                                                        .card_index_for_request(
+                                                            &request_id,
+                                                            category,
+                                                        )
+                                                    {
+                                                        view.choose_diff(
+                                                            index, approved, event, window, cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                        }),
+                                ),
+                            );
+                        }
+                        item_view
                     }),
             );
         let sidebar = div()
@@ -1476,22 +2689,68 @@ impl Render for TauView {
             .child(
                 div()
                     .flex()
+                    .flex_col()
                     .gap_3()
-                    .items_end()
                     .child(self.input.clone())
+                    .child({
+                        let input = self.input.read(cx);
+                        let refs = input.file_references();
+                        let char_count = input.char_count();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(0x8994a8))
+                            .children(refs.into_iter().map(|reference| {
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x293b52))
+                                    .child(reference)
+                            }))
+                            .child(format!("{} characters", char_count))
+                    })
                     .child(
                         div()
-                            .id("send-button")
-                            .px_4()
-                            .py_3()
-                            .bg(rgb(0x85b8ff))
-                            .hover(|style| style.bg(rgb(0xa8ccff)))
-                            .focusable()
-                            .text_color(rgb(0x10151e))
-                            .rounded_lg()
-                            .cursor_pointer()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
-                            .child("Send"),
+                            .flex()
+                            .items_end()
+                            .gap_3()
+                            .child(toast_button(
+                                &format!(
+                                    "Agent · {}",
+                                    if self.agent.is_empty() {
+                                        "default"
+                                    } else {
+                                        &self.agent
+                                    }
+                                ),
+                                0x33445f,
+                                cx.listener(Self::click_agent),
+                            ))
+                            .child(toast_button(
+                                &format!("Model · {}", current_model),
+                                0x33445f,
+                                cx.listener(Self::click_model),
+                            ))
+                            .child(
+                                div()
+                                    .id("send-button")
+                                    .px_4()
+                                    .py_3()
+                                    .bg(rgb(0x85b8ff))
+                                    .hover(|style| style.bg(rgb(0xa8ccff)))
+                                    .focusable()
+                                    .text_color(rgb(0x10151e))
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .when(self.chat.active_assistant.is_some(), |button| {
+                                        button.opacity(0.45)
+                                    })
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
+                                    .child("Send"),
+                            ),
                     ),
             )
             .when(self.chat.active_assistant.is_some(), |footer| {
@@ -1508,7 +2767,29 @@ impl Render for TauView {
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_turn))
                         .child("Cancel"),
                 )
-            });
+            })
+            .child(
+                div()
+                    .mt_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(0x2c3340))
+                    .text_xs()
+                    .text_color(rgb(0x8994a8))
+                    .child(format!(
+                        "Connection · {}",
+                        match self.backend.daemon_status() {
+                            DaemonStatus::Ready => "connected",
+                            DaemonStatus::Absent => "offline",
+                            DaemonStatus::Spawning
+                            | DaemonStatus::Connecting
+                            | DaemonStatus::Negotiating => "connecting",
+                            DaemonStatus::Incompatible
+                            | DaemonStatus::Degraded
+                            | DaemonStatus::Failed => "degraded",
+                        }
+                    )),
+            );
         let mut root = div()
             .size_full()
             .bg(rgb(0x11151b))
@@ -1533,7 +2814,21 @@ impl Render for TauView {
         }
         root = root.on_action(cx.listener(Self::toggle_sidebar));
         root = root.on_action(cx.listener(Self::toggle_follow));
+        root = root.on_action(cx.listener(Self::operations_status_action));
+        root = root.on_action(cx.listener(Self::operations_git_action));
+        root = root.on_action(cx.listener(Self::operations_changes_action));
+        root = root.on_action(cx.listener(Self::operations_refresh_action));
+        root = root.on_action(cx.listener(Self::operations_stage_action));
+        root = root.on_action(cx.listener(Self::operations_unstage_action));
+        root = root.on_action(cx.listener(Self::operations_revert_action));
+        root = root.on_action(cx.listener(Self::operations_keep_action));
+        root = root.on_action(cx.listener(Self::operations_acknowledge_action));
+        root = root.on_action(cx.listener(Self::operations_create_action));
+        root = root.on_action(cx.listener(Self::operations_switch_action));
         root.child(header)
+            .when(self.sessions_open, |root| {
+                root.child(self.session_panel(cx))
+            })
             .children(runtime_banner_view)
             .child(
                 div()
@@ -1541,12 +2836,24 @@ impl Render for TauView {
                     .flex_1()
                     .min_h(px(0.))
                     .child(transcript)
-                    .when(self.sidebar_visible, |view| view.child(sidebar)),
+                    .when(self.sidebar_visible, |view| {
+                        view.child(sidebar).child(self.operations_panel(cx))
+                    }),
             )
             .child(footer)
             .when(self.toast_visible, |root| {
                 root.child(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
             })
+    }
+}
+
+fn to_navigator_session(session: tau_client::SessionSummary) -> NavigatorSession {
+    NavigatorSession {
+        id: session.session_id.as_str().to_owned(),
+        project_id: NavigatorProjectId::new(session.project_id.as_str()),
+        title: session.title,
+        updated_at: session.updated_at,
+        archived: session.archived_at.is_some(),
     }
 }
 
@@ -1567,11 +2874,10 @@ fn sidebar_card(title: &str, value: &str) -> impl IntoElement {
         .child(div().text_sm().child(value.to_string()))
 }
 
-fn toast_button(
-    label: &str,
-    color: u32,
-    callback: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+fn toast_button<T>(label: impl Into<String>, color: u32, callback: T) -> impl IntoElement
+where
+    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+{
     div()
         .px_2()
         .py_1()
@@ -1579,7 +2885,7 @@ fn toast_button(
         .bg(rgb(color))
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
-        .child(label.to_string())
+        .child(label.into())
 }
 
 #[cfg(test)]
@@ -1665,5 +2971,60 @@ mod view_model_tests {
                 .iter()
                 .any(|(key, value)| key == "DIRECTORY" && value == "Unavailable")
         );
+    }
+
+    #[test]
+    fn feed_controls_use_policy_ids_not_envelope_request_ids() {
+        let raw = tau_proto::prelude::TurnEvent::PermissionRequested {
+            turn_id: "turn".into(),
+            request_id: "policy-42".into(),
+            tool: "shell".into(),
+            description: "run".into(),
+        };
+        let event = crate::chat::TypedEvent {
+            event_id: "event".into(),
+            session_id: "session".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: Some("envelope-99".into()),
+            turn_id: "turn".into(),
+            kind: EventKind::PermissionRequested {
+                permission_id: "policy-42".into(),
+                tool: "shell".into(),
+                description: "run".into(),
+            },
+            raw,
+        };
+        let item = crate::feed::project(&event, crate::feed::DEFAULT_COLLAPSE_AT);
+        assert_eq!(feed_policy_request_id(&item), Some("policy-42"));
+        assert_ne!(feed_policy_request_id(&item), item.request_id.as_deref());
+    }
+
+    #[test]
+    fn acknowledged_feed_policy_controls_are_removed_from_the_root() {
+        let raw = tau_proto::prelude::TurnEvent::QuestionAsked {
+            turn_id: "turn".into(),
+            question_id: "question-7".into(),
+            question: "continue?".into(),
+        };
+        let event = crate::chat::TypedEvent {
+            event_id: "event".into(),
+            session_id: "session".into(),
+            sequence: 1,
+            occurred_at: 0,
+            request_id: None,
+            turn_id: "turn".into(),
+            kind: EventKind::QuestionAsked {
+                question_id: "question-7".into(),
+                question: "continue?".into(),
+            },
+            raw,
+        };
+        let item = crate::feed::project(&event, crate::feed::DEFAULT_COLLAPSE_AT);
+        let mut chat = ChatState::default();
+        assert!(feed_item_is_pending(&chat, &item));
+        chat.policy_states
+            .insert("question-7".into(), crate::chat::PolicyState::Ack);
+        assert!(!feed_item_is_pending(&chat, &item));
     }
 }
