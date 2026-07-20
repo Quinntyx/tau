@@ -15,6 +15,11 @@ use tau_proto::prelude::{
     Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
     RequestAction, TurnCancelParams, TurnReplayParams, TurnResponseParams, TurnStartParams,
 };
+use tau_proto::projects::{
+    ProjectActionResult, ProjectCreateParams, ProjectCreateResult, ProjectIdParams,
+    ProjectListParams, ProjectListResult, ProjectMutationResult, ProjectNewIdParams,
+    ProjectNewIdResult, ProjectRenameParams, ProjectRepathParams,
+};
 use tokio::sync::mpsc;
 
 use crate::picker::PickerAction;
@@ -236,9 +241,9 @@ impl Backend {
     pub fn session_create(
         &self,
         project_id: ProjectId,
+        cwd: String,
     ) -> tokio::task::JoinHandle<Result<SessionSummary>> {
         let backend = self.clone();
-        let cwd = self.cwd.clone();
         self.runtime.spawn(async move {
             let client = backend.typed_client().await?;
             let summary = client
@@ -265,12 +270,131 @@ impl Backend {
         })
     }
 
+    /// List projects known by the daemon.  The daemon, rather than a local
+    /// adapter, is authoritative for both active and inactive records.
+    pub fn project_list(
+        &self,
+        include_inactive: bool,
+    ) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_list(ProjectListParams {
+                    include_inactive: Some(include_inactive),
+                })
+                .await
+        })
+    }
+
+    pub fn project_list_active(&self) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
+        self.project_list(false)
+    }
+
+    pub fn project_list_inactive(&self) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            let result = backend
+                .typed_client()
+                .await?
+                .project_list(ProjectListParams {
+                    include_inactive: Some(true),
+                })
+                .await?;
+            Ok(ProjectListResult {
+                projects: result
+                    .projects
+                    .into_iter()
+                    .filter(|project| !project.active)
+                    .collect(),
+            })
+        })
+    }
+
+    /// Register the GUI working directory as a daemon project.
+    pub fn project_create(
+        &self,
+        name: String,
+        root: String,
+    ) -> tokio::task::JoinHandle<Result<ProjectCreateResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_create(ProjectCreateParams { name, root })
+                .await
+        })
+    }
+
+    pub fn project_rename(
+        &self,
+        params: ProjectRenameParams,
+    ) -> tokio::task::JoinHandle<Result<ProjectMutationResult>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.project_rename(params).await })
+    }
+
+    pub fn project_repath(
+        &self,
+        params: ProjectRepathParams,
+    ) -> tokio::task::JoinHandle<Result<ProjectMutationResult>> {
+        let backend = self.clone();
+        self.runtime
+            .spawn(async move { backend.typed_client().await?.project_repath(params).await })
+    }
+
+    pub fn project_unregister(
+        &self,
+        project_id: String,
+    ) -> tokio::task::JoinHandle<Result<ProjectActionResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_unregister(ProjectIdParams { project_id })
+                .await
+        })
+    }
+
+    pub fn project_reactivate(
+        &self,
+        project_id: String,
+    ) -> tokio::task::JoinHandle<Result<ProjectActionResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_reactivate(ProjectIdParams { project_id })
+                .await
+        })
+    }
+
+    pub fn project_new_id(
+        &self,
+        project_id: Option<String>,
+    ) -> tokio::task::JoinHandle<Result<ProjectNewIdResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            backend
+                .typed_client()
+                .await?
+                .project_new_id(ProjectNewIdParams { project_id })
+                .await
+        })
+    }
+
     /// The daemon-backed operations seam.  Keep repository effects here so
     /// the GPUI view only deals in typed results and never touches Git.
     pub fn operations_status(
         &self,
+        project: String,
     ) -> tokio::sync::oneshot::Receiver<Result<GitStatusResult, String>> {
-        self.operations_call(|client, project| async move {
+        self.operations_call(project, |client, project| async move {
             client
                 .git_status(tau_proto::git::GitStatusParams { project })
                 .await
@@ -351,9 +475,10 @@ impl Backend {
 
     pub fn operations_file(
         &self,
+        project: String,
         path: String,
     ) -> tokio::sync::oneshot::Receiver<Result<GitFileResult, String>> {
-        self.operations_call(move |client, project| async move {
+        self.operations_call(project, move |client, project| async move {
             client
                 .git_file(tau_proto::git::GitFileParams { project, path })
                 .await
@@ -362,9 +487,10 @@ impl Backend {
 
     pub fn operations_stage(
         &self,
+        project: String,
         path: String,
     ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
-        self.operations_call(move |client, project| async move {
+        self.operations_call(project, move |client, project| async move {
             client
                 .git_stage(tau_proto::git::GitPathParams { project, path })
                 .await
@@ -373,9 +499,10 @@ impl Backend {
 
     pub fn operations_unstage(
         &self,
+        project: String,
         path: String,
     ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
-        self.operations_call(move |client, project| async move {
+        self.operations_call(project, move |client, project| async move {
             client
                 .git_unstage(tau_proto::git::GitPathParams { project, path })
                 .await
@@ -384,10 +511,11 @@ impl Backend {
 
     pub fn operations_revert(
         &self,
+        project: String,
         path: String,
         confirmed: bool,
     ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
-        self.operations_call(move |client, project| async move {
+        self.operations_call(project, move |client, project| async move {
             client
                 .git_revert(tau_proto::git::GitRevertParams {
                     project,
@@ -400,8 +528,9 @@ impl Backend {
 
     pub fn operations_branches(
         &self,
+        project: String,
     ) -> tokio::sync::oneshot::Receiver<Result<GitBranchesResult, String>> {
-        self.operations_call(|client, project| async move {
+        self.operations_call(project, |client, project| async move {
             client
                 .git_branches(tau_proto::git::GitBranchesParams { project })
                 .await
@@ -410,9 +539,10 @@ impl Backend {
 
     pub fn operations_create_branch(
         &self,
+        project: String,
         name: String,
     ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
-        self.operations_call(move |client, project| async move {
+        self.operations_call(project, move |client, project| async move {
             client
                 .git_branch_create(tau_proto::git::GitBranchCreateParams { project, name })
                 .await
@@ -421,9 +551,10 @@ impl Backend {
 
     pub fn operations_switch_branch(
         &self,
+        project: String,
         name: String,
     ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
-        self.operations_call(move |client, project| async move {
+        self.operations_call(project, move |client, project| async move {
             client
                 .git_branch_switch(tau_proto::git::GitBranchSwitchParams { project, name })
                 .await
@@ -432,10 +563,11 @@ impl Backend {
 
     pub fn operations_ack(
         &self,
+        project: String,
         operation: String,
         acknowledged: bool,
     ) -> tokio::sync::oneshot::Receiver<Result<GitAckResult, String>> {
-        self.operations_call(move |client, project| async move {
+        self.operations_call(project, move |client, project| async move {
             client
                 .git_ack(tau_proto::git::GitAckParams {
                     project,
@@ -448,6 +580,7 @@ impl Backend {
 
     fn operations_call<F, Fut, T>(
         &self,
+        project: String,
         call: F,
     ) -> tokio::sync::oneshot::Receiver<Result<T, String>>
     where
@@ -457,7 +590,6 @@ impl Backend {
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let socket = self.socket.clone();
-        let cwd = self.cwd.clone();
         let session = self.session.clone();
         let daemon = self._daemon.clone();
         let status = self.status.clone();
@@ -487,7 +619,7 @@ impl Backend {
                     }
                     status.lock().map(|mut s| *s = DaemonStatus::Ready).ok();
                 }
-                call(guard.as_ref().unwrap().clone(), cwd).await
+                call(guard.as_ref().unwrap().clone(), project).await
             }
             .await
             .map_err(|e: anyhow::Error| e.to_string());

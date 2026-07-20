@@ -2,6 +2,7 @@ use gpui::{
     App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, ScrollHandle,
     StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb,
 };
+use std::path::PathBuf;
 use tau_client::ProjectId;
 use tau_client::TurnStreamEvent;
 use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
@@ -435,6 +436,9 @@ pub struct TauView {
     transcript_scroll: ScrollHandle,
     follow_output: bool,
     selected_project_id: Option<String>,
+    /// Root paired with `selected_project_id`; project ids are not paths.
+    selected_project_root: Option<PathBuf>,
+    project_generation: u64,
     sessions: Navigator,
     session_query: Entity<TextInput>,
     sessions_open: bool,
@@ -506,7 +510,7 @@ impl TauView {
             input.set_model(initial_model);
             input.set_agent(agent.clone());
         });
-        let mut view = Self {
+        Self {
             input,
             picker_input,
             backend,
@@ -530,6 +534,8 @@ impl TauView {
             transcript_scroll: ScrollHandle::new(),
             follow_output: true,
             selected_project_id: None,
+            selected_project_root: None,
+            project_generation: 0,
             sessions: Navigator::default(),
             session_query,
             sessions_open: false,
@@ -537,35 +543,87 @@ impl TauView {
             operations_loading: false,
             operations_error: None,
             operations_tab: OperationsTab::Status,
-        };
-        // Session loading begins only after an explicit project selection.
-        view.refresh_operations(cx);
-        view
+        }
     }
 
     /// Set the active project selected by the project navigator.  Turns are
     /// intentionally rejected until this explicit selection is supplied.
-    pub fn select_project(&mut self, project_id: Option<String>) {
-        self.selected_project_id = project_id.filter(|id| !id.trim().is_empty());
+    pub fn select_project(
+        &mut self,
+        project_id: Option<String>,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let project_id = project_id.filter(|id| !id.trim().is_empty());
+        if self.selected_project_id == project_id && self.selected_project_root == root {
+            return;
+        }
+        self.selected_project_id = project_id;
+        self.selected_project_root = root;
+        self.project_generation = self.project_generation.wrapping_add(1);
+        // Nothing from the previous repository may be displayed while the
+        // daemon request for the new one is in flight.
+        self.chat = ChatState::default();
+        self.sessions = Navigator::default();
+        self.operations = OperationsModel::new();
+        self.operations_loading = false;
+        self.operations_error = None;
+        self.task = None;
+        self.ack_tasks.clear();
+        self.runtime = RuntimeState::NotNegotiated;
+        if self.selected_project_id.is_some() {
+            self.load_sessions(cx);
+            self.refresh_operations(cx);
+        }
+        cx.notify();
+    }
+
+    fn operation_project(&self) -> Option<String> {
+        self.selected_project_root
+            .as_ref()
+            .map(|root| root.to_string_lossy().into_owned())
+    }
+
+    fn project_is_current(&self, generation: u64, project_id: &str, root: &str) -> bool {
+        self.project_generation == generation
+            && self.selected_project_id.as_deref() == Some(project_id)
+            && self.operation_project().as_deref() == Some(root)
     }
 
     fn refresh_operations(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
         self.operations_loading = true;
         self.operations_error = None;
-        let receiver = self.backend.operations_status();
+        let receiver = self.backend.operations_status(project_root.clone());
         cx.spawn(async move |view, cx| {
             let _ = match receiver.await {
                 Ok(Ok(result)) => view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations.apply_status(result.branch, result.files);
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     cx.notify();
                 }),
                 Ok(Err(error)) => view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
                 }),
                 Err(error) => view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
@@ -577,10 +635,18 @@ impl TauView {
     }
 
     fn refresh_operation_branches(&mut self, cx: &mut Context<Self>) {
-        let receiver = self.backend.operations_branches();
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        let receiver = self.backend.operations_branches(project_root.clone());
         cx.spawn(async move |view, cx| {
             if let Ok(Ok(result)) = receiver.await {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations.branch = result.current;
                     view.operations.apply_branches(result.branches);
                     cx.notify();
@@ -596,12 +662,20 @@ impl TauView {
     }
 
     fn open_operation_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
         self.operations_loading = true;
         self.operations_error = None;
-        let receiver = self.backend.operations_file(path);
+        let receiver = self.backend.operations_file(project_root.clone(), path);
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(file)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     let revision = crate::operations::content_revision(&file.content);
                     view.operations.invalidate_revision(&file.path, &revision);
                     view.operations.select_file(file);
@@ -611,6 +685,9 @@ impl TauView {
             }
             Ok(Err(error)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
@@ -618,6 +695,9 @@ impl TauView {
             }
             Err(error) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
@@ -635,17 +715,27 @@ impl TauView {
     }
 
     fn operation_mutation(&mut self, path: String, kind: &'static str, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
         self.operations_loading = true;
         self.operations_error = None;
         let receiver = match kind {
-            "stage" => self.backend.operations_stage(path),
-            "unstage" => self.backend.operations_unstage(path),
-            "revert" => self.backend.operations_revert(path, true),
+            "stage" => self.backend.operations_stage(project_root.clone(), path),
+            "unstage" => self.backend.operations_unstage(project_root.clone(), path),
+            "revert" => self
+                .backend
+                .operations_revert(project_root.clone(), path, true),
             _ => return,
         };
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(_)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations.acknowledge(true);
                     view.refresh_operations(cx);
@@ -654,6 +744,9 @@ impl TauView {
             }
             Ok(Err(error)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
@@ -661,6 +754,9 @@ impl TauView {
             }
             Err(error) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
@@ -679,12 +775,22 @@ impl TauView {
     }
 
     fn acknowledge_operation(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
         self.operations_loading = true;
         self.operations_error = None;
-        let receiver = self.backend.operations_ack("operations".into(), true);
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        let receiver = self
+            .backend
+            .operations_ack(project_root.clone(), "operations".into(), true);
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(result)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations.acknowledge(result.acknowledged);
                     cx.notify();
@@ -692,6 +798,9 @@ impl TauView {
             }
             Ok(Err(error)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error);
                     cx.notify();
@@ -699,6 +808,9 @@ impl TauView {
             }
             Err(error) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
@@ -709,12 +821,20 @@ impl TauView {
     }
 
     fn create_operation_branch(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
         let receiver = self
             .backend
-            .operations_create_branch("tau/gui-review".into());
+            .operations_create_branch(project_root.clone(), "tau/gui-review".into());
         cx.spawn(async move |view, cx| {
             let _ = receiver.await;
             let _ = view.update(cx, |view, cx| {
+                if !view.project_is_current(generation, &project_id, &project_root) {
+                    return;
+                }
                 view.refresh_operation_branches(cx);
                 cx.notify();
             });
@@ -723,22 +843,38 @@ impl TauView {
     }
 
     fn switch_operation_branch(&mut self, name: String, cx: &mut Context<Self>) {
-        let receiver = self.backend.operations_switch_branch(name);
+        let Some(project_root) = self.operation_project() else {
+            return;
+        };
+        let project_id = self.selected_project_id.clone().unwrap_or_default();
+        let generation = self.project_generation;
+        let receiver = self
+            .backend
+            .operations_switch_branch(project_root.clone(), name);
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(_)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.refresh_operations(cx);
                     cx.notify();
                 });
             }
             Ok(Err(error)) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_error = Some(error.to_string());
                     cx.notify();
                 });
             }
             Err(error) => {
                 let _ = view.update(cx, |view, cx| {
+                    if !view.project_is_current(generation, &project_id, &project_root) {
+                        return;
+                    }
                     view.operations_error = Some(error.to_string());
                     cx.notify();
                 });
@@ -1048,8 +1184,20 @@ impl TauView {
             return;
         };
         let project = ProjectId::new(project_id);
+        let Some(project_root) = self
+            .selected_project_root
+            .as_ref()
+            .map(|root| root.to_string_lossy().into_owned())
+        else {
+            self.runtime =
+                RuntimeState::Failed("select a project root before creating a chat".into());
+            cx.notify();
+            return;
+        };
+        let project_id = project.as_str().to_owned();
+        let generation = self.project_generation;
         self.ack_tasks.push(cx.spawn(async move |this, cx| {
-            let result = match backend.session_create(project).await {
+            let result = match backend.session_create(project, project_root.clone()).await {
                 Ok(task) => task.ok(),
                 Err(_) => None,
             };
@@ -1064,13 +1212,15 @@ impl TauView {
                     .and_then(|task| task.ok());
             }
             let _ = this.update(cx, |view, cx| {
-                if let Some(summary) = result {
-                    view.chat.session_id = Some(summary.session_id.as_str().to_owned());
-                    view.chat.cards.clear();
-                    view.chat.events.clear();
-                    view.chat.status = ChatStatus::Ready;
-                    view.load_sessions(cx);
-                    cx.notify();
+                if view.project_is_current(generation, &project_id, &project_root) {
+                    if let Some(summary) = result {
+                        view.chat.session_id = Some(summary.session_id.as_str().to_owned());
+                        view.chat.cards.clear();
+                        view.chat.events.clear();
+                        view.chat.status = ChatStatus::Ready;
+                        view.load_sessions(cx);
+                        cx.notify();
+                    }
                 }
             });
         }));
@@ -1089,6 +1239,8 @@ impl TauView {
         let navigator_project = NavigatorProjectId::new(project.as_str());
         self.sessions.set_project(Some(navigator_project));
         let include_archived = self.sessions.show_archived();
+        let selected_id = project.as_str().to_owned();
+        let generation = self.project_generation;
         self.ack_tasks.push(cx.spawn(async move |this, cx| {
             let listed = backend
                 .session_list(project.clone(), include_archived)
@@ -1102,6 +1254,11 @@ impl TauView {
                 .and_then(|task| task.ok())
                 .flatten();
             let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(selected_id.as_str())
+                {
+                    return;
+                }
                 if let Some(records) = listed {
                     view.sessions
                         .ingest(records.into_iter().map(to_navigator_session));
@@ -1134,6 +1291,8 @@ impl TauView {
     ) {
         let backend = self.backend.clone();
         let project = ProjectId::new(project_id);
+        let selected_project_id = project.as_str().to_owned();
+        let generation = self.project_generation;
         let reference = tau_client::SessionRef {
             project_id: project.clone(),
             session_id: tau_client::SessionId::new(session_id.clone()),
@@ -1150,6 +1309,11 @@ impl TauView {
                 .ok()
                 .and_then(|task| task.ok());
             let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(selected_project_id.as_str())
+                {
+                    return;
+                }
                 if let Some(history) = history {
                     view.chat.cards.clear();
                     view.chat.events.clear();
@@ -1181,6 +1345,11 @@ impl TauView {
             title
         };
         let backend = self.backend.clone();
+        if self.selected_project_id.as_deref() != Some(project_id.as_str()) {
+            return;
+        }
+        let generation = self.project_generation;
+        let update_project_id = project_id.clone();
         self.ack_tasks.push(cx.spawn(async move |this, cx| {
             let _ = backend
                 .session_rename(tau_client::SessionRename {
@@ -1192,6 +1361,11 @@ impl TauView {
                 .ok()
                 .and_then(|task| task.ok());
             let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(update_project_id.as_str())
+                {
+                    return;
+                }
                 view.load_sessions(cx);
                 cx.notify();
             });
@@ -1228,6 +1402,11 @@ impl TauView {
         cx: &mut Context<Self>,
     ) {
         let backend = self.backend.clone();
+        if self.selected_project_id.as_deref() != Some(project_id.as_str()) {
+            return;
+        }
+        let generation = self.project_generation;
+        let update_project_id = project_id.clone();
         self.ack_tasks.push(cx.spawn(async move |this, cx| {
             let reference = tau_client::SessionRef {
                 project_id: ProjectId::new(project_id),
@@ -1240,6 +1419,11 @@ impl TauView {
             };
             let _ = result.ok().and_then(|task| task.ok());
             let _ = this.update(cx, |view, cx| {
+                if view.project_generation != generation
+                    || view.selected_project_id.as_deref() != Some(update_project_id.as_str())
+                {
+                    return;
+                }
                 view.load_sessions(cx);
                 cx.notify();
             });
@@ -1717,6 +1901,11 @@ impl TauView {
         if prompt.trim().is_empty() {
             return;
         }
+        if self.selected_project_id.is_none() {
+            self.runtime = RuntimeState::Failed("select a project before sending".into());
+            cx.notify();
+            return;
+        }
         if let Some(command) = parse_command(&prompt) {
             if let Some(action) = command_action(command) {
                 match action {
@@ -1751,6 +1940,7 @@ impl TauView {
         window.focus(&self.input.focus_handle(cx));
 
         let selected_model = self.models.get(self.model_index).cloned();
+        let generation = self.project_generation;
         let receiver = self.backend.turn_with_project_options(
             prompt,
             self.chat.session_id.clone(),
@@ -1763,6 +1953,9 @@ impl TauView {
             while let Some(event) = receiver.recv().await {
                 let done = matches!(event, Ok(TurnStreamEvent::Complete(_)) | Err(_));
                 let _ = this.update(cx, |view, cx| {
+                    if view.project_generation != generation {
+                        return;
+                    }
                     view.apply_event(event, cx);
                 });
                 if done {

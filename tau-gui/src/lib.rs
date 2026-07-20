@@ -21,10 +21,8 @@ use gpui::{
     App, AppContext, Application, Bounds, Context as GpuiContext, Entity, IntoElement,
     ParentElement, Render, Styled, Window, WindowBounds, WindowOptions, div, px, size,
 };
-use projects::{ProjectAction, ProjectError, ProjectState};
-use shell::{
-    InactiveProjectChoice, ProjectItem, ProjectServiceAction, ProjectServiceAdapter, ProjectShell,
-};
+use shell::{ProjectItem, ProjectServiceAction, ProjectShell};
+use tau_proto::projects::{Project as DaemonProject, ProjectRenameParams, ProjectRepathParams};
 use tokio::runtime::{Handle, Runtime};
 use view::TauView;
 
@@ -34,130 +32,240 @@ use view::TauView;
 pub struct ProjectShellRoot {
     shell: Entity<ProjectShell>,
     view: Entity<TauView>,
-    pub project_adapter: LocalProjectAdapter,
-}
-
-/// Local implementation of the S1 adapter seam. It keeps this slice
-/// production-wirable before the project RPC types exist on the branch.
-#[derive(Debug, Default)]
-pub struct LocalProjectAdapter {
-    pub state: ProjectState,
-    pub last_error: Option<ProjectError>,
-}
-
-impl ProjectServiceAdapter for LocalProjectAdapter {
-    fn dispatch(&mut self, action: ProjectServiceAction) {
-        self.last_error = None;
-        let action = match action {
-            ProjectServiceAction::Create { name, root } => ProjectAction::Create { name, root },
-            ProjectServiceAction::Select(id) => ProjectAction::Select(id),
-            ProjectServiceAction::Update { id, name, root } => {
-                ProjectAction::Update { id, name, root }
-            }
-            ProjectServiceAction::Unregister(id) => ProjectAction::Unregister(id),
-            ProjectServiceAction::Reactivate(id) => ProjectAction::Reactivate(id),
-        };
-        if let Err(error) = self.state.apply(action) {
-            self.last_error = Some(error);
-        }
-    }
+    backend: Backend,
+    projects: Vec<DaemonProject>,
+    selected_project_id: Option<String>,
+    last_shell_action: Option<ProjectServiceAction>,
+    retry_in_flight: bool,
+    preferences: crate::preferences::GuiPreferences,
+    pub cwd_unregistered: bool,
+    pub create_project_name: String,
+    pub create_project_root: PathBuf,
 }
 
 impl ProjectShellRoot {
     fn new(backend: Backend, cx: &mut GpuiContext<Self>) -> Self {
         let cwd = PathBuf::from(backend.cwd());
-        let mut state = ProjectState::new();
-        let id = state
-            .create("Current project".into(), cwd.clone())
-            .expect("fresh project");
-        let shell_state = shell::ProjectState::Ready(vec![ProjectItem {
-            id: id.clone(),
-            name: "Current project".into(),
-            path: cwd,
-        }]);
+        let create_project_name = cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("project")
+            .to_owned();
         let shell = cx.new(|_: &mut GpuiContext<ProjectShell>| {
-            let mut project_shell = ProjectShell::new(shell_state.clone());
-            project_shell.select(id);
-            project_shell
+            ProjectShell::new(shell::ProjectState::Loading)
         });
-        let view = cx.new(|cx| TauView::new(backend, cx));
-        Self {
+        let view = cx.new(|cx| TauView::new(backend.clone(), cx));
+        let mut root = Self {
             shell,
             view,
-            project_adapter: LocalProjectAdapter {
-                state,
-                last_error: None,
-            },
+            backend,
+            projects: Vec::new(),
+            selected_project_id: None,
+            last_shell_action: None,
+            retry_in_flight: false,
+            preferences: crate::preferences::path()
+                .ok()
+                .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
+                .unwrap_or_default(),
+            cwd_unregistered: true,
+            create_project_name,
+            create_project_root: cwd,
+        };
+        root.reload_projects(cx, None);
+        root
+    }
+
+    fn reload_projects(&mut self, cx: &mut GpuiContext<Self>, preferred: Option<String>) {
+        let request = self.backend.project_list(true);
+        self.retry_in_flight = true;
+        self.shell.update(cx, |shell, cx| {
+            shell.projects = shell::ProjectState::Loading;
+            shell.set_lifecycle(shell::LifecycleStatus::Loading);
+            cx.notify();
+        });
+        cx.spawn(async move |this, cx| match request.await {
+            Ok(Ok(result)) => {
+                let _ = this.update(cx, |root, cx| {
+                    root.retry_in_flight = false;
+                    root.projects = result.projects;
+                    let cwd = root.create_project_root.to_string_lossy();
+                    root.cwd_unregistered = !root
+                        .projects
+                        .iter()
+                        .any(|project| project.active && project.root == cwd);
+                    let selected = preferred
+                        .or_else(|| root.preferences.selected_project_id.clone())
+                        .and_then(|id| {
+                            root.projects
+                                .iter()
+                                .find(|project| project.id == id && project.active)
+                                .map(|project| project.id.clone())
+                        })
+                        .or_else(|| {
+                            root.projects
+                                .iter()
+                                .find(|project| project.active && project.root == cwd)
+                                .map(|project| project.id.clone())
+                        });
+                    root.selected_project_id = selected.clone();
+                    let items = project_items(&root.projects);
+                    root.shell.update(cx, |shell, cx| {
+                        shell.projects = if items.is_empty() {
+                            shell::ProjectState::Empty
+                        } else {
+                            shell::ProjectState::Ready(items)
+                        };
+                        shell.selected = selected.clone();
+                        shell.set_lifecycle(shell::LifecycleStatus::Acknowledged(
+                            "Projects loaded".into(),
+                        ));
+                        shell.last_action = None;
+                        cx.notify();
+                    });
+                    root.select_view_project(selected, cx);
+                    if root.cwd_unregistered {
+                        root.shell.update(cx, |shell, cx| {
+                            shell.open_create_prompt(root.create_project_root.clone());
+                            cx.notify();
+                        });
+                    }
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |root, cx| {
+                    root.retry_in_flight = false;
+                    root.shell.update(cx, |shell, cx| {
+                        shell.projects = shell::ProjectState::Error(error.to_string());
+                        shell.set_lifecycle(shell::LifecycleStatus::Error(error.to_string()));
+                        shell.last_action = None;
+                        cx.notify();
+                    });
+                });
+            }
+            Err(error) => {
+                let _ = this.update(cx, |root, cx| {
+                    root.retry_in_flight = false;
+                    root.shell.update(cx, |shell, cx| {
+                        shell.projects = shell::ProjectState::Error(error.to_string());
+                        shell.set_lifecycle(shell::LifecycleStatus::Error(error.to_string()));
+                        shell.last_action = None;
+                        cx.notify();
+                    });
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn select_view_project(&mut self, id: Option<String>, cx: &mut GpuiContext<Self>) {
+        // The shell is only a projection and may emit an id for an archived
+        // row.  Never let an inactive/unknown daemon record become the view's
+        // active project (or get persisted as the last-active preference).
+        let id = id.and_then(|id| {
+            self.projects
+                .iter()
+                .find(|project| project.id == *id && project.active)
+                .map(|project| (project.id.clone(), PathBuf::from(&project.root)))
+        });
+        let (project_id, root) = id
+            .map(|(id, root)| (Some(id), Some(root)))
+            .unwrap_or((None, None));
+        if self.shell.read(cx).selected != project_id {
+            let selected = project_id.clone();
+            self.shell.update(cx, |shell, cx| {
+                shell.selected = selected;
+                cx.notify();
+            });
+        }
+        self.view.update(cx, |view, cx| {
+            view.select_project(project_id.clone(), root, cx)
+        });
+        if self.preferences.selected_project_id != project_id {
+            self.preferences.selected_project_id = project_id;
+            let _ = self.preferences.save();
         }
     }
 
-    /// Narrow adapter seam for menus, persistence, and future project dialogs.
-    pub fn apply_project_action(&mut self, action: ProjectAction, cx: &mut GpuiContext<Self>) {
-        let service_action = match &action {
-            ProjectAction::Create { name, root } => ProjectServiceAction::Create {
-                name: name.clone(),
-                root: root.clone(),
-            },
-            ProjectAction::Select(id) => ProjectServiceAction::Select(id.clone()),
-            ProjectAction::Update { id, name, root } => ProjectServiceAction::Update {
-                id: id.clone(),
-                name: name.clone(),
-                root: root.clone(),
-            },
-            ProjectAction::Unregister(id) => ProjectServiceAction::Unregister(id.clone()),
-            ProjectAction::Reactivate(id) => ProjectServiceAction::Reactivate(id.clone()),
+    fn begin_service_action(&mut self, action: ProjectServiceAction, cx: &mut GpuiContext<Self>) {
+        self.last_shell_action = Some(action.clone());
+        self.shell.update(cx, |shell, cx| {
+            shell.set_lifecycle(shell::LifecycleStatus::Loading);
+            cx.notify();
+        });
+        let backend = self.backend.clone();
+        let preferred = match &action {
+            ProjectServiceAction::Select(id)
+            | ProjectServiceAction::Update { id, .. }
+            | ProjectServiceAction::Reactivate(id)
+            | ProjectServiceAction::Unregister(id) => Some(id.clone()),
+            ProjectServiceAction::Create { .. } | ProjectServiceAction::CreateNewId(_) => None,
         };
-        self.apply_service_action(service_action, cx);
+        cx.spawn(async move |this, cx| {
+            let result: Result<Option<String>> = async {
+                match action {
+                    ProjectServiceAction::Create { name, root } => {
+                        let response = backend
+                            .project_create(name, root.to_string_lossy().into_owned())
+                            .await??;
+                        Ok(Some(response.project.id))
+                    }
+                    ProjectServiceAction::CreateNewId(source_id) => {
+                        let response = backend.project_new_id(Some(source_id)).await??;
+                        Ok(Some(response.project_id))
+                    }
+                    ProjectServiceAction::Select(id) => Ok(Some(id)),
+                    ProjectServiceAction::Update { id, name, root } => {
+                        backend
+                            .project_rename(ProjectRenameParams {
+                                project_id: id.clone(),
+                                name,
+                            })
+                            .await??;
+                        backend
+                            .project_repath(ProjectRepathParams {
+                                project_id: id,
+                                root: root.to_string_lossy().into_owned(),
+                            })
+                            .await??;
+                        Ok(None)
+                    }
+                    ProjectServiceAction::Unregister(id) => {
+                        backend.project_unregister(id).await??;
+                        Ok(None)
+                    }
+                    ProjectServiceAction::Reactivate(id) => {
+                        let response = backend.project_reactivate(id).await??;
+                        Ok(Some(response.project.id))
+                    }
+                }
+            }
+            .await;
+            let _ = this.update(cx, |root, cx| match result {
+                Ok(created_or_selected) => {
+                    let preferred = created_or_selected.or(preferred);
+                    root.reload_projects(cx, preferred);
+                }
+                Err(error) => {
+                    root.shell.update(cx, |shell, cx| {
+                        shell.set_lifecycle(shell::LifecycleStatus::Error(error.to_string()));
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
-    /// Dispatch a shell action through the typed adapter and refresh the
-    /// visible projection only after the local adapter accepts it.
+    /// Service actions originate in the shell, but are acknowledged by the
+    /// daemon before the projection is refreshed.
     pub fn apply_service_action(
         &mut self,
         action: ProjectServiceAction,
         cx: &mut GpuiContext<Self>,
     ) {
-        self.project_adapter.dispatch(action.clone());
-        let error = self
-            .project_adapter
-            .last_error
-            .as_ref()
-            .map(|error| format!("{error:?}"));
-        let selected = self.project_adapter.state.active_project_id.clone();
-        let items = project_items(&self.project_adapter.state);
-        self.shell.update(cx, |shell, cx| {
-            shell.dispatch_project_action(action);
-            if let Some(error) = error {
-                shell.projects = shell::ProjectState::Error(error);
-            } else {
-                shell.projects = shell::ProjectState::Ready(items);
-            }
-            shell.selected = selected;
-            cx.notify();
-        });
-    }
-
-    /// Registering an inactive path deliberately requires an explicit choice.
-    pub fn register_inactive(
-        &mut self,
-        id: impl Into<String>,
-        name: impl Into<String>,
-        root: PathBuf,
-        choice: InactiveProjectChoice,
-        cx: &mut GpuiContext<Self>,
-    ) {
-        match choice {
-            InactiveProjectChoice::Reactivate => {
-                self.apply_service_action(ProjectServiceAction::Reactivate(id.into()), cx)
-            }
-            InactiveProjectChoice::CreateNew => self.apply_service_action(
-                ProjectServiceAction::Create {
-                    name: name.into(),
-                    root,
-                },
-                cx,
-            ),
-        }
+        self.begin_service_action(action, cx);
     }
 
     /// Production callers use this to surface loading, empty, and transport
@@ -170,24 +278,42 @@ impl ProjectShellRoot {
     }
 }
 
-fn project_items(state: &ProjectState) -> Vec<ProjectItem> {
-    state
-        .projects
-        .values()
+fn project_items(projects: &[DaemonProject]) -> Vec<ProjectItem> {
+    projects
+        .iter()
         .map(|project| ProjectItem {
             id: project.id.clone(),
-            name: if project.inactive {
+            name: if !project.active {
                 format!("{} (inactive)", project.name)
             } else {
                 project.name.clone()
             },
-            path: project.root.clone(),
+            path: PathBuf::from(&project.root),
         })
         .collect()
 }
 
 impl Render for ProjectShellRoot {
-    fn render(&mut self, _window: &mut Window, _cx: &mut GpuiContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut GpuiContext<Self>) -> impl IntoElement {
+        let shell_action = self.shell.read(cx).last_service_action.clone();
+        if shell_action != self.last_shell_action {
+            if let Some(action) = shell_action {
+                self.begin_service_action(action, cx);
+            }
+        }
+        let retry_requested =
+            self.shell.read(cx).last_action == Some(shell::ShellAction::RetryProjects);
+        if retry_requested && !self.retry_in_flight {
+            self.reload_projects(cx, None);
+        }
+        if !retry_requested {
+            self.retry_in_flight = false;
+        }
+        let selected = self.shell.read(cx).selected.clone();
+        if selected != self.selected_project_id {
+            self.selected_project_id = selected.clone();
+            self.select_view_project(selected, cx);
+        }
         div()
             .size_full()
             .flex()
@@ -252,22 +378,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_adapter_reaches_project_lifecycle_without_wire_types() {
-        let mut adapter = LocalProjectAdapter::default();
-        adapter.dispatch(ProjectServiceAction::Create {
-            name: "demo".into(),
-            root: "/tmp/demo".into(),
-        });
-        let id = adapter.state.active_project_id.clone().unwrap();
-        adapter.dispatch(ProjectServiceAction::Update {
-            id: id.clone(),
-            name: "renamed".into(),
-            root: "/tmp/renamed".into(),
-        });
-        adapter.dispatch(ProjectServiceAction::Select(id.clone()));
-        adapter.dispatch(ProjectServiceAction::Unregister(id.clone()));
-        adapter.dispatch(ProjectServiceAction::Reactivate(id));
-        assert!(adapter.last_error.is_none());
-        assert!(adapter.state.active().is_some());
+    fn daemon_project_records_project_to_shell_items() {
+        let records = vec![
+            DaemonProject {
+                id: "active".into(),
+                name: "Active".into(),
+                root: "/tmp/active".into(),
+                active: true,
+                created_at: 0,
+                updated_at: 0,
+            },
+            DaemonProject {
+                id: "inactive".into(),
+                name: "Old".into(),
+                root: "/tmp/old".into(),
+                active: false,
+                created_at: 0,
+                updated_at: 0,
+            },
+        ];
+        let items = project_items(&records);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].name, "Old (inactive)");
     }
 }
