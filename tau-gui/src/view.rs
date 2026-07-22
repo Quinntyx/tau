@@ -455,7 +455,7 @@ enum OperationsTab {
     Changes,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerKind {
     Model,
     Agent,
@@ -584,6 +584,16 @@ impl TauView {
             .map(|root| root.to_string_lossy().into_owned())
     }
 
+    fn operation_project_or_error(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let project = self.operation_project();
+        if project.is_none() {
+            self.operations_loading = false;
+            self.operations_error = Some("select a project before using repository actions".into());
+            cx.notify();
+        }
+        project
+    }
+
     fn project_is_current(&self, generation: u64, project_id: &str, root: &str) -> bool {
         self.project_generation == generation
             && self.selected_project_id.as_deref() == Some(project_id)
@@ -591,7 +601,7 @@ impl TauView {
     }
 
     fn refresh_operations(&mut self, cx: &mut Context<Self>) {
-        let Some(project_root) = self.operation_project() else {
+        let Some(project_root) = self.operation_project_or_error(cx) else {
             return;
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
@@ -636,7 +646,7 @@ impl TauView {
     }
 
     fn refresh_operation_branches(&mut self, cx: &mut Context<Self>) {
-        let Some(project_root) = self.operation_project() else {
+        let Some(project_root) = self.operation_project_or_error(cx) else {
             return;
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
@@ -663,7 +673,7 @@ impl TauView {
     }
 
     fn open_operation_file(&mut self, path: String, cx: &mut Context<Self>) {
-        let Some(project_root) = self.operation_project() else {
+        let Some(project_root) = self.operation_project_or_error(cx) else {
             return;
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
@@ -717,7 +727,7 @@ impl TauView {
     }
 
     fn operation_mutation(&mut self, path: String, kind: &'static str, cx: &mut Context<Self>) {
-        let Some(project_root) = self.operation_project() else {
+        let Some(project_root) = self.operation_project_or_error(cx) else {
             return;
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
@@ -778,7 +788,7 @@ impl TauView {
     }
 
     fn acknowledge_operation(&mut self, cx: &mut Context<Self>) {
-        let Some(project_root) = self.operation_project() else {
+        let Some(project_root) = self.operation_project_or_error(cx) else {
             return;
         };
         self.operations_loading = true;
@@ -825,7 +835,7 @@ impl TauView {
     }
 
     fn create_operation_branch(&mut self, cx: &mut Context<Self>) {
-        let Some(project_root) = self.operation_project() else {
+        let Some(project_root) = self.operation_project_or_error(cx) else {
             return;
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
@@ -854,7 +864,7 @@ impl TauView {
     }
 
     fn switch_operation_branch(&mut self, name: String, cx: &mut Context<Self>) {
-        let Some(project_root) = self.operation_project() else {
+        let Some(project_root) = self.operation_project_or_error(cx) else {
             return;
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
@@ -1058,30 +1068,34 @@ impl TauView {
                 div()
                     .flex()
                     .gap_1()
-                    .child(toast_button(
+                    .child(testable_button(
                         "Status",
                         0x33445f,
+                        "operations-status",
                         cx.listener(|view, _, _, cx| {
                             view.set_operations_tab(OperationsTab::Status, cx)
                         }),
                     ))
-                    .child(toast_button(
+                    .child(testable_button(
                         "Git",
                         0x33445f,
+                        "operations-git",
                         cx.listener(|view, _, _, cx| {
                             view.set_operations_tab(OperationsTab::Git, cx)
                         }),
                     ))
-                    .child(toast_button(
+                    .child(testable_button(
                         "Changes",
                         0x33445f,
+                        "operations-changes",
                         cx.listener(|view, _, _, cx| {
                             view.set_operations_tab(OperationsTab::Changes, cx)
                         }),
                     ))
-                    .child(toast_button(
+                    .child(testable_button(
                         "Refresh",
                         0x33445f,
+                        "operations-refresh",
                         cx.listener(|view, _, _, cx| view.refresh_operations(cx)),
                     )),
             );
@@ -2239,39 +2253,43 @@ impl Render for TauView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(toast_button(
+                    .child(testable_button(
                         "New Chat",
                         0x39734a,
+                        "new-chat-button",
                         cx.listener(Self::new_chat),
                     ))
-                    .child(toast_button(
+                    .child(testable_button(
                         if self.sessions_open {
                             "Hide sessions"
                         } else {
                             "Sessions"
                         },
                         0x52627a,
+                        "sessions-button",
                         cx.listener(Self::toggle_sessions),
                     ))
-                    .child(toast_button(
+                    .child(testable_button(
                         if self.sidebar_visible {
                             "Hide sidebar"
                         } else {
                             "Show sidebar"
                         },
                         0x33445f,
+                        "sidebar-button",
                         cx.listener(|view, _, _, cx| {
                             view.sidebar_visible = next_sidebar_visibility(view.sidebar_visible);
                             cx.notify();
                         }),
                     ))
-                    .child(toast_button(
+                    .child(testable_button(
                         if self.follow_output {
                             "Following"
                         } else {
                             "Follow output"
                         },
                         0x33445f,
+                        "follow-button",
                         cx.listener(|view, _, _, cx| {
                             view.follow_output = next_follow_state(view.follow_output);
                             if view.follow_output {
@@ -2490,6 +2508,7 @@ impl Render for TauView {
                 };
                 let mut card_view = div()
                     .id(("card", index))
+                    .debug_selector(|| format!("card-{index}"))
                     .focusable()
                     .hover(|style| style.bg(rgb(0x171d26)))
                     .flex()
@@ -2752,7 +2771,7 @@ impl Render for TauView {
                             .flex()
                             .items_end()
                             .gap_3()
-                            .child(toast_button(
+                            .child(testable_button(
                                 &format!(
                                     "Agent · {}",
                                     if self.agent.is_empty() {
@@ -2762,16 +2781,19 @@ impl Render for TauView {
                                     }
                                 ),
                                 0x33445f,
+                                "agent-button",
                                 cx.listener(Self::click_agent),
                             ))
-                            .child(toast_button(
+                            .child(testable_button(
                                 &format!("Model · {}", current_model),
                                 0x33445f,
+                                "model-button",
                                 cx.listener(Self::click_model),
                             ))
                             .child(
                                 div()
                                     .id("send-button")
+                                    .debug_selector(|| "send-button".into())
                                     .px_4()
                                     .py_3()
                                     .bg(rgb(0x85b8ff))
@@ -2924,9 +2946,114 @@ where
         .child(label.into())
 }
 
+fn testable_button<T>(
+    label: impl Into<String>,
+    color: u32,
+    selector: &'static str,
+    callback: T,
+) -> impl IntoElement
+where
+    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+{
+    div()
+        .debug_selector(|| selector.into())
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(rgb(color))
+        .hover(|style| style.opacity(0.9))
+        .cursor_pointer()
+        .on_mouse_up(MouseButton::Left, callback)
+        .child(label.into())
+}
+
 #[cfg(test)]
 mod view_model_tests {
     use super::*;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+    fn test_backend(runtime: &tokio::runtime::Runtime) -> Backend {
+        Backend::from_parts(
+            PathBuf::from("/tmp/tau-gui-click-test.sock"),
+            runtime.handle().clone(),
+            None,
+            "/tmp/tau-gui-click-project".into(),
+            "test/model".into(),
+        )
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing rendered control: {selector}"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+    }
+
+    #[gpui::test]
+    fn rendered_root_controls_dispatch_mouse_clicks(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let backend = test_backend(&runtime);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = TauView::new(backend, cx);
+            view.sidebar_visible = true;
+            view
+        });
+
+        click(cx, "operations-git");
+        assert_eq!(
+            cx.update(|_, app| view.read(app).operations_tab),
+            OperationsTab::Git
+        );
+
+        click(cx, "operations-refresh");
+        assert!(
+            cx.update(|_, app| view.read(app).operations_error.clone())
+                .is_some()
+        );
+
+        click(cx, "new-chat-button");
+        assert!(matches!(
+            cx.update(|_, app| view.read(app).runtime.clone()),
+            RuntimeState::Failed(_)
+        ));
+
+        click(cx, "sessions-button");
+        assert!(cx.update(|_, app| view.read(app).sessions_open));
+
+        click(cx, "follow-button");
+        assert!(!cx.update(|_, app| view.read(app).follow_output));
+
+        click(cx, "sidebar-button");
+        assert!(!cx.update(|_, app| view.read(app).sidebar_visible));
+
+        click(cx, "model-button");
+        assert_eq!(
+            cx.update(|_, app| view.read(app).picker),
+            Some(PickerKind::Model)
+        );
+    }
+
+    #[gpui::test]
+    fn rendered_tool_card_click_toggles_inspector(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let backend = test_backend(&runtime);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = TauView::new(backend, cx);
+            view.chat.cards.push(Card::Tool {
+                name: "read".into(),
+                input: "file.txt".into(),
+                output: "contents".into(),
+                expanded: false,
+            });
+            view
+        });
+
+        click(cx, "card-0");
+        assert!(matches!(
+            &cx.update(|_, app| view.read(app).chat.cards[0].clone()),
+            Card::Tool { expanded: true, .. }
+        ));
+    }
 
     #[test]
     fn description_exposes_empty_and_operational_states() {
