@@ -100,7 +100,11 @@ async fn execute_inner(state: &AppState, job: &TurnJob) -> Result<Option<i64>> {
     })
     .await?;
 
-    let runner = AgentRunner::new(provider);
+    let test_tools = provider.test_tool_registry(std::path::Path::new(&session.cwd))?;
+    let mut runner = AgentRunner::new(provider);
+    if let Some(tools) = test_tools {
+        runner = runner.with_tools(tools);
+    }
     let request = CompletionRequest {
         model: None,
         preamble: None,
