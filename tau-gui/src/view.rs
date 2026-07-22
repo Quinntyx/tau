@@ -598,6 +598,7 @@ impl TauView {
         let generation = self.project_generation;
         self.operations_loading = true;
         self.operations_error = None;
+        cx.notify();
         let receiver = self.backend.operations_status(project_root.clone());
         cx.spawn(async move |view, cx| {
             let _ = match receiver.await {
@@ -669,6 +670,7 @@ impl TauView {
         let generation = self.project_generation;
         self.operations_loading = true;
         self.operations_error = None;
+        cx.notify();
         let receiver = self.backend.operations_file(project_root.clone(), path);
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(file)) => {
@@ -722,6 +724,7 @@ impl TauView {
         let generation = self.project_generation;
         self.operations_loading = true;
         self.operations_error = None;
+        cx.notify();
         let receiver = match kind {
             "stage" => self.backend.operations_stage(project_root.clone(), path),
             "unstage" => self.backend.operations_unstage(project_root.clone(), path),
@@ -780,6 +783,7 @@ impl TauView {
         };
         self.operations_loading = true;
         self.operations_error = None;
+        cx.notify();
         let project_id = self.selected_project_id.clone().unwrap_or_default();
         let generation = self.project_generation;
         let receiver = self
@@ -826,14 +830,21 @@ impl TauView {
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
         let generation = self.project_generation;
+        self.operations_loading = true;
+        self.operations_error = None;
+        cx.notify();
         let receiver = self
             .backend
             .operations_create_branch(project_root.clone(), "tau/gui-review".into());
         cx.spawn(async move |view, cx| {
-            let _ = receiver.await;
+            let result = receiver.await;
             let _ = view.update(cx, |view, cx| {
                 if !view.project_is_current(generation, &project_id, &project_root) {
                     return;
+                }
+                view.operations_loading = false;
+                if let Ok(Err(error)) = result {
+                    view.operations_error = Some(error.to_string());
                 }
                 view.refresh_operation_branches(cx);
                 cx.notify();
@@ -848,6 +859,9 @@ impl TauView {
         };
         let project_id = self.selected_project_id.clone().unwrap_or_default();
         let generation = self.project_generation;
+        self.operations_loading = true;
+        self.operations_error = None;
+        cx.notify();
         let receiver = self
             .backend
             .operations_switch_branch(project_root.clone(), name);
@@ -857,6 +871,7 @@ impl TauView {
                     if !view.project_is_current(generation, &project_id, &project_root) {
                         return;
                     }
+                    view.operations_loading = false;
                     view.refresh_operations(cx);
                     cx.notify();
                 });
@@ -866,6 +881,7 @@ impl TauView {
                     if !view.project_is_current(generation, &project_id, &project_root) {
                         return;
                     }
+                    view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
                 });
@@ -875,6 +891,7 @@ impl TauView {
                     if !view.project_is_current(generation, &project_id, &project_root) {
                         return;
                     }
+                    view.operations_loading = false;
                     view.operations_error = Some(error.to_string());
                     cx.notify();
                 });
@@ -1196,6 +1213,8 @@ impl TauView {
         };
         let project_id = project.as_str().to_owned();
         let generation = self.project_generation;
+        self.runtime = RuntimeState::Negotiating;
+        cx.notify();
         self.ack_tasks.push(cx.spawn(async move |this, cx| {
             let result = match backend.session_create(project, project_root.clone()).await {
                 Ok(task) => task.ok(),
@@ -1218,7 +1237,11 @@ impl TauView {
                         view.chat.cards.clear();
                         view.chat.events.clear();
                         view.chat.status = ChatStatus::Ready;
+                        view.runtime = RuntimeState::Ready;
                         view.load_sessions(cx);
+                        cx.notify();
+                    } else {
+                        view.runtime = RuntimeState::Failed("could not create a new chat".into());
                         cx.notify();
                     }
                 }
@@ -1297,6 +1320,12 @@ impl TauView {
             project_id: project.clone(),
             session_id: tau_client::SessionId::new(session_id.clone()),
         };
+        self.sessions.restore_selection(Some(&session_id));
+        self.sessions_open = false;
+        self.runtime = RuntimeState::Negotiating;
+        self.chat.cards.clear();
+        self.chat.events.clear();
+        cx.notify();
         self.ack_tasks.push(cx.spawn(async move |this, cx| {
             let history = backend
                 .session_history(reference)
@@ -1318,9 +1347,12 @@ impl TauView {
                     view.chat.cards.clear();
                     view.chat.events.clear();
                     view.chat.session_id = Some(session_id);
+                    view.runtime = RuntimeState::Ready;
                     for event in history.entries {
                         view.chat.reduce(ChatAction::SessionEvent(event));
                     }
+                } else {
+                    view.runtime = RuntimeState::Failed("could not load session history".into());
                 }
                 view.sessions
                     .restore_selection(view.chat.session_id.as_deref());
@@ -1497,6 +1529,7 @@ impl TauView {
                                 cx,
                             );
                         }
+                        cx.stop_propagation();
                     }),
                 );
                 let mut row = div()
@@ -1536,7 +1569,8 @@ impl TauView {
                                     event,
                                     window,
                                     cx,
-                                )
+                                );
+                                cx.stop_propagation();
                             }),
                         ))
                         .child(lifecycle_button),
@@ -2119,6 +2153,7 @@ impl TauView {
                                                 let _ = view.backend.toggle_favorite(model.clone());
                                                 view.preferences.toggle_favorite(model.clone());
                                                 let _ = view.preferences.save();
+                                                cx.stop_propagation();
                                                 cx.notify();
                                             }),
                                         )
@@ -2883,6 +2918,7 @@ where
         .py_1()
         .rounded_sm()
         .bg(rgb(color))
+        .hover(|style| style.opacity(0.9))
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
         .child(label.into())

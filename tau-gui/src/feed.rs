@@ -215,26 +215,40 @@ fn classify(kind: &EventKind) -> (FeedCategory, Role, String, ActionReachability
             (FeedCategory::Tool, Role::Tool, detail)
         }
         EventKind::ToolOutput { inline, .. } | EventKind::ToolError { error: inline, .. } => {
+            if let EventKind::ToolError { call_id, .. } = kind {
+                actions.tool_toggle = true;
+                actions.tool_toggle_id = Some(call_id.clone());
+            }
             (FeedCategory::Tool, Role::Tool, inline.clone())
         }
         EventKind::ToolStatus {
-            status, metadata, ..
-        } => (
-            FeedCategory::Tool,
-            Role::Tool,
-            format!(
-                "{status:?}{}",
-                metadata
-                    .as_deref()
-                    .map(|value| format!("\n{value}"))
-                    .unwrap_or_default()
-            ),
-        ),
-        EventKind::ToolCompleted { output, .. } => (
-            FeedCategory::Tool,
-            Role::Tool,
-            output.clone().unwrap_or_default(),
-        ),
+            call_id,
+            status,
+            metadata,
+        } => {
+            actions.tool_toggle = true;
+            actions.tool_toggle_id = Some(call_id.clone());
+            (
+                FeedCategory::Tool,
+                Role::Tool,
+                format!(
+                    "{status:?}{}",
+                    metadata
+                        .as_deref()
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                ),
+            )
+        }
+        EventKind::ToolCompleted { call_id, output } => {
+            actions.tool_toggle = true;
+            actions.tool_toggle_id = Some(call_id.clone());
+            (
+                FeedCategory::Tool,
+                Role::Tool,
+                output.clone().unwrap_or_default(),
+            )
+        }
         EventKind::PermissionRequested { description, .. } => {
             actions.permission = true;
             if let EventKind::PermissionRequested { permission_id, .. } = kind {
