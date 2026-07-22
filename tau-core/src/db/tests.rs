@@ -6,6 +6,14 @@ fn test_db() -> Db {
     Db::open_in_memory().expect("in-memory db")
 }
 
+fn test_project(db: &Db, name: &str) -> (tempfile::TempDir, Project) {
+    let directory = tempfile::tempdir().expect("temporary project parent");
+    let project = db
+        .create_project(name, directory.path().join("project"))
+        .expect("create temporary project");
+    (directory, project)
+}
+
 #[test]
 fn migration_idempotent() {
     let db = test_db();
@@ -15,7 +23,7 @@ fn migration_idempotent() {
 #[test]
 fn policy_decisions_round_trip_by_scope_and_replace_idempotently() {
     let db = test_db();
-    let project = db.create_project("policy", "/tmp/policy").unwrap();
+    let (_root, project) = test_project(&db, "policy");
     let session = db.create_session(&project.id).unwrap();
     let first = db
         .save_policy_decision(Some(&session.id), "session", "human", "read:*", "allow")
@@ -46,7 +54,7 @@ fn v1_database_upgrades_forward_to_event_storage() {
         conn.pragma_update(None, "user_version", 1).unwrap();
     }
     let db = Db::open(file.path()).unwrap();
-    let project = db.create_project("upgrade", "/tmp/upgrade").unwrap();
+    let (_root, project) = test_project(&db, "upgrade");
     let session = db.create_session(&project.id).unwrap();
     assert_eq!(db.replay_events(&session.id, 0, None).unwrap().len(), 0);
 }
@@ -54,7 +62,7 @@ fn v1_database_upgrades_forward_to_event_storage() {
 #[test]
 fn context_epochs_are_append_only_and_reloaded() {
     let db = test_db();
-    let project = db.create_project("project", "/tmp/project").unwrap();
+    let (_root, project) = test_project(&db, "project");
     let session = db.create_session(&project.id).unwrap();
     let first = db
         .append_context_epoch(&ContextEpochRecord::new(&session.id, 0, "first", "manual"))
@@ -81,7 +89,7 @@ fn context_epochs_are_append_only_and_reloaded() {
 #[test]
 fn epoch_schema_has_restart_metadata_and_duplicate_append_is_atomic() {
     let db = test_db();
-    let project = db.create_project("project", "/tmp/project").unwrap();
+    let (_root, project) = test_project(&db, "project");
     let session = db.create_session(&project.id).unwrap();
     let columns: Vec<String> = {
         let conn = db.conn.lock().unwrap();
@@ -112,7 +120,7 @@ fn epoch_schema_has_restart_metadata_and_duplicate_append_is_atomic() {
 #[test]
 fn session_create_and_get() {
     let db = test_db();
-    let project = db.create_project("project", "/tmp/project").unwrap();
+    let (_root, project) = test_project(&db, "project");
     let s = db.create_session(&project.id).unwrap();
     assert_eq!(s.cwd, project.root);
     assert_eq!(s.project_id, project.id);
@@ -120,7 +128,7 @@ fn session_create_and_get() {
     assert!(!s.id.is_empty());
 
     let fetched = db.get_session(&s.id).unwrap().expect("session exists");
-    assert_eq!(fetched.cwd, "/tmp/project");
+    assert_eq!(fetched.cwd, project.root);
     assert_eq!(fetched.created_at, s.created_at);
 }
 
@@ -139,7 +147,7 @@ fn session_list() {
 #[test]
 fn message_append_and_get() {
     let db = test_db();
-    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let (_root, project) = test_project(&db, "proj");
     let s = db.create_session(&project.id).unwrap();
     let msg = db
         .append_message(&s.id, "user", vec![ContentBlock::text("hello world")])
@@ -162,7 +170,7 @@ fn message_append_and_get() {
 #[test]
 fn tool_use_tool_result_round_trip() {
     let db = test_db();
-    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let (_root, project) = test_project(&db, "proj");
     let s = db.create_session(&project.id).unwrap();
     db.append_message(
         &s.id,
@@ -211,7 +219,7 @@ fn tool_use_tool_result_round_trip() {
 #[test]
 fn usage_round_trip() {
     let db = test_db();
-    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let (_root, project) = test_project(&db, "proj");
     let s = db.create_session(&project.id).unwrap();
     let u = db
         .record_usage(&s.id, None, "gpt-4o", 100, 50, Some(20))
@@ -225,7 +233,7 @@ fn usage_round_trip() {
 #[test]
 fn qa_record_round_trip() {
     let db = test_db();
-    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let (_root, project) = test_project(&db, "proj");
     let s = db.create_session(&project.id).unwrap();
     let qa = db.record_qa(&s.id, "which database?", "rusqlite").unwrap();
     assert_eq!(qa.question, "which database?");
@@ -239,7 +247,7 @@ fn qa_record_round_trip() {
 #[test]
 fn session_updated_on_message_append() {
     let db = test_db();
-    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let (_root, project) = test_project(&db, "proj");
     let s = db.create_session(&project.id).unwrap();
     let original_updated = s.updated_at;
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -342,7 +350,7 @@ fn session_cwd_rejects_traversal_without_creating_outside_root() {
 #[test]
 fn event_journal_sequences_replay_and_idempotency() {
     let db = test_db();
-    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let (_root, project) = test_project(&db, "proj");
     let session = db.create_session(&project.id).unwrap();
     let event = tau_proto::turn::TurnEvent::TextDelta {
         turn_id: "t".into(),
@@ -379,7 +387,7 @@ fn event_journal_sequences_replay_and_idempotency() {
 #[test]
 fn artifact_reference_round_trip() {
     let db = test_db();
-    let project = db.create_project("proj", "/tmp/proj").unwrap();
+    let (_root, project) = test_project(&db, "proj");
     let session = db.create_session(&project.id).unwrap();
     let reference = tau_proto::turn::ArtifactReference {
         artifact_id: "a".into(),
