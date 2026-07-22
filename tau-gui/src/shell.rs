@@ -352,12 +352,24 @@ impl ProjectShell {
             ProjectState::Loading => div().child("Loading projects…").child(
                 div()
                     .id("retry-projects-loading")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x26354a))
+                    .text_color(rgb(0xd6deeb))
+                    .cursor_pointer()
                     .child("Refresh")
                     .on_click(cx.listener(|shell, _, _, _| shell.retry_projects())),
             ),
             ProjectState::Empty => div().child("No projects yet").child(
                 div()
                     .id("create-project-empty")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x26354a))
+                    .text_color(rgb(0xd6deeb))
+                    .cursor_pointer()
                     .child("Create project")
                     .on_click(cx.listener(|shell, _, _, _| {
                         shell.open_create_prompt(PathBuf::from("project"));
@@ -368,6 +380,12 @@ impl ProjectShell {
                 .child(
                     div()
                         .id("retry-projects-error")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x26354a))
+                        .text_color(rgb(0xd6deeb))
+                        .cursor_pointer()
                         .child("Retry")
                         .on_click(cx.listener(|shell, _, _, _| shell.retry_projects())),
                 ),
@@ -377,15 +395,20 @@ impl ProjectShell {
                 let selected = self.selected.as_deref() == Some(project.id.as_str());
                 let mut row = div()
                     .id(SharedString::from(project.id.clone()))
+                    .debug_selector(|| project.id.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_2()
                     .py_2()
                     .rounded_md()
+                    .cursor_pointer()
                     .bg(if selected {
                         rgb(0x26354a)
                     } else {
                         rgb(0x151a21)
                     })
-                    .child(project.name.clone());
+                    .child(div().flex_1().child(project.name.clone()));
                 if inactive {
                     let reactivate_id = id.clone();
                     let new_id = id.clone();
@@ -398,8 +421,16 @@ impl ProjectShell {
                         .child(
                             div()
                                 .id(SharedString::from(format!("reactivate-{id}")))
+                                .debug_selector(|| format!("reactivate-{id}"))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x314d3c))
+                                .text_color(rgb(0xd6deeb))
+                                .cursor_pointer()
                                 .child("Reactivate")
-                                .on_click(cx.listener(move |shell, _, _, _| {
+                                .on_click(cx.listener(move |shell, _, _, cx| {
+                                    cx.stop_propagation();
                                     shell.choose_inactive(
                                         reactivate_id.clone(),
                                         reactivate_name.clone(),
@@ -412,8 +443,16 @@ impl ProjectShell {
                         .child(
                             div()
                                 .id(SharedString::from(format!("new-id-{new_id}")))
+                                .debug_selector(|| format!("new-id-{new_id}"))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x26354a))
+                                .text_color(rgb(0xd6deeb))
+                                .cursor_pointer()
                                 .child("New ID")
-                                .on_click(cx.listener(move |shell, _, _, _| {
+                                .on_click(cx.listener(move |shell, _, _, cx| {
+                                    cx.stop_propagation();
                                     shell.choose_inactive(
                                         new_id.clone(),
                                         new_name.clone(),
@@ -432,8 +471,15 @@ impl ProjectShell {
                         .child(
                             div()
                                 .id(SharedString::from(format!("update-{update_id}")))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x26354a))
+                                .text_color(rgb(0xd6deeb))
+                                .cursor_pointer()
                                 .child("Update")
-                                .on_click(cx.listener(move |shell, _, _, _| {
+                                .on_click(cx.listener(move |shell, _, _, cx| {
+                                    cx.stop_propagation();
                                     shell.update_project(
                                         update_id.clone(),
                                         update_name.clone(),
@@ -444,13 +490,20 @@ impl ProjectShell {
                         .child(
                             div()
                                 .id(SharedString::from(format!("unregister-{unregister_id}")))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x4a2930))
+                                .text_color(rgb(0xd6deeb))
+                                .cursor_pointer()
                                 .child("Unregister")
-                                .on_click(cx.listener(move |shell, _, _, _| {
+                                .on_click(cx.listener(move |shell, _, _, cx| {
+                                    cx.stop_propagation();
                                     shell.unregister_project(unregister_id.clone())
                                 })),
-                        )
-                        .on_click(cx.listener(move |shell, _, _, _| shell.select(id.clone())));
+                        );
                 }
+                row = row.on_click(cx.listener(move |shell, _, _, _| shell.select(id.clone())));
                 list.child(row)
             }),
         };
@@ -461,12 +514,34 @@ impl ProjectShell {
                 .flex_col()
                 .gap_1()
                 .p_2()
-                .child("Create project")
-                .child(format!("Name: {}", prompt.name))
-                .child(format!("Path: {}", prompt.root.display()))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xd6deeb))
+                        .child("Create project"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x8994a8))
+                        .child(format!("Name: {}", prompt.name)),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x8994a8))
+                        .child(format!("Path: {}", prompt.root.display())),
+                )
                 .child(
                     div()
                         .id("submit-create-project")
+                        .debug_selector(|| "submit-create-project".into())
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x314d3c))
+                        .text_color(rgb(0xd6deeb))
+                        .cursor_pointer()
                         .child("Create")
                         .on_click(cx.listener(|shell, _, _, _| {
                             let _ = shell.submit_create_prompt();
@@ -475,6 +550,13 @@ impl ProjectShell {
                 .child(
                     div()
                         .id("cancel-create-project")
+                        .debug_selector(|| "cancel-create-project".into())
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x26354a))
+                        .text_color(rgb(0xd6deeb))
+                        .cursor_pointer()
                         .child("Cancel")
                         .on_click(cx.listener(|shell, _, _, _| shell.cancel_create_prompt())),
                 )

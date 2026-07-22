@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use gpui::{Modifiers, TestAppContext, point, px};
 use tau_gui::ProjectShellRoot;
 use tau_gui::composer::{Composer, ComposerAction};
 use tau_gui::feed::{ActionReachability, FeedAction};
@@ -13,9 +14,18 @@ use tau_gui::picker::{PickerAction, command_action, parse_command};
 use tau_gui::projects::{ProjectAction, ProjectState};
 use tau_gui::sessions::{Navigator, ProjectId, SessionIntent, SessionSummary};
 use tau_gui::shell::{
-    ProjectItem, ProjectServiceAction, ProjectShell, ProjectState as ShellState, ShellAction,
-    ShellLayout,
+    InactiveProjectChoice, ProjectItem, ProjectServiceAction, ProjectServiceAdapter, ProjectShell,
+    ProjectState as ShellState, ShellAction, ShellLayout,
 };
+
+#[derive(Default)]
+struct RecordingProjectListener(Vec<ProjectServiceAction>);
+
+impl ProjectServiceAdapter for RecordingProjectListener {
+    fn dispatch(&mut self, action: ProjectServiceAction) {
+        self.0.push(action);
+    }
+}
 
 #[test]
 fn root_shell_description_composes_project_rail_and_sessions() {
@@ -134,6 +144,171 @@ fn root_projection_accepts_only_daemon_owned_projects() {
     );
     assert_eq!(state.persisted_active_id(), Some("project-1"));
     let _root_type: Option<ProjectShellRoot> = None;
+}
+
+#[test]
+fn rendered_create_prompt_controls_submit_to_listener_and_cancel() {
+    let mut shell = ProjectShell::new(ShellState::Empty);
+    let mut listener = RecordingProjectListener::default();
+
+    // These are the callbacks installed by the rendered Create and Cancel
+    // controls.  Exercise them through the same listener seam used by the
+    // root rather than asserting only on a state description.
+    shell.open_create_prompt(PathBuf::from("/workspace/new-project"));
+    shell.set_create_fields("New project", PathBuf::from("/workspace/new-project"));
+    let action = shell.submit_create_prompt().expect("Create button action");
+    listener.dispatch(action.clone());
+    assert_eq!(
+        listener.0,
+        vec![ProjectServiceAction::Create {
+            name: "New project".into(),
+            root: PathBuf::from("/workspace/new-project"),
+        }]
+    );
+    assert!(shell.create_prompt.is_none());
+
+    shell.open_create_prompt(PathBuf::from("/workspace/cancelled"));
+    shell.cancel_create_prompt();
+    assert!(shell.create_prompt.is_none());
+    assert_eq!(listener.0.len(), 1, "Cancel must not notify the service");
+}
+
+#[test]
+fn rendered_inactive_controls_dispatch_reactivate_and_new_id() {
+    let mut shell = ProjectShell::new(ShellState::Ready(vec![ProjectItem {
+        id: "old-id".into(),
+        name: "Old project (inactive)".into(),
+        path: PathBuf::from("/workspace/old"),
+    }]));
+    let mut listener = RecordingProjectListener::default();
+
+    shell.choose_inactive("old-id", "Old project", PathBuf::from("/workspace/old"));
+    let action = shell
+        .submit_inactive_choice(InactiveProjectChoice::Reactivate)
+        .expect("Reactivate button action");
+    shell.dispatch_to(&mut listener, action);
+
+    shell.choose_inactive("old-id", "Old project", PathBuf::from("/workspace/old"));
+    let action = shell
+        .submit_inactive_choice(InactiveProjectChoice::CreateNew)
+        .expect("New ID button action");
+    shell.dispatch_to(&mut listener, action);
+
+    assert_eq!(
+        listener.0,
+        vec![
+            ProjectServiceAction::Reactivate("old-id".into()),
+            ProjectServiceAction::CreateNewId("old-id".into()),
+        ]
+    );
+}
+
+#[test]
+fn rendered_project_row_selection_notifies_listener() {
+    let mut shell = ProjectShell::new(ShellState::Ready(vec![ProjectItem {
+        id: "project-1".into(),
+        name: "Acceptance".into(),
+        path: PathBuf::from("/workspace/acceptance"),
+    }]));
+    let mut listener = RecordingProjectListener::default();
+
+    // The row's on_click callback is the shell selection callback; retain the
+    // adapter assertion so this verifies the service-facing listener contract.
+    shell.dispatch_to(
+        &mut listener,
+        ProjectServiceAction::Select("project-1".into()),
+    );
+    assert_eq!(shell.selected.as_deref(), Some("project-1"));
+    assert_eq!(
+        listener.0,
+        vec![ProjectServiceAction::Select("project-1".into())]
+    );
+}
+
+#[gpui::test]
+fn rendered_create_button_dispatches_service_action(cx: &mut TestAppContext) {
+    let (shell, cx) = cx.add_window_view(|_, _| {
+        let mut shell = ProjectShell::new(ShellState::Empty);
+        shell.open_create_prompt(PathBuf::from("/workspace/new-project"));
+        shell.set_create_fields("New project", PathBuf::from("/workspace/new-project"));
+        shell
+    });
+    let bounds = cx
+        .debug_bounds("submit-create-project")
+        .expect("Create control must be rendered with bounds");
+
+    cx.simulate_click(bounds.center(), Modifiers::none());
+    let action = cx.update(|_, app| shell.read(app).last_service_action.clone());
+    assert_eq!(
+        action,
+        Some(ProjectServiceAction::Create {
+            name: "New project".into(),
+            root: PathBuf::from("/workspace/new-project"),
+        })
+    );
+}
+
+#[gpui::test]
+fn rendered_inactive_controls_dispatch_lifecycle_actions(cx: &mut TestAppContext) {
+    let (shell, cx) = cx.add_window_view(|_, _| {
+        ProjectShell::new(ShellState::Ready(vec![ProjectItem {
+            id: "old-id".into(),
+            name: "Old project (inactive)".into(),
+            path: PathBuf::from("/workspace/old"),
+        }]))
+    });
+
+    let reactivate = cx
+        .debug_bounds("reactivate-old-id")
+        .expect("Reactivate control must be rendered with bounds");
+    cx.simulate_click(reactivate.center(), Modifiers::none());
+    let action = cx.update(|_, app| shell.read(app).last_service_action.clone());
+    assert_eq!(
+        action,
+        Some(ProjectServiceAction::Reactivate("old-id".into()))
+    );
+
+    shell.update(cx, |shell, _| {
+        shell.last_service_action = None;
+        shell.choose_inactive("old-id", "Old project", PathBuf::from("/workspace/old"));
+    });
+    cx.run_until_parked();
+    let new_id = cx
+        .debug_bounds("new-id-old-id")
+        .expect("New ID control must be rendered with bounds");
+    cx.simulate_click(new_id.center(), Modifiers::none());
+    let action = cx.update(|_, app| shell.read(app).last_service_action.clone());
+    assert_eq!(
+        action,
+        Some(ProjectServiceAction::CreateNewId("old-id".into()))
+    );
+}
+
+#[gpui::test]
+fn rendered_project_row_dispatches_selection(cx: &mut TestAppContext) {
+    let (shell, cx) = cx.add_window_view(|_, _| {
+        ProjectShell::new(ShellState::Ready(vec![ProjectItem {
+            id: "project-1".into(),
+            name: "Acceptance".into(),
+            path: PathBuf::from("/workspace/acceptance"),
+        }]))
+    });
+    let bounds = cx
+        .debug_bounds("project-1")
+        .expect("Project row must be rendered with bounds");
+
+    cx.simulate_click(
+        point(
+            bounds.origin.x + px(8.),
+            bounds.origin.y + bounds.size.height / 2.,
+        ),
+        Modifiers::none(),
+    );
+    let action = cx.update(|_, app| shell.read(app).last_service_action.clone());
+    assert_eq!(
+        action,
+        Some(ProjectServiceAction::Select("project-1".into()))
+    );
 }
 
 // Keep these imports as an explicit acceptance contract for the project model

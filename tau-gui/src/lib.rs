@@ -72,8 +72,35 @@ impl ProjectShellRoot {
             create_project_name,
             create_project_root: cwd,
         };
+        cx.observe(&root.shell, |root, shell, cx| {
+            root.sync_from_shell(shell, cx);
+        })
+        .detach();
         root.reload_projects(cx, None);
         root
+    }
+
+    fn sync_from_shell(&mut self, shell: Entity<ProjectShell>, cx: &mut GpuiContext<Self>) {
+        let shell_state = shell.read(cx);
+        let service_action = shell_state.last_service_action.clone();
+        let retry_requested = shell_state.last_action == Some(shell::ShellAction::RetryProjects);
+        let selected = shell_state.selected.clone();
+        if service_action != self.last_shell_action {
+            self.last_shell_action = service_action.clone();
+            if let Some(action) = service_action {
+                self.begin_service_action(action, cx);
+            }
+        }
+        if retry_requested && !self.retry_in_flight {
+            self.reload_projects(cx, None);
+        }
+        if !retry_requested {
+            self.retry_in_flight = false;
+        }
+        if selected != self.selected_project_id {
+            self.selected_project_id = selected.clone();
+            self.select_view_project(selected, cx);
+        }
     }
 
     fn reload_projects(&mut self, cx: &mut GpuiContext<Self>, preferred: Option<String>) {
@@ -198,9 +225,10 @@ impl ProjectShellRoot {
         let preferred = match &action {
             ProjectServiceAction::Select(id)
             | ProjectServiceAction::Update { id, .. }
-            | ProjectServiceAction::Reactivate(id)
-            | ProjectServiceAction::Unregister(id) => Some(id.clone()),
-            ProjectServiceAction::Create { .. } | ProjectServiceAction::CreateNewId(_) => None,
+            | ProjectServiceAction::Reactivate(id) => Some(id.clone()),
+            ProjectServiceAction::Unregister(_)
+            | ProjectServiceAction::Create { .. }
+            | ProjectServiceAction::CreateNewId(_) => None,
         };
         cx.spawn(async move |this, cx| {
             let result: Result<Option<String>> = async {
@@ -248,7 +276,9 @@ impl ProjectShellRoot {
                     root.reload_projects(cx, preferred);
                 }
                 Err(error) => {
+                    root.last_shell_action = None;
                     root.shell.update(cx, |shell, cx| {
+                        shell.last_service_action = None;
                         shell.set_lifecycle(shell::LifecycleStatus::Error(error.to_string()));
                         cx.notify();
                     });
@@ -265,6 +295,10 @@ impl ProjectShellRoot {
         action: ProjectServiceAction,
         cx: &mut GpuiContext<Self>,
     ) {
+        self.shell.update(cx, |shell, cx| {
+            shell.last_service_action = Some(action.clone());
+            cx.notify();
+        });
         self.begin_service_action(action, cx);
     }
 
@@ -294,26 +328,7 @@ fn project_items(projects: &[DaemonProject]) -> Vec<ProjectItem> {
 }
 
 impl Render for ProjectShellRoot {
-    fn render(&mut self, _window: &mut Window, cx: &mut GpuiContext<Self>) -> impl IntoElement {
-        let shell_action = self.shell.read(cx).last_service_action.clone();
-        if shell_action != self.last_shell_action {
-            if let Some(action) = shell_action {
-                self.begin_service_action(action, cx);
-            }
-        }
-        let retry_requested =
-            self.shell.read(cx).last_action == Some(shell::ShellAction::RetryProjects);
-        if retry_requested && !self.retry_in_flight {
-            self.reload_projects(cx, None);
-        }
-        if !retry_requested {
-            self.retry_in_flight = false;
-        }
-        let selected = self.shell.read(cx).selected.clone();
-        if selected != self.selected_project_id {
-            self.selected_project_id = selected.clone();
-            self.select_view_project(selected, cx);
-        }
+    fn render(&mut self, _window: &mut Window, _cx: &mut GpuiContext<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()

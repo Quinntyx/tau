@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
@@ -219,6 +220,22 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    /// Spawn a daemon request without flattening either transport or daemon
+    /// errors.  Callers await the returned handle in the GPUI callback style
+    /// (`await??`), so completion is always observable by the loading state.
+    fn project_request<T, F, Fut>(&self, request: F) -> tokio::task::JoinHandle<Result<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(tau_client::Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            let client = backend.typed_client().await?;
+            request(client).await
+        })
+    }
+
     fn require_project_id(project_id: &str) -> Result<()> {
         if project_id.trim().is_empty() {
             anyhow::bail!("cannot access session: select an active project first")
@@ -285,11 +302,8 @@ impl Backend {
         &self,
         include_inactive: bool,
     ) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_list(ProjectListParams {
                     include_inactive: Some(include_inactive),
                 })
@@ -302,11 +316,8 @@ impl Backend {
     }
 
     pub fn project_list_inactive(&self) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            let result = backend
-                .typed_client()
-                .await?
+        self.project_request(|client| async move {
+            let result = client
                 .project_list(ProjectListParams {
                     include_inactive: Some(true),
                 })
@@ -327,11 +338,8 @@ impl Backend {
         name: String,
         root: String,
     ) -> tokio::task::JoinHandle<Result<ProjectCreateResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_create(ProjectCreateParams { name, root })
                 .await
         })
@@ -373,11 +381,8 @@ impl Backend {
         &self,
         project_id: String,
     ) -> tokio::task::JoinHandle<Result<ProjectActionResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_reactivate(ProjectIdParams { project_id })
                 .await
         })
@@ -387,11 +392,8 @@ impl Backend {
         &self,
         project_id: String,
     ) -> tokio::task::JoinHandle<Result<ProjectNewIdResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_new_id(ProjectNewIdParams { project_id })
                 .await
         })
