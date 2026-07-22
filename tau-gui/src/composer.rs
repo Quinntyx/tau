@@ -551,6 +551,22 @@ mod tests {
     }
 
     #[test]
+    fn send_and_cancel_are_reachable_through_the_action_listener() {
+        let mut composer = Composer::new();
+        let mut listener = listener_for_ime();
+        listener.on_action(&mut composer, ComposerAction::InsertText("hello".into()));
+        assert!(composer.state().send_enabled);
+        assert_eq!(
+            composer.apply(ComposerAction::Send).as_deref(),
+            Some("hello")
+        );
+        assert!(composer.state().cancel_enabled);
+        listener.on_action(&mut composer, ComposerAction::Cancel);
+        assert!(!composer.state().disabled);
+        assert!(!composer.state().cancel_enabled);
+    }
+
+    #[test]
     fn ime_listener_is_reachable_and_commands_are_typed() {
         let mut composer = Composer::new();
         let mut listener = listener_for_ime();

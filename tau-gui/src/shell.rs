@@ -352,15 +352,21 @@ impl ProjectShell {
             ProjectState::Loading => div().child("Loading projects…").child(
                 div()
                     .id("retry-projects-loading")
+                    .cursor_pointer()
                     .child("Refresh")
-                    .on_click(cx.listener(|shell, _, _, _| shell.retry_projects())),
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.retry_projects();
+                        cx.notify();
+                    })),
             ),
             ProjectState::Empty => div().child("No projects yet").child(
                 div()
                     .id("create-project-empty")
+                    .cursor_pointer()
                     .child("Create project")
-                    .on_click(cx.listener(|shell, _, _, _| {
+                    .on_click(cx.listener(|shell, _, _, cx| {
                         shell.open_create_prompt(PathBuf::from("project"));
+                        cx.notify();
                     })),
             ),
             ProjectState::Error(message) => div()
@@ -368,8 +374,12 @@ impl ProjectShell {
                 .child(
                     div()
                         .id("retry-projects-error")
+                        .cursor_pointer()
                         .child("Retry")
-                        .on_click(cx.listener(|shell, _, _, _| shell.retry_projects())),
+                        .on_click(cx.listener(|shell, _, _, cx| {
+                            shell.retry_projects();
+                            cx.notify();
+                        })),
                 ),
             ProjectState::Ready(items) => items.iter().fold(div(), |list, project| {
                 let id = project.id.clone();
@@ -398,8 +408,9 @@ impl ProjectShell {
                         .child(
                             div()
                                 .id(SharedString::from(format!("reactivate-{id}")))
+                                .cursor_pointer()
                                 .child("Reactivate")
-                                .on_click(cx.listener(move |shell, _, _, _| {
+                                .on_click(cx.listener(move |shell, _, _, cx| {
                                     shell.choose_inactive(
                                         reactivate_id.clone(),
                                         reactivate_name.clone(),
@@ -407,13 +418,16 @@ impl ProjectShell {
                                     );
                                     let _ = shell
                                         .submit_inactive_choice(InactiveProjectChoice::Reactivate);
+                                    cx.stop_propagation();
+                                    cx.notify();
                                 })),
                         )
                         .child(
                             div()
                                 .id(SharedString::from(format!("new-id-{new_id}")))
+                                .cursor_pointer()
                                 .child("New ID")
-                                .on_click(cx.listener(move |shell, _, _, _| {
+                                .on_click(cx.listener(move |shell, _, _, cx| {
                                     shell.choose_inactive(
                                         new_id.clone(),
                                         new_name.clone(),
@@ -421,6 +435,8 @@ impl ProjectShell {
                                     );
                                     let _ = shell
                                         .submit_inactive_choice(InactiveProjectChoice::CreateNew);
+                                    cx.stop_propagation();
+                                    cx.notify();
                                 })),
                         );
                 } else {
@@ -429,27 +445,37 @@ impl ProjectShell {
                     let update_name = project.name.clone();
                     let update_path = project.path.clone();
                     row = row
+                        .cursor_pointer()
                         .child(
                             div()
                                 .id(SharedString::from(format!("update-{update_id}")))
+                                .cursor_pointer()
                                 .child("Update")
-                                .on_click(cx.listener(move |shell, _, _, _| {
+                                .on_click(cx.listener(move |shell, _, _, cx| {
                                     shell.update_project(
                                         update_id.clone(),
                                         update_name.clone(),
                                         update_path.clone(),
-                                    )
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
                                 })),
                         )
                         .child(
                             div()
                                 .id(SharedString::from(format!("unregister-{unregister_id}")))
+                                .cursor_pointer()
                                 .child("Unregister")
-                                .on_click(cx.listener(move |shell, _, _, _| {
-                                    shell.unregister_project(unregister_id.clone())
+                                .on_click(cx.listener(move |shell, _, _, cx| {
+                                    shell.unregister_project(unregister_id.clone());
+                                    cx.stop_propagation();
+                                    cx.notify();
                                 })),
                         )
-                        .on_click(cx.listener(move |shell, _, _, _| shell.select(id.clone())));
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.select(id.clone());
+                            cx.notify();
+                        }));
                 }
                 list.child(row)
             }),
@@ -467,16 +493,22 @@ impl ProjectShell {
                 .child(
                     div()
                         .id("submit-create-project")
+                        .cursor_pointer()
                         .child("Create")
-                        .on_click(cx.listener(|shell, _, _, _| {
+                        .on_click(cx.listener(|shell, _, _, cx| {
                             let _ = shell.submit_create_prompt();
+                            cx.notify();
                         })),
                 )
                 .child(
                     div()
                         .id("cancel-create-project")
+                        .cursor_pointer()
                         .child("Cancel")
-                        .on_click(cx.listener(|shell, _, _, _| shell.cancel_create_prompt())),
+                        .on_click(cx.listener(|shell, _, _, cx| {
+                            shell.cancel_create_prompt();
+                            cx.notify();
+                        })),
                 )
         });
         let container = div().flex().flex_col().gap_2().p_3().child(body);
@@ -502,18 +534,21 @@ impl Render for ProjectShell {
             .child(
                 div()
                     .id("new-project")
+                    .cursor_pointer()
                     .child("+")
                     .on_click(cx.listener(Self::new_project)),
             )
             .child(
                 div()
                     .id("settings")
+                    .cursor_pointer()
                     .child("⚙")
                     .on_click(cx.listener(Self::open_settings)),
             );
         let root = div()
-            .size_full()
+            .h_full()
             .flex()
+            .flex_none()
             .bg(rgb(0x0d1117))
             .text_color(rgb(0xd6deeb));
         let list = self.project_list(cx);
@@ -529,8 +564,9 @@ impl Render for ProjectShell {
             list
         };
         match layout {
-            ShellLayout::Full | ShellLayout::Rail => root.child(rail).child(list),
-            ShellLayout::ContentOnly => root.child(rail),
+            ShellLayout::Full => root.w(px(320.)).child(rail).child(list.flex_1().min_w_0()),
+            ShellLayout::Rail => root.w(px(52.)).child(rail),
+            ShellLayout::ContentOnly => root.w(px(0.)),
         }
     }
 }

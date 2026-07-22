@@ -36,6 +36,7 @@ pub struct OperationsModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationsDescription {
     pub branch: String,
+    pub branches: Vec<String>,
     pub changes: Vec<(String, bool, bool, bool)>,
     pub selected_path: Option<String>,
     pub acknowledgement: Option<bool>,
@@ -44,6 +45,11 @@ pub struct OperationsDescription {
 pub fn describe(model: &OperationsModel) -> OperationsDescription {
     OperationsDescription {
         branch: model.branch.clone(),
+        branches: model
+            .branches
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect(),
         changes: model
             .files
             .iter()
@@ -121,6 +127,29 @@ impl OperationsModel {
 
     pub fn acknowledge(&mut self, value: bool) {
         self.acknowledgement = Some(value);
+    }
+
+    /// Return the actions represented by the currently rendered operations
+    /// data.  Keeping this projection beside the model prevents a renderer
+    /// from displaying a control for which it cannot produce a typed action.
+    pub fn available_actions(&self) -> Vec<OperationsAction> {
+        let mut actions = vec![OperationsAction::Refresh];
+        for file in &self.files {
+            actions.push(OperationsAction::OpenFile(file.path.clone()));
+            if file.staged {
+                actions.push(OperationsAction::Unstage(file.path.clone()));
+            } else {
+                actions.push(OperationsAction::Stage(file.path.clone()));
+            }
+            actions.push(OperationsAction::RevertConfirmed(file.path.clone()));
+            actions.push(OperationsAction::Keep(file.path.clone()));
+        }
+        actions.extend(
+            self.branches
+                .iter()
+                .map(|branch| OperationsAction::SwitchBranch(branch.name.clone())),
+        );
+        actions
     }
 }
 
@@ -317,6 +346,16 @@ mod tests {
         });
         let description = describe(&model);
         assert_eq!(description.branch, "main");
+        assert!(
+            model
+                .available_actions()
+                .contains(&OperationsAction::Refresh)
+        );
+        assert!(
+            model
+                .available_actions()
+                .contains(&OperationsAction::OpenFile("tracked.txt".into()))
+        );
         assert_eq!(description.changes[0].0, "tracked.txt");
         assert_eq!(description.selected_path.as_deref(), Some("tracked.txt"));
     }

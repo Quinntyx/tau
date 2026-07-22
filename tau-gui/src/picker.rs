@@ -97,6 +97,14 @@ impl ModelPicker {
             false
         }
     }
+
+    /// Typed actions for the controls rendered for a model row.
+    pub fn row_actions(&self, model: &ModelOption) -> [PickerAction; 2] {
+        [
+            PickerAction::SelectModel(model.id.clone()),
+            PickerAction::ToggleFavorite(model.id.clone()),
+        ]
+    }
 }
 
 pub fn fuzzy_models(models: &[ModelOption], query: &str) -> Vec<ModelOption> {
@@ -188,6 +196,10 @@ impl AgentPicker {
     }
     pub fn cycle(&self, current: Option<&str>, reverse: bool) -> Option<String> {
         next_agent(&self.agents, current, reverse)
+    }
+
+    pub fn row_action(&self, agent: &AgentOption) -> PickerAction {
+        PickerAction::SelectAgent(agent.name.clone())
     }
 }
 
@@ -433,6 +445,10 @@ mod tests {
         picker.query = "a".into();
         assert_eq!(picker.selected_model().unwrap().id, "a");
         assert!(picker.toggle_favorite("a"));
+        assert_eq!(
+            picker.row_actions(&picker.models[0])[0],
+            PickerAction::SelectModel("a".into())
+        );
         assert!(picker.mark_recent("a"));
         assert_eq!(move_selection(0, 2, -1), 1);
         assert_eq!(
