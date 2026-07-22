@@ -41,6 +41,7 @@ pub enum Provider {
     XiaomiMimo(openai::completion::GenericCompletionModel<xiaomimimo::XiaomiMimoExt>),
     ZAI(openai::completion::GenericCompletionModel<zai::ZAiExt>),
     Mock(rig_core::test_utils::MockCompletionModel),
+    Test(super::test::TestProvider),
 }
 
 /// Build a provider client (with optional base URL override), then create a
@@ -125,6 +126,7 @@ impl Provider {
             "xai" => make!(xai, XAI, model_id, api_key, api_base),
             "xiaomimimo" => make!(xiaomimimo, XiaomiMimo, model_id, api_key, api_base),
             "zai" => make!(zai, ZAI, model_id, api_key, api_base),
+            "test" => Ok(Self::Test(super::test::TestProvider::from_env()?)),
             other => anyhow::bail!("unknown provider: {other}"),
         }
     }
@@ -163,6 +165,17 @@ impl Provider {
             Self::XiaomiMimo(m) => super::ops::stream_with_model(m, request).await,
             Self::ZAI(m) => super::ops::stream_with_model(m, request).await,
             Self::Mock(m) => super::ops::stream_with_model(m, request).await,
+            Self::Test(provider) => provider.stream(request).await,
+        }
+    }
+
+    pub fn test_tool_registry(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Result<Option<crate::tools::ToolRegistry>> {
+        match self {
+            Self::Test(provider) => provider.tool_registry(workspace).map(Some),
+            _ => Ok(None),
         }
     }
 }

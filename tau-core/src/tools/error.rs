@@ -53,6 +53,8 @@ pub enum ToolError {
     CommandTimeout(u64),
     #[error("snapshot failed: {0}")]
     Snapshot(String),
+    #[error("integration tool failed: {0}")]
+    Integration(String),
 }
 
 pub(crate) fn io(

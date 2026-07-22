@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
@@ -34,9 +35,23 @@ pub struct Backend {
     active: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     active_turn: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
     response_context: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
-    _daemon: Arc<Mutex<Option<Child>>>,
+    _daemon: Arc<DaemonLifetime>,
     auto_started: bool,
     status: Arc<Mutex<DaemonStatus>>,
+}
+
+/// Keeps an auto-started daemon alive until the last GUI backend goes away.
+/// The wrapper's `Drop` runs only when the final `Arc` reference is dropped.
+struct DaemonLifetime(Mutex<Option<Child>>);
+
+impl Drop for DaemonLifetime {
+    fn drop(&mut self) {
+        if let Ok(daemon) = self.0.get_mut() {
+            if let Some(mut child) = daemon.take() {
+                stop_child(&mut child);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,17 +223,23 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-impl Drop for Backend {
-    fn drop(&mut self) {
-        if let Ok(mut daemon) = self._daemon.lock() {
-            if let Some(mut child) = daemon.take() {
-                stop_child(&mut child);
-            }
-        }
-    }
-}
-
 impl Backend {
+    /// Spawn a daemon request without flattening either transport or daemon
+    /// errors.  Callers await the returned handle in the GPUI callback style
+    /// (`await??`), so completion is always observable by the loading state.
+    fn project_request<T, F, Fut>(&self, request: F) -> tokio::task::JoinHandle<Result<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(tau_client::Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            let client = backend.typed_client().await?;
+            request(client).await
+        })
+    }
+
     fn require_project_id(project_id: &str) -> Result<()> {
         if project_id.trim().is_empty() {
             anyhow::bail!("cannot access session: select an active project first")
@@ -285,11 +306,8 @@ impl Backend {
         &self,
         include_inactive: bool,
     ) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_list(ProjectListParams {
                     include_inactive: Some(include_inactive),
                 })
@@ -302,11 +320,8 @@ impl Backend {
     }
 
     pub fn project_list_inactive(&self) -> tokio::task::JoinHandle<Result<ProjectListResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            let result = backend
-                .typed_client()
-                .await?
+        self.project_request(|client| async move {
+            let result = client
                 .project_list(ProjectListParams {
                     include_inactive: Some(true),
                 })
@@ -327,11 +342,8 @@ impl Backend {
         name: String,
         root: String,
     ) -> tokio::task::JoinHandle<Result<ProjectCreateResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_create(ProjectCreateParams { name, root })
                 .await
         })
@@ -373,11 +385,8 @@ impl Backend {
         &self,
         project_id: String,
     ) -> tokio::task::JoinHandle<Result<ProjectActionResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_reactivate(ProjectIdParams { project_id })
                 .await
         })
@@ -387,11 +396,8 @@ impl Backend {
         &self,
         project_id: String,
     ) -> tokio::task::JoinHandle<Result<ProjectNewIdResult>> {
-        let backend = self.clone();
-        self.runtime.spawn(async move {
-            backend
-                .typed_client()
-                .await?
+        self.project_request(move |client| async move {
+            client
                 .project_new_id(ProjectNewIdParams { project_id })
                 .await
         })
@@ -728,7 +734,7 @@ impl Backend {
             active: Arc::new(Mutex::new(None)),
             active_turn: Arc::new(Mutex::new(None)),
             response_context: Arc::new(Mutex::new(None)),
-            _daemon: Arc::new(Mutex::new(daemon)),
+            _daemon: Arc::new(DaemonLifetime(Mutex::new(daemon))),
             auto_started,
             status: Arc::new(Mutex::new(initial_status)),
         }
@@ -843,7 +849,7 @@ impl Backend {
             let _ = preferences.save_to(&path);
         }
         if matches!(action, DaemonAction::Disown | DaemonAction::AlwaysDisown) {
-            if let Ok(mut daemon) = self._daemon.lock() {
+            if let Ok(mut daemon) = self._daemon.0.lock() {
                 daemon.take();
             }
         }
@@ -858,7 +864,7 @@ impl Backend {
                 .ok();
         }
         if matches!(action, DaemonAction::Restart) {
-            if let Ok(mut daemon) = self._daemon.lock() {
+            if let Ok(mut daemon) = self._daemon.0.lock() {
                 if let Some(mut child) = daemon.take() {
                     stop_child(&mut child);
                 }
@@ -1255,13 +1261,13 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
 
 async fn connect_or_start(
     socket: &PathBuf,
-    owned_daemon: &Arc<Mutex<Option<Child>>>,
+    owned_daemon: &Arc<DaemonLifetime>,
 ) -> Result<tau_client::Client> {
     match tau_client::Client::connect(socket).await {
         Ok(client) => Ok(client),
         Err(connect_error) => match ensure_daemon(socket).await? {
             Some(child) => {
-                if let Ok(mut daemon) = owned_daemon.lock() {
+                if let Ok(mut daemon) = owned_daemon.0.lock() {
                     *daemon = Some(child);
                 }
                 tau_client::Client::connect(socket)

@@ -7,9 +7,11 @@
 
 mod kind;
 mod ops;
+mod test;
 
 pub use kind::Provider;
 pub use ops::{completion_request, stream_with_model};
+pub use test::{ENABLE_ENV as TEST_PROVIDER_ENABLE_ENV, FIXTURE_ENV as TEST_PROVIDER_FIXTURE_ENV};
 
 use std::pin::Pin;
 
