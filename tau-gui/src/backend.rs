@@ -34,9 +34,23 @@ pub struct Backend {
     active: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     active_turn: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
     response_context: Arc<Mutex<Option<(tau_client::Client, String, String)>>>,
-    _daemon: Arc<Mutex<Option<Child>>>,
+    _daemon: Arc<DaemonLifetime>,
     auto_started: bool,
     status: Arc<Mutex<DaemonStatus>>,
+}
+
+/// Keeps an auto-started daemon alive until the last GUI backend goes away.
+/// The wrapper's `Drop` runs only when the final `Arc` reference is dropped.
+struct DaemonLifetime(Mutex<Option<Child>>);
+
+impl Drop for DaemonLifetime {
+    fn drop(&mut self) {
+        if let Ok(daemon) = self.0.get_mut() {
+            if let Some(mut child) = daemon.take() {
+                stop_child(&mut child);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,16 +220,6 @@ fn stop_child(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
-}
-
-impl Drop for Backend {
-    fn drop(&mut self) {
-        if let Ok(mut daemon) = self._daemon.lock() {
-            if let Some(mut child) = daemon.take() {
-                stop_child(&mut child);
-            }
-        }
-    }
 }
 
 impl Backend {
@@ -728,7 +732,7 @@ impl Backend {
             active: Arc::new(Mutex::new(None)),
             active_turn: Arc::new(Mutex::new(None)),
             response_context: Arc::new(Mutex::new(None)),
-            _daemon: Arc::new(Mutex::new(daemon)),
+            _daemon: Arc::new(DaemonLifetime(Mutex::new(daemon))),
             auto_started,
             status: Arc::new(Mutex::new(initial_status)),
         }
@@ -843,7 +847,7 @@ impl Backend {
             let _ = preferences.save_to(&path);
         }
         if matches!(action, DaemonAction::Disown | DaemonAction::AlwaysDisown) {
-            if let Ok(mut daemon) = self._daemon.lock() {
+            if let Ok(mut daemon) = self._daemon.0.lock() {
                 daemon.take();
             }
         }
@@ -858,7 +862,7 @@ impl Backend {
                 .ok();
         }
         if matches!(action, DaemonAction::Restart) {
-            if let Ok(mut daemon) = self._daemon.lock() {
+            if let Ok(mut daemon) = self._daemon.0.lock() {
                 if let Some(mut child) = daemon.take() {
                     stop_child(&mut child);
                 }
@@ -1255,13 +1259,13 @@ async fn ensure_daemon(socket: &PathBuf) -> Result<Option<Child>> {
 
 async fn connect_or_start(
     socket: &PathBuf,
-    owned_daemon: &Arc<Mutex<Option<Child>>>,
+    owned_daemon: &Arc<DaemonLifetime>,
 ) -> Result<tau_client::Client> {
     match tau_client::Client::connect(socket).await {
         Ok(client) => Ok(client),
         Err(connect_error) => match ensure_daemon(socket).await? {
             Some(child) => {
-                if let Ok(mut daemon) = owned_daemon.lock() {
+                if let Ok(mut daemon) = owned_daemon.0.lock() {
                     *daemon = Some(child);
                 }
                 tau_client::Client::connect(socket)
