@@ -3496,20 +3496,26 @@ impl Render for TauView {
         root = root.on_action(cx.listener(Self::operations_acknowledge_action));
         root = root.on_action(cx.listener(Self::operations_create_action));
         root = root.on_action(cx.listener(Self::operations_switch_action));
-        root.child(header)
-            .when(self.sessions_open, |root| {
-                root.child(self.session_panel(cx))
-            })
+        let center_column = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .child(header)
+            .when(self.sessions_open, |col| col.child(self.session_panel(cx)))
             .children(runtime_banner_view)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(transcript)
-                    .when(self.sidebar_visible, |view| view.child(sidebar)),
-            )
-            .child(footer)
+            .child(transcript)
+            .child(footer);
+
+        let main_body = div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.))
+            .child(center_column)
+            .when(self.sidebar_visible, |view| view.child(sidebar));
+
+        root.child(main_body)
             .when(self.toast_visible, |root| {
                 root.child(
                     deferred(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
