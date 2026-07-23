@@ -31,18 +31,16 @@ impl OAuthManager {
 
     pub(crate) async fn status(&self) -> AuthStatusResult {
         let mut inner = self.inner.lock().await;
-        if !matches!(inner.status, AuthState::Pending { .. }) {
-            inner.status = persisted_status();
+        let current_persisted = persisted_status();
+        if matches!(current_persisted, AuthState::SignedIn { .. })
+            || !matches!(inner.status, AuthState::Pending { .. })
+        {
+            inner.status = current_persisted;
         }
         auth_result(inner.status.clone())
     }
 
     pub(crate) async fn begin(&self) -> Result<AuthBeginResult> {
-        let store = CredentialStore::new()?;
-        let _ = store
-            .get_secure(OPENAI_CODEX_PROVIDER)
-            .context("Codex OAuth requires an available operating-system keyring")?;
-
         self.cancel().await;
         let listener = TcpListener::bind(("127.0.0.1", codex::CALLBACK_PORT))
             .await

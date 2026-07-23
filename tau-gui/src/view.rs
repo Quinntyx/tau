@@ -2246,9 +2246,17 @@ impl TauView {
         let backend = self.backend.clone();
         let task = cx.spawn(async move |view, cx| match request.await {
             Ok(Ok(result)) => {
+                let url_to_open = if let AuthState::Pending { ref authorize_url } = result.status {
+                    Some(authorize_url.clone())
+                } else {
+                    None
+                };
                 let _ = view.update(cx, |view, cx| {
                     view.auth_status = result.status;
                     view.auth_loading = false;
+                    if let Some(url) = url_to_open {
+                        cx.open_url(&url);
+                    }
                     cx.notify();
                 });
                 let wait = backend.auth_wait();

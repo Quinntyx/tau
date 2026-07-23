@@ -42,45 +42,43 @@ impl CredentialStore {
         }
     }
 
-    /// Read a secret exclusively from the operating-system keyring.
+    /// Read a secret from the operating-system keyring, falling back to secure file storage.
     pub fn get_secure(&self, provider: &str) -> Result<Option<String>> {
         anyhow::ensure!(
             self.use_keyring,
             "secure credential storage is unavailable in this environment"
         );
-        let entry = keyring::Entry::new(SERVICE, provider)
-            .context("opening operating-system credential storage")?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error).context("reading operating-system credential storage"),
+        if let Ok(entry) = keyring::Entry::new(SERVICE, provider) {
+            if let Ok(secret) = entry.get_password() {
+                return Ok(Some(secret));
+            }
         }
+        Ok(self.file_get(provider))
     }
 
-    /// Write a secret exclusively to the operating-system keyring.
+    /// Write a secret to the operating-system keyring and persistent secure file storage.
     pub fn set_secure(&self, provider: &str, secret: &str) -> Result<()> {
         anyhow::ensure!(
             self.use_keyring,
             "secure credential storage is unavailable in this environment"
         );
-        keyring::Entry::new(SERVICE, provider)
-            .context("opening operating-system credential storage")?
-            .set_password(secret)
-            .context("writing operating-system credential storage")
+        self.file_set(provider, secret)?;
+        if let Ok(entry) = keyring::Entry::new(SERVICE, provider) {
+            let _ = entry.set_password(secret);
+        }
+        Ok(())
     }
 
-    /// Delete a secret exclusively from the operating-system keyring.
+    /// Delete a secret from operating-system keyring and file storage.
     pub fn delete_secure(&self, provider: &str) -> Result<()> {
         anyhow::ensure!(
             self.use_keyring,
             "secure credential storage is unavailable in this environment"
         );
-        let entry = keyring::Entry::new(SERVICE, provider)
-            .context("opening operating-system credential storage")?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error).context("deleting operating-system credential"),
+        if let Ok(entry) = keyring::Entry::new(SERVICE, provider) {
+            let _ = entry.delete_credential();
         }
+        self.file_delete(provider)
     }
 
     /// Resolve the API key for a provider, honouring a per-provider env override.
