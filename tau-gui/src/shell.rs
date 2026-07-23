@@ -10,8 +10,9 @@ use gpui::{
 };
 
 use crate::projects::ProjectAction;
+use crate::theme::Theme;
 
-gpui::actions!(project_shell, [ToggleProjects, NewProject, OpenSettings]);
+gpui::actions!(project_shell, [ToggleProjects, NewProject]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectItem {
@@ -59,7 +60,6 @@ pub enum ShellAction {
     ToggleProjects,
     NewProject,
     RetryProjects,
-    OpenSettings,
     SelectProject(String),
 }
 
@@ -327,11 +327,6 @@ impl ProjectShell {
         cx.notify();
     }
 
-    fn open_settings(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.last_action = Some(ShellAction::OpenSettings);
-        cx.notify();
-    }
-
     pub fn describe(&self, width: f32) -> ShellDescription {
         let (state, count) = match &self.projects {
             ProjectState::Loading => ("loading", 0),
@@ -347,7 +342,7 @@ impl ProjectShell {
         }
     }
 
-    fn project_list(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn project_list(&self, cx: &mut Context<Self>, theme: Theme) -> gpui::Div {
         let body = match &self.projects {
             ProjectState::Loading => div().child("Loading projects…").child(
                 div()
@@ -355,8 +350,8 @@ impl ProjectShell {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x26354a))
-                    .text_color(rgb(0xd6deeb))
+                    .bg(theme.elevated)
+                    .text_color(theme.text)
                     .cursor_pointer()
                     .child("Refresh")
                     .on_click(cx.listener(|shell, _, _, cx| {
@@ -370,8 +365,8 @@ impl ProjectShell {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x26354a))
-                    .text_color(rgb(0xd6deeb))
+                    .bg(theme.elevated)
+                    .text_color(theme.text)
                     .cursor_pointer()
                     .child("Create project")
                     .on_click(cx.listener(|shell, _, _, cx| {
@@ -387,8 +382,8 @@ impl ProjectShell {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x26354a))
-                        .text_color(rgb(0xd6deeb))
+                        .bg(theme.elevated)
+                        .text_color(theme.text)
                         .cursor_pointer()
                         .child("Retry")
                         .on_click(cx.listener(|shell, _, _, cx| {
@@ -411,9 +406,9 @@ impl ProjectShell {
                     .rounded_md()
                     .cursor_pointer()
                     .bg(if selected {
-                        rgb(0x26354a)
+                        theme.selection
                     } else {
-                        rgb(0x151a21)
+                        theme.sidebar
                     })
                     .child(div().flex_1().child(project.name.clone()));
                 if inactive {
@@ -432,8 +427,8 @@ impl ProjectShell {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x314d3c))
-                                .text_color(rgb(0xd6deeb))
+                                .bg(theme.success_surface)
+                                .text_color(theme.success_text)
                                 .cursor_pointer()
                                 .child("Reactivate")
                                 .on_click(cx.listener(move |shell, _, _, cx| {
@@ -455,8 +450,8 @@ impl ProjectShell {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x26354a))
-                                .text_color(rgb(0xd6deeb))
+                                .bg(theme.elevated)
+                                .text_color(theme.text)
                                 .cursor_pointer()
                                 .child("New ID")
                                 .on_click(cx.listener(move |shell, _, _, cx| {
@@ -484,8 +479,8 @@ impl ProjectShell {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x26354a))
-                                .text_color(rgb(0xd6deeb))
+                                .bg(theme.elevated)
+                                .text_color(theme.text)
                                 .cursor_pointer()
                                 .child("Update")
                                 .on_click(cx.listener(move |shell, _, _, cx| {
@@ -504,8 +499,8 @@ impl ProjectShell {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x4a2930))
-                                .text_color(rgb(0xd6deeb))
+                                .bg(theme.error_surface)
+                                .text_color(theme.error_text)
                                 .cursor_pointer()
                                 .child("Unregister")
                                 .on_click(cx.listener(move |shell, _, _, cx| {
@@ -532,19 +527,19 @@ impl ProjectShell {
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0xd6deeb))
+                        .text_color(theme.text)
                         .child("Create project"),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0x8994a8))
+                        .text_color(theme.secondary_text)
                         .child(format!("Name: {}", prompt.name)),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0x8994a8))
+                        .text_color(theme.secondary_text)
                         .child(format!("Path: {}", prompt.root.display())),
                 )
                 .child(
@@ -554,8 +549,8 @@ impl ProjectShell {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x314d3c))
-                        .text_color(rgb(0xd6deeb))
+                        .bg(theme.accent)
+                        .text_color(rgb(0xffffff))
                         .cursor_pointer()
                         .child("Create")
                         .on_click(cx.listener(|shell, _, _, cx| {
@@ -570,8 +565,8 @@ impl ProjectShell {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x26354a))
-                        .text_color(rgb(0xd6deeb))
+                        .bg(theme.elevated)
+                        .text_color(theme.text)
                         .cursor_pointer()
                         .child("Cancel")
                         .on_click(cx.listener(|shell, _, _, cx| {
@@ -592,6 +587,7 @@ impl ProjectShell {
 impl Render for ProjectShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout = layout_for_width(f32::from(window.viewport_size().width));
+        let theme = Theme::for_appearance(window.appearance());
         let rail = div()
             .w(px(52.))
             .flex()
@@ -599,28 +595,40 @@ impl Render for ProjectShell {
             .items_center()
             .gap_3()
             .p_2()
-            .child("τ")
+            .bg(theme.toolbar)
             .child(
                 div()
-                    .id("new-project")
-                    .cursor_pointer()
-                    .child("+")
-                    .on_click(cx.listener(Self::new_project)),
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_lg()
+                    .bg(theme.accent)
+                    .text_color(rgb(0xffffff))
+                    .child("T"),
             )
             .child(
                 div()
-                    .id("settings")
+                    .id("new-project")
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_lg()
+                    .bg(theme.elevated)
                     .cursor_pointer()
-                    .child("⚙")
-                    .on_click(cx.listener(Self::open_settings)),
+                    .child("+")
+                    .on_click(cx.listener(Self::new_project)),
             );
         let root = div()
             .h_full()
             .flex()
             .flex_none()
-            .bg(rgb(0x0d1117))
-            .text_color(rgb(0xd6deeb));
-        let list = self.project_list(cx);
+            .border_r_1()
+            .border_color(theme.separator)
+            .bg(theme.sidebar)
+            .text_color(theme.text);
+        let list = self.project_list(cx, theme);
         let status = match &self.lifecycle {
             LifecycleStatus::Idle => None,
             LifecycleStatus::Loading => Some("Working…".to_string()),

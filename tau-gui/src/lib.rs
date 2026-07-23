@@ -11,6 +11,7 @@ pub mod preferences;
 pub mod projects;
 pub mod sessions;
 pub mod shell;
+pub mod theme;
 pub mod view;
 
 use std::path::PathBuf;

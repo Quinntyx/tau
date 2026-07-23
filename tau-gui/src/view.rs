@@ -1,11 +1,13 @@
 use gpui::{
-    App, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render, ScrollHandle,
-    StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb,
+    App, ClipboardItem, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render,
+    ScrollHandle, StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb, rgba,
 };
 use std::path::PathBuf;
 use tau_client::ProjectId;
 use tau_client::TurnStreamEvent;
-use tau_proto::prelude::{ClientResponse, QuestionAnswer, TurnPermissionChoice};
+use tau_proto::prelude::{
+    AuthState, ClientResponse, OPENAI_CODEX_PROVIDER, QuestionAnswer, TurnPermissionChoice,
+};
 
 use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
@@ -20,6 +22,7 @@ use crate::picker::{
 use crate::sessions::{
     Navigator, ProjectId as NavigatorProjectId, SessionSummary as NavigatorSession,
 };
+use crate::theme::Theme;
 
 gpui::actions!(
     tau_view,
@@ -278,7 +281,7 @@ pub fn describe_chat(chat: &ChatState, agent: &str, model: &str, cwd: &str) -> T
     TauViewDescription {
         transcript,
         status,
-        loading: chat.loading || chat.active_assistant.is_some(),
+        loading: chat.loading || chat.is_streaming(),
         sidebar: vec![
             (
                 "AGENT".into(),
@@ -393,6 +396,18 @@ fn card_description(card: &Card) -> (String, String) {
                 answer.as_deref().unwrap_or("awaiting answer")
             ),
         ),
+        Card::Error {
+            summary,
+            details,
+            expanded,
+        } => (
+            "error".into(),
+            if *expanded {
+                format!("{summary}\n{details}")
+            } else {
+                summary.clone()
+            },
+        ),
     }
 }
 
@@ -446,6 +461,11 @@ pub struct TauView {
     operations_loading: bool,
     operations_error: Option<String>,
     operations_tab: OperationsTab,
+    account_sheet: bool,
+    auth_status: AuthState,
+    auth_loading: bool,
+    auth_error: Option<String>,
+    theme: Theme,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,6 +496,10 @@ impl TauView {
         // retain the configured backend model and every configured preference
         // entry so a recent/favorite flag cannot hide otherwise valid models.
         let mut models = vec![backend.model().to_owned()];
+        let codex_model = format!("{OPENAI_CODEX_PROVIDER}/gpt-5.4");
+        if !models.iter().any(|candidate| candidate == &codex_model) {
+            models.push(codex_model);
+        }
         for model in preferences
             .favorites
             .iter()
@@ -510,7 +534,7 @@ impl TauView {
             input.set_model(initial_model);
             input.set_agent(agent.clone());
         });
-        Self {
+        let mut view = Self {
             input,
             picker_input,
             backend,
@@ -543,7 +567,14 @@ impl TauView {
             operations_loading: false,
             operations_error: None,
             operations_tab: OperationsTab::Status,
-        }
+            account_sheet: false,
+            auth_status: AuthState::SignedOut,
+            auth_loading: false,
+            auth_error: None,
+            theme: Theme::default(),
+        };
+        view.refresh_auth(cx);
+        view
     }
 
     /// Set the active project selected by the project navigator.  Turns are
@@ -579,9 +610,7 @@ impl TauView {
     }
 
     fn operation_project(&self) -> Option<String> {
-        self.selected_project_root
-            .as_ref()
-            .map(|root| root.to_string_lossy().into_owned())
+        self.selected_project_id.clone()
     }
 
     fn operation_project_or_error(&mut self, cx: &mut Context<Self>) -> Option<String> {
@@ -594,10 +623,10 @@ impl TauView {
         project
     }
 
-    fn project_is_current(&self, generation: u64, project_id: &str, root: &str) -> bool {
+    fn project_is_current(&self, generation: u64, project_id: &str, wire_project_id: &str) -> bool {
         self.project_generation == generation
             && self.selected_project_id.as_deref() == Some(project_id)
-            && self.operation_project().as_deref() == Some(root)
+            && self.operation_project().as_deref() == Some(wire_project_id)
     }
 
     fn refresh_operations(&mut self, cx: &mut Context<Self>) {
@@ -1047,14 +1076,16 @@ impl TauView {
             OperationsTab::Changes => "Changes",
         };
         let mut panel = div()
-            .w(px(340.))
+            .w_full()
             .flex()
             .flex_col()
             .gap_2()
-            .p_4()
-            .border_l_1()
-            .border_color(rgb(0x2c3340))
-            .child(div().text_lg().child("Status / Git / Changes"))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Repository"),
+            )
             .child(
                 div()
                     .text_xs()
@@ -1194,6 +1225,167 @@ impl TauView {
             panel = panel.child(details);
         }
         panel
+    }
+
+    fn account_sheet(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = div()
+            .w(px(520.))
+            .max_w_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_6()
+            .rounded_xl()
+            .border_1()
+            .border_color(self.theme.separator)
+            .bg(self.theme.elevated)
+            .text_color(self.theme.text)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xl().child("ChatGPT account"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(self.theme.secondary_text)
+                                    .child("Use your Plus or Pro subscription with Codex."),
+                            ),
+                    )
+                    .child(mac_button(
+                        "Close",
+                        "account-close",
+                        false,
+                        self.theme,
+                        cx.listener(Self::close_account),
+                    )),
+            )
+            .when_some(self.auth_error.clone(), |view, error| {
+                view.child(
+                    div()
+                        .p_3()
+                        .rounded_md()
+                        .bg(self.theme.error_surface)
+                        .text_color(self.theme.error_text)
+                        .child(error),
+                )
+            });
+        let content = match &self.auth_status {
+            AuthState::SignedOut => content
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(self.theme.secondary_text)
+                        .child("Tau will open a secure browser authorization page. Your password is never visible to Tau."),
+                )
+                .child(mac_button(
+                    if self.auth_loading { "Connecting..." } else { "Connect ChatGPT" },
+                    "account-connect",
+                    true,
+                    self.theme,
+                    cx.listener(Self::begin_auth),
+                )),
+            AuthState::Pending { authorize_url } => content
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_sm().child("Authorization is waiting in your browser."))
+                        .child(
+                            div()
+                                .p_3()
+                                .rounded_md()
+                                .bg(self.theme.canvas)
+                                .text_xs()
+                                .text_color(self.theme.accent)
+                                .child(authorize_url.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(mac_button(
+                            "Open Browser",
+                            "account-open-browser",
+                            true,
+                            self.theme,
+                            cx.listener(Self::open_auth_url),
+                        ))
+                        .child(mac_button(
+                            "Copy Link",
+                            "account-copy-link",
+                            false,
+                            self.theme,
+                            cx.listener(Self::copy_auth_url),
+                        ))
+                        .child(mac_button(
+                            "Cancel",
+                            "account-cancel",
+                            false,
+                            self.theme,
+                            cx.listener(Self::cancel_auth),
+                        )),
+                ),
+            AuthState::SignedIn { email, account_id } => content
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_3()
+                        .rounded_md()
+                        .bg(self.theme.success_surface)
+                        .text_color(self.theme.success_text)
+                        .child("Connected")
+                        .children(email.iter().cloned().map(|value| div().text_sm().child(value)))
+                        .children(account_id.iter().cloned().map(|value| {
+                            div()
+                                .text_xs()
+                                .text_color(self.theme.secondary_text)
+                                .child(value)
+                        })),
+                )
+                .child(testable_button(
+                    "Sign Out",
+                    0x8b3038,
+                    "account-logout",
+                    cx.listener(Self::logout_auth),
+                )),
+            AuthState::Failed { message } => content
+                .child(
+                    div()
+                        .p_3()
+                        .rounded_md()
+                        .bg(self.theme.error_surface)
+                        .text_color(self.theme.error_text)
+                        .child(message.clone()),
+                )
+                .child(mac_button(
+                    "Try Again",
+                    "account-retry",
+                    true,
+                    self.theme,
+                    cx.listener(Self::begin_auth),
+                )),
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .bg(rgba(0x00000099))
+            .child(content)
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -1751,6 +1943,27 @@ impl TauView {
         cx.notify();
     }
 
+    fn toggle_error(
+        &mut self,
+        index: usize,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Card::Error { expanded, .. }) = self.chat.cards.get_mut(index) {
+            *expanded = !*expanded;
+            cx.notify();
+        }
+    }
+
+    fn retry_last_prompt(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.chat.raw_input.clone() else {
+            return;
+        };
+        self.input.update(cx, |input, _| input.set_content(prompt));
+        self.send(window, cx);
+    }
+
     fn card_index_for_request(
         &self,
         request_id: &str,
@@ -1941,8 +2154,150 @@ impl TauView {
         cx.notify();
     }
 
+    fn selected_model(&self) -> &str {
+        self.models
+            .get(self.model_index)
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
+    fn codex_selected(&self) -> bool {
+        self.selected_model()
+            .starts_with(&format!("{OPENAI_CODEX_PROVIDER}/"))
+    }
+
+    fn refresh_auth(&mut self, cx: &mut Context<Self>) {
+        self.auth_loading = true;
+        self.auth_error = None;
+        let request = self.backend.auth_status();
+        let task = cx.spawn(async move |view, cx| {
+            let result = request.await;
+            let _ = view.update(cx, |view, cx| {
+                view.auth_loading = false;
+                match result {
+                    Ok(Ok(result)) => view.auth_status = result.status,
+                    Ok(Err(error)) => view.auth_error = Some(error.to_string()),
+                    Err(error) => view.auth_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        });
+        self.ack_tasks.push(task);
+    }
+
+    fn open_account(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.account_sheet = true;
+        self.refresh_auth(cx);
+        cx.notify();
+    }
+
+    fn close_account(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.account_sheet = false;
+        cx.notify();
+    }
+
+    fn begin_auth(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.auth_loading = true;
+        self.auth_error = None;
+        let request = self.backend.auth_begin();
+        let backend = self.backend.clone();
+        let task = cx.spawn(async move |view, cx| match request.await {
+            Ok(Ok(result)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.auth_status = result.status;
+                    view.auth_loading = false;
+                    cx.notify();
+                });
+                let wait = backend.auth_wait();
+                let completed = wait.await;
+                let _ = view.update(cx, |view, cx| {
+                    match completed {
+                        Ok(Ok(result)) => {
+                            let signed_in = matches!(result.status, AuthState::SignedIn { .. });
+                            view.auth_status = result.status;
+                            view.auth_error = None;
+                            if signed_in {
+                                view.runtime = RuntimeState::NotNegotiated;
+                            }
+                        }
+                        Ok(Err(error)) => view.auth_error = Some(error.to_string()),
+                        Err(error) => view.auth_error = Some(error.to_string()),
+                    }
+                    view.auth_loading = false;
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.auth_loading = false;
+                    view.auth_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.auth_loading = false;
+                    view.auth_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        });
+        self.ack_tasks.push(task);
+        cx.notify();
+    }
+
+    fn open_auth_url(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let AuthState::Pending { authorize_url } = &self.auth_status {
+            cx.open_url(authorize_url);
+        }
+    }
+
+    fn copy_auth_url(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let AuthState::Pending { authorize_url } = &self.auth_status {
+            cx.write_to_clipboard(ClipboardItem::new_string(authorize_url.clone()));
+        }
+    }
+
+    fn cancel_auth(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let request = self.backend.auth_cancel();
+        self.auth_loading = true;
+        let task = cx.spawn(async move |view, cx| {
+            let result = request.await;
+            let _ = view.update(cx, |view, cx| {
+                view.auth_loading = false;
+                match result {
+                    Ok(Ok(result)) => view.auth_status = result.status,
+                    Ok(Err(error)) => view.auth_error = Some(error.to_string()),
+                    Err(error) => view.auth_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        });
+        self.ack_tasks.push(task);
+        cx.notify();
+    }
+
+    fn logout_auth(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let request = self.backend.auth_logout();
+        self.auth_loading = true;
+        let task = cx.spawn(async move |view, cx| {
+            let result = request.await;
+            let _ = view.update(cx, |view, cx| {
+                view.auth_loading = false;
+                match result {
+                    Ok(Ok(result)) => view.auth_status = result.status,
+                    Ok(Err(error)) => view.auth_error = Some(error.to_string()),
+                    Err(error) => view.auth_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        });
+        self.ack_tasks.push(task);
+        cx.notify();
+    }
+
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.chat.active_assistant.is_some() {
+        if self.chat.is_streaming() {
             return;
         }
         let prompt = self.input.read(cx).content();
@@ -1951,6 +2306,24 @@ impl TauView {
         }
         if self.selected_project_id.is_none() {
             self.runtime = RuntimeState::Failed("select a project before sending".into());
+            cx.notify();
+            return;
+        }
+        if matches!(
+            self.backend.daemon_status(),
+            DaemonStatus::Incompatible | DaemonStatus::Failed
+        ) {
+            self.runtime = RuntimeState::Failed(
+                "Tau cannot send until the daemon connection is repaired. Restart an external daemon, then choose Retry.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        if self.codex_selected() && !matches!(self.auth_status, AuthState::SignedIn { .. }) {
+            self.account_sheet = true;
+            self.runtime = RuntimeState::Failed(
+                "Connect a ChatGPT Plus or Pro account before using the Codex model.".into(),
+            );
             cx.notify();
             return;
         }
@@ -2190,20 +2563,21 @@ impl TauView {
     fn apply_event(&mut self, event: Result<TurnStreamEvent, String>, cx: &mut Context<Self>) {
         match event {
             Ok(TurnStreamEvent::Event(event)) => {
-                self.runtime = RuntimeState::Ready;
                 self.chat.reduce(ChatAction::SessionEvent(event));
+                self.runtime = match &self.chat.status {
+                    ChatStatus::Failed(error) => RuntimeState::Failed(error.clone()),
+                    _ => RuntimeState::Ready,
+                };
                 if let Some(session_id) = self.chat.session_id.clone() {
-                    let project_id = self.backend.cwd().to_owned();
-                    self.input.update(cx, |input, _| {
-                        input.set_ids(session_id, project_id);
-                    });
+                    if let Some(project_id) = self.selected_project_id.clone() {
+                        self.input.update(cx, |input, _| {
+                            input.set_ids(session_id, project_id);
+                        });
+                    }
                 }
                 cx.notify();
             }
             Ok(TurnStreamEvent::Complete(_)) => {
-                self.runtime = RuntimeState::Ready;
-                self.chat.active_assistant = None;
-                self.chat.status = ChatStatus::Ready;
                 self.input.update(cx, |input, _| input.set_disabled(false));
                 cx.notify();
             }
@@ -2224,12 +2598,20 @@ impl Focusable for TauView {
 }
 
 impl Render for TauView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.theme = Theme::for_appearance(window.appearance());
         let current_model = self
             .models
             .get(self.model_index)
             .map(String::as_str)
             .unwrap_or(self.backend.model());
+        let send_blocked = self.chat.is_streaming()
+            || matches!(
+                self.backend.daemon_status(),
+                DaemonStatus::Incompatible | DaemonStatus::Failed
+            )
+            || (current_model.starts_with(&format!("{OPENAI_CODEX_PROVIDER}/"))
+                && !matches!(self.auth_status, AuthState::SignedIn { .. }));
         let description = describe_chat(&self.chat, &self.agent, current_model, self.backend.cwd());
         let typed_feed = feed::FeedProjection::from_events(&self.chat.events);
         if self.follow_output {
@@ -2239,57 +2621,63 @@ impl Render for TauView {
             .flex()
             .items_center()
             .justify_between()
-            .p_4()
+            .h(px(52.))
+            .px_4()
             .border_b_1()
-            .border_color(rgb(0x2c3340))
+            .border_color(self.theme.separator)
+            .bg(self.theme.toolbar)
             .child(
                 div()
-                    .text_xl()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("tau"),
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Tau"),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(testable_button(
+                    .child(mac_button(
                         "New Chat",
-                        0x39734a,
                         "new-chat-button",
+                        true,
+                        self.theme,
                         cx.listener(Self::new_chat),
                     ))
-                    .child(testable_button(
+                    .child(mac_button(
                         if self.sessions_open {
                             "Hide sessions"
                         } else {
                             "Sessions"
                         },
-                        0x52627a,
                         "sessions-button",
+                        false,
+                        self.theme,
                         cx.listener(Self::toggle_sessions),
                     ))
-                    .child(testable_button(
+                    .child(mac_button(
                         if self.sidebar_visible {
-                            "Hide sidebar"
+                            "Hide Inspector"
                         } else {
-                            "Show sidebar"
+                            "Show Inspector"
                         },
-                        0x33445f,
                         "sidebar-button",
+                        false,
+                        self.theme,
                         cx.listener(|view, _, _, cx| {
                             view.sidebar_visible = next_sidebar_visibility(view.sidebar_visible);
                             cx.notify();
                         }),
                     ))
-                    .child(testable_button(
+                    .child(mac_button(
                         if self.follow_output {
                             "Following"
                         } else {
                             "Follow output"
                         },
-                        0x33445f,
                         "follow-button",
+                        false,
+                        self.theme,
                         cx.listener(|view, _, _, cx| {
                             view.follow_output = next_follow_state(view.follow_output);
                             if view.follow_output {
@@ -2298,10 +2686,17 @@ impl Render for TauView {
                             cx.notify();
                         }),
                     ))
+                    .child(mac_button(
+                        "Settings",
+                        "settings-button",
+                        false,
+                        self.theme,
+                        cx.listener(Self::open_account),
+                    ))
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x8c96a8))
+                            .text_color(self.theme.secondary_text)
                             .cursor_pointer()
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::click_model))
                             .child(format!(
@@ -2350,8 +2745,16 @@ impl Render for TauView {
                 .justify_between()
                 .gap_3()
                 .p_3()
-                .bg(rgb(if failed { 0x4a2929 } else { 0x202b38 }))
-                .text_color(rgb(if failed { 0xffb4a8 } else { 0xb9d7ff }))
+                .bg(if failed {
+                    self.theme.error_surface
+                } else {
+                    self.theme.selection
+                })
+                .text_color(if failed {
+                    self.theme.error_text
+                } else {
+                    self.theme.text
+                })
                 .child(div().flex_1().child(message.to_string()));
             if failed {
                 banner = banner.child(toast_button(
@@ -2359,19 +2762,22 @@ impl Render for TauView {
                     0x52627a,
                     cx.listener(Self::retry_runtime),
                 ));
-                banner = banner.child(toast_button(
-                    "Restart owned daemon",
-                    0x6a5834,
-                    cx.listener(Self::restart_runtime),
-                ));
+                if self.backend.owns_daemon() {
+                    banner = banner.child(toast_button(
+                        "Restart Tau Daemon",
+                        0x6a5834,
+                        cx.listener(Self::restart_runtime),
+                    ));
+                }
             }
-            banner
-                .child(toast_button(
+            if self.backend.owns_daemon() {
+                banner = banner.child(toast_button(
                     "Disown safely",
                     0x6a5834,
                     cx.listener(Self::disown_daemon),
-                ))
-                .child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui)))
+                ));
+            }
+            banner.child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui)))
         });
         let toast = div()
             .flex()
@@ -2430,9 +2836,10 @@ impl Render for TauView {
             .flex_col()
             .gap_3()
             .p_5()
+            .items_center()
             .when(self.chat.cards.is_empty(), |view| {
-                view.child(div().text_sm().text_color(rgb(0x8994a8)).child(
-                    if self.chat.active_assistant.is_some() {
+                view.child(div().text_sm().text_color(self.theme.tertiary_text).child(
+                    if self.chat.is_streaming() {
                         "Loading transcript…"
                     } else {
                         "No transcript yet"
@@ -2444,27 +2851,36 @@ impl Render for TauView {
                     Card::Message {
                         role: Role::User,
                         text,
-                    } => (0x274d72, "You", true, text.clone()),
+                    } => (self.theme.accent, "You", true, text.clone()),
                     Card::Message {
                         role: Role::Assistant,
                         text,
-                    } => (0x202630, "tau", false, text.clone()),
+                    } => (self.theme.canvas, "Tau", false, text.clone()),
                     Card::Message {
                         role: Role::System,
                         text,
-                    } => (0x202630, "system", false, text.clone()),
+                    } => (
+                        if text.starts_with("Request failed") {
+                            self.theme.error_surface
+                        } else {
+                            self.theme.surface
+                        },
+                        "System",
+                        false,
+                        text.clone(),
+                    ),
                     Card::Message {
                         role: Role::Tool,
                         text,
-                    } => (0x3b3425, "tool", false, text.clone()),
+                    } => (self.theme.elevated, "Tool", false, text.clone()),
                     Card::Tool {
                         name,
                         input,
                         output,
                         expanded,
                     } => (
-                        0x3b3425,
-                        "tool",
+                        self.theme.elevated,
+                        "Tool",
                         false,
                         if *expanded {
                             format!("{name}\ninput: {input}\noutput: {output}")
@@ -2478,27 +2894,41 @@ impl Render for TauView {
                         approved,
                         ..
                     } => (
-                        0x293b32,
-                        "diff",
+                        self.theme.success_surface,
+                        "Changes",
                         false,
                         format!(
                             "{path} ({})\n{patch}",
                             if *approved { "approved" } else { "pending" }
                         ),
                     ),
+                    Card::Error {
+                        summary,
+                        details,
+                        expanded,
+                    } => (
+                        self.theme.error_surface,
+                        "Couldn’t Complete Request",
+                        false,
+                        if *expanded {
+                            format!("{summary}\n\nTechnical details\n{details}")
+                        } else {
+                            summary.clone()
+                        },
+                    ),
                     Card::Permission {
                         tool, description, ..
                     } => (
-                        0x463b24,
-                        "permission",
+                        self.theme.elevated,
+                        "Permission",
                         false,
                         format!("{tool}: {description}"),
                     ),
                     Card::Question {
                         question, answer, ..
                     } => (
-                        0x293b32,
-                        "question",
+                        self.theme.selection,
+                        "Question",
                         false,
                         format!(
                             "{question}\n{}",
@@ -2509,19 +2939,50 @@ impl Render for TauView {
                 let mut card_view = div()
                     .id(("card", index))
                     .debug_selector(|| format!("card-{index}"))
+                    .w_full()
+                    .max_w(px(760.))
                     .focusable()
-                    .hover(|style| style.bg(rgb(0x171d26)))
+                    .hover(|style| style.bg(self.theme.surface))
                     .flex()
                     .flex_col()
                     .when(align_end, |element| element.items_end())
-                    .child(div().text_xs().text_color(rgb(0x8994a8)).child(label))
-                    .child(feed_body(label, text).bg(rgb(background)));
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.theme.secondary_text)
+                            .child(label),
+                    )
+                    .child(feed_body(label, text).bg(background));
                 if matches!(card, Card::Tool { .. }) {
                     card_view = card_view.on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |view, event, window, cx| {
                             view.toggle_tool(index, event, window, cx)
                         }),
+                    );
+                }
+                if let Card::Error { expanded, .. } = card {
+                    let expanded = *expanded;
+                    card_view = card_view.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(toast_button(
+                                "Retry",
+                                0x0a84ff,
+                                cx.listener(Self::retry_last_prompt),
+                            ))
+                            .child(toast_button(
+                                if expanded {
+                                    "Hide Details"
+                                } else {
+                                    "Show Details"
+                                },
+                                0x52627a,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.toggle_error(index, event, window, cx)
+                                }),
+                            )),
                     );
                 }
                 if matches!(
@@ -2707,41 +3168,49 @@ impl Render for TauView {
                     }),
             );
         let sidebar = div()
-            .w(px(260.))
+            .id("inspector")
+            .w(px(320.))
             .flex()
             .flex_col()
             .gap_3()
             .p_4()
             .flex_none()
+            .overflow_y_scroll()
             .border_l_1()
-            .border_color(rgb(0x2c3340))
+            .border_color(self.theme.separator)
+            .bg(self.theme.sidebar)
             .child(
                 div()
-                    .cursor_pointer()
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_agent))
-                    .child(sidebar_card(
-                        "AGENT",
-                        description
-                            .sidebar
-                            .iter()
-                            .find(|(title, _)| title == "AGENT")
-                            .map(|(_, value)| value.as_str())
-                            .unwrap_or(&self.agent),
-                    )),
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Inspector"),
             )
             .children(
                 description
                     .sidebar
                     .iter()
-                    .filter(|(title, _)| title != "AGENT")
-                    .map(|(title, value)| sidebar_card(title, value)),
+                    .filter(|(_, value)| !value.is_empty() && value != "Unavailable")
+                    .map(|(title, value)| sidebar_card(title, value, self.theme)),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .pt_4()
+                    .border_t_1()
+                    .border_color(self.theme.separator)
+                    .child(self.operations_panel(cx)),
             );
         let footer = div()
             .p_4()
+            .flex()
+            .justify_center()
+            .bg(self.theme.toolbar)
             .border_t_1()
-            .border_color(rgb(0x2c3340))
+            .border_color(self.theme.separator)
             .child(
                 div()
+                    .w_full()
+                    .max_w(px(900.))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -2802,15 +3271,13 @@ impl Render for TauView {
                                     .text_color(rgb(0x10151e))
                                     .rounded_lg()
                                     .cursor_pointer()
-                                    .when(self.chat.active_assistant.is_some(), |button| {
-                                        button.opacity(0.45)
-                                    })
+                                    .when(send_blocked, |button| button.opacity(0.45))
                                     .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
                                     .child("Send"),
                             ),
                     ),
             )
-            .when(self.chat.active_assistant.is_some(), |footer| {
+            .when(self.chat.is_streaming(), |footer| {
                 footer.child(
                     div()
                         .id("cancel-button")
@@ -2830,7 +3297,7 @@ impl Render for TauView {
                     .mt_2()
                     .pt_2()
                     .border_t_1()
-                    .border_color(rgb(0x2c3340))
+                    .border_color(self.theme.separator)
                     .text_xs()
                     .text_color(rgb(0x8994a8))
                     .child(format!(
@@ -2849,8 +3316,8 @@ impl Render for TauView {
             );
         let mut root = div()
             .size_full()
-            .bg(rgb(0x11151b))
-            .text_color(rgb(0xe8edf5))
+            .bg(self.theme.canvas)
+            .text_color(self.theme.text)
             .flex()
             .flex_col()
             .min_h(px(0.))
@@ -2893,13 +3360,14 @@ impl Render for TauView {
                     .flex_1()
                     .min_h(px(0.))
                     .child(transcript)
-                    .when(self.sidebar_visible, |view| {
-                        view.child(sidebar).child(self.operations_panel(cx))
-                    }),
+                    .when(self.sidebar_visible, |view| view.child(sidebar)),
             )
             .child(footer)
             .when(self.toast_visible, |root| {
                 root.child(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
+            })
+            .when(self.account_sheet, |root| {
+                root.child(self.account_sheet(cx))
             })
     }
 }
@@ -2914,21 +3382,56 @@ fn to_navigator_session(session: tau_client::SessionSummary) -> NavigatorSession
     }
 }
 
-fn sidebar_card(title: &str, value: &str) -> impl IntoElement {
+fn sidebar_card(title: &str, value: &str, theme: Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
         .gap_1()
         .p_3()
         .rounded_md()
-        .bg(rgb(0x1b1f27))
+        .bg(theme.surface)
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x7e8a9d))
+                .text_color(theme.secondary_text)
                 .child(title.to_string()),
         )
         .child(div().text_sm().child(value.to_string()))
+}
+
+fn mac_button<T>(
+    label: impl Into<String>,
+    selector: &'static str,
+    primary: bool,
+    theme: Theme,
+    callback: T,
+) -> impl IntoElement
+where
+    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+{
+    div()
+        .debug_selector(|| selector.into())
+        .h(px(32.))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .bg(if primary {
+            theme.accent
+        } else {
+            theme.elevated
+        })
+        .text_color(if primary { rgb(0xffffff) } else { theme.text })
+        .hover(move |style| {
+            style.bg(if primary {
+                theme.accent_hover
+            } else {
+                theme.surface
+            })
+        })
+        .cursor_pointer()
+        .on_mouse_up(MouseButton::Left, callback)
+        .child(label.into())
 }
 
 fn toast_button<T>(label: impl Into<String>, color: u32, callback: T) -> impl IntoElement
@@ -3053,6 +3556,50 @@ mod view_model_tests {
             &cx.update(|_, app| view.read(app).chat.cards[0].clone()),
             Card::Tool { expanded: true, .. }
         ));
+    }
+
+    #[gpui::test]
+    fn rendered_account_sheet_opens_and_copies_explicit_oauth_link(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let backend = test_backend(&runtime);
+        let authorize_url = "https://auth.openai.com/oauth/authorize?state=stable";
+        {
+            let (_view, window) = cx.add_window_view(|_, cx| {
+                let mut view = TauView::new(backend, cx);
+                view.account_sheet = true;
+                view.auth_status = AuthState::Pending {
+                    authorize_url: authorize_url.into(),
+                };
+                view
+            });
+            click(window, "account-open-browser");
+            click(window, "account-copy-link");
+        }
+        assert_eq!(cx.opened_url().as_deref(), Some(authorize_url));
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some(authorize_url)
+        );
+    }
+
+    #[gpui::test]
+    fn repository_operations_use_opaque_project_id_not_root_path(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let backend = test_backend(&runtime);
+        let (view, window) = cx.add_window_view(|_, cx| TauView::new(backend, cx));
+        view.update(window, |view, cx| {
+            view.select_project(
+                Some("project-opaque-id".into()),
+                Some(PathBuf::from("/workspace/project")),
+                cx,
+            );
+            assert_eq!(
+                view.operation_project().as_deref(),
+                Some("project-opaque-id")
+            );
+        });
     }
 
     #[test]

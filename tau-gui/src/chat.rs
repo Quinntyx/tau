@@ -164,6 +164,11 @@ pub enum Card {
         question: String,
         answer: Option<String>,
     },
+    Error {
+        summary: String,
+        details: String,
+        expanded: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +178,7 @@ pub enum CardKind {
     Diff,
     Permission,
     Question,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +216,11 @@ impl Card {
                 interactive: answer.is_none(),
                 expanded: true,
             },
+            Self::Error { expanded, .. } => CardMetadata {
+                kind: CardKind::Error,
+                interactive: true,
+                expanded: *expanded,
+            },
         }
     }
 
@@ -232,6 +243,7 @@ impl Card {
             }
             Self::Permission { description, .. } => description,
             Self::Question { question, .. } => question,
+            Self::Error { summary, .. } => summary,
         };
         text.chars().take(max_chars).collect()
     }
@@ -367,29 +379,28 @@ impl ChatState {
     pub fn reduce(&mut self, action: ChatAction) -> bool {
         match action {
             ChatAction::SessionEvent(event) => self.apply_session_event(event),
-            ChatAction::Submit(text)
-                if !text.trim().is_empty() && self.active_assistant.is_none() =>
-            {
+            ChatAction::Submit(text) if !text.trim().is_empty() && self.can_submit() => {
                 self.raw_input = Some(text.clone());
+                self.raw_output = None;
                 self.cards.push(Card::Message {
                     role: Role::User,
                     text,
                 });
-                let index = self.cards.len();
-                self.cards.push(Card::Message {
-                    role: Role::Assistant,
-                    text: String::new(),
-                });
-                self.active_assistant = Some(index);
                 self.status = ChatStatus::Streaming;
                 self.loading = true;
                 self.error = None;
                 true
             }
             ChatAction::Completion(CompletionEvent::Delta(delta)) => {
-                let Some(index) = self.active_assistant else {
-                    return false;
-                };
+                let index = self.active_assistant.unwrap_or_else(|| {
+                    self.cards.push(Card::Message {
+                        role: Role::Assistant,
+                        text: String::new(),
+                    });
+                    let index = self.cards.len() - 1;
+                    self.active_assistant = Some(index);
+                    index
+                });
                 if let Card::Message { text, .. } = &mut self.cards[index] {
                     text.push_str(&delta.text);
                 }
@@ -397,12 +408,12 @@ impl ChatState {
             }
             ChatAction::Completion(CompletionEvent::Complete(result)) => self.finish(result),
             ChatAction::Error(error) => {
-                let Some(index) = self.active_assistant.take() else {
-                    return false;
-                };
-                if let Card::Message { text, .. } = &mut self.cards[index] {
-                    *text = format!("Error: {error}");
-                }
+                self.discard_empty_assistant();
+                self.cards.push(Card::Error {
+                    summary: "The request could not be completed.".into(),
+                    details: error.clone(),
+                    expanded: false,
+                });
                 self.status = ChatStatus::Failed(error.clone());
                 self.loading = false;
                 self.error = Some(error);
@@ -515,16 +526,10 @@ impl ChatState {
         self.events.push(typed);
         match event.event {
             TurnEvent::TurnStarted { .. } => {
+                self.raw_output = None;
                 self.status = ChatStatus::Streaming;
                 self.loading = true;
                 self.error = None;
-                if self.active_assistant.is_none() {
-                    self.cards.push(Card::Message {
-                        role: Role::Assistant,
-                        text: String::new(),
-                    });
-                    self.active_assistant = Some(self.cards.len() - 1);
-                }
                 true
             }
             TurnEvent::TextDelta { text, .. } => {
@@ -671,19 +676,41 @@ impl ChatState {
                 true
             }
             TurnEvent::TurnCompleted { .. } => {
-                self.active_assistant = None;
-                self.status = ChatStatus::Ready;
+                self.discard_empty_assistant();
+                if self
+                    .raw_output
+                    .as_deref()
+                    .is_none_or(|output| output.trim().is_empty())
+                {
+                    let message = "The provider completed without returning assistant text.";
+                    self.cards.push(Card::Error {
+                        summary: "The provider returned an empty response.".into(),
+                        details: format!(
+                            "{message} Check account setup and provider configuration, then retry."
+                        ),
+                        expanded: false,
+                    });
+                    self.error = Some(message.into());
+                    self.status = ChatStatus::Failed(message.into());
+                } else {
+                    self.status = ChatStatus::Ready;
+                }
                 self.loading = false;
                 true
             }
             TurnEvent::TurnCancelled { .. } => {
-                self.active_assistant = None;
+                self.discard_empty_assistant();
                 self.status = ChatStatus::Ready;
                 self.loading = false;
                 true
             }
             TurnEvent::TurnFailed { message, .. } => {
-                self.active_assistant = None;
+                self.discard_empty_assistant();
+                self.cards.push(Card::Error {
+                    summary: "The request could not be completed.".into(),
+                    details: message.clone(),
+                    expanded: false,
+                });
                 self.error = Some(message.clone());
                 self.status = ChatStatus::Failed(message);
                 self.loading = false;
@@ -788,9 +815,27 @@ impl ChatState {
     }
 
     fn finish(&mut self, result: CompletionStreamResult) -> bool {
-        let Some(index) = self.active_assistant.take() else {
-            return false;
-        };
+        if self.active_assistant.is_none() && result.text.trim().is_empty() {
+            self.cards.push(Card::Error {
+                summary: "The provider returned an empty response.".into(),
+                details: "No assistant text was returned. Check account setup and provider configuration, then retry.".into(),
+                expanded: false,
+            });
+            self.raw_output = Some(String::new());
+            self.session_id = Some(result.session_id);
+            self.usage = Some(result.usage.total_tokens);
+            self.status = ChatStatus::Failed("The provider returned an empty response".into());
+            self.loading = false;
+            self.error = Some("The provider returned an empty response".into());
+            return true;
+        }
+        let index = self.active_assistant.take().unwrap_or_else(|| {
+            self.cards.push(Card::Message {
+                role: Role::Assistant,
+                text: String::new(),
+            });
+            self.cards.len() - 1
+        });
         if let Card::Message { text, .. } = &mut self.cards[index] {
             self.raw_output = Some(result.text.clone());
             *text = result.text;
@@ -801,6 +846,21 @@ impl ChatState {
         self.loading = false;
         self.error = None;
         true
+    }
+
+    fn discard_empty_assistant(&mut self) {
+        let Some(index) = self.active_assistant.take() else {
+            return;
+        };
+        if matches!(
+            self.cards.get(index),
+            Some(Card::Message {
+                role: Role::Assistant,
+                text,
+            }) if text.is_empty()
+        ) {
+            self.cards.remove(index);
+        }
     }
 }
 
@@ -1056,6 +1116,40 @@ fn update_context(sidebar: &mut SidebarState, context: Option<&serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_and_empty_completions_never_leave_blank_assistant_cards() {
+        let mut state = ChatState::default();
+        assert!(state.reduce(ChatAction::Submit("hello".into())));
+        assert_eq!(state.cards.len(), 1);
+        assert!(state.active_assistant.is_none());
+
+        assert!(state.reduce(ChatAction::Error("missing credentials".into())));
+        assert!(matches!(
+            state.cards.last(),
+            Some(Card::Error { details, .. }) if details == "missing credentials"
+        ));
+        assert!(!state.cards.iter().any(|card| matches!(
+            card,
+            Card::Message {
+                role: Role::Assistant,
+                text,
+            } if text.is_empty()
+        )));
+
+        let mut empty = ChatState::default();
+        empty.reduce(ChatAction::Submit("hello".into()));
+        empty.reduce(ChatAction::Completion(CompletionEvent::Complete(
+            CompletionStreamResult {
+                session_id: "session".into(),
+                message_id: 1,
+                text: String::new(),
+                usage: tau_proto::completion::UsageSummary::default(),
+            },
+        )));
+        assert!(matches!(empty.cards.last(), Some(Card::Error { .. })));
+        assert!(matches!(empty.status, ChatStatus::Failed(_)));
+    }
     use tau_proto::prelude::{CompletionDelta, UsageSummary};
 
     #[test]

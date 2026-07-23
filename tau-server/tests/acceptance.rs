@@ -649,7 +649,7 @@ fn gui_and_tui_state_fixtures_cover_permission_diff_tiers_and_cancel() {
 
     let mut gui = tau_gui::chat::ChatState::default();
     assert!(gui.reduce(tau_gui::chat::ChatAction::Submit("hello".into())));
-    assert_eq!(gui.cards.len(), 2);
+    assert_eq!(gui.cards.len(), 1);
 }
 
 /// Mandatory M13 closure chain. The only double here is Rig's scripted model

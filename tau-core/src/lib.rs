@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod codex;
 pub mod config;
 pub mod context;
 pub mod credentials;

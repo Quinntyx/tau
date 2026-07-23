@@ -628,6 +628,30 @@ impl Client {
             .context("decoding cancellation")
     }
 
+    pub async fn auth_status(&self, params: AuthProviderParams) -> Result<AuthStatusResult> {
+        require_non_empty(&params.provider, "provider")?;
+        serde_json::from_value(self.call(METHOD_AUTH_STATUS, Some(params)).await?)
+            .context("decoding account status")
+    }
+
+    pub async fn auth_begin(&self, params: AuthProviderParams) -> Result<AuthBeginResult> {
+        require_non_empty(&params.provider, "provider")?;
+        serde_json::from_value(self.call(METHOD_AUTH_BEGIN, Some(params)).await?)
+            .context("decoding account authorization")
+    }
+
+    pub async fn auth_cancel(&self, params: AuthProviderParams) -> Result<AuthCancelResult> {
+        require_non_empty(&params.provider, "provider")?;
+        serde_json::from_value(self.call(METHOD_AUTH_CANCEL, Some(params)).await?)
+            .context("decoding account cancellation")
+    }
+
+    pub async fn auth_logout(&self, params: AuthProviderParams) -> Result<AuthLogoutResult> {
+        require_non_empty(&params.provider, "provider")?;
+        serde_json::from_value(self.call(METHOD_AUTH_LOGOUT, Some(params)).await?)
+            .context("decoding account logout")
+    }
+
     pub async fn project_list(&self, params: ProjectListParams) -> Result<ProjectListResult> {
         serde_json::from_value(self.call(METHOD_PROJECT_LIST, Some(params)).await?)
             .context("decoding project list")
