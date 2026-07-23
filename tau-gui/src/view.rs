@@ -3368,9 +3368,30 @@ impl Render for TauView {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .child(
+                                div()
+                                    .id("attach-button")
+                                    .debug_selector(|| "attach-button".into())
+                                    .h(px(28.))
+                                    .w(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(self.theme.elevated)
+                                    .text_color(self.theme.secondary_text)
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .hover(|style| {
+                                        style.bg(self.theme.surface).text_color(self.theme.text)
+                                    })
+                                    .cursor_pointer()
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::click_model))
+                                    .child("+"),
+                            )
                             .child(composer_pill(
                                 &format!(
-                                    "Agent · {}",
+                                    "^ Agent · {}",
                                     if self.agent.is_empty() {
                                         "default"
                                     } else {
@@ -3382,7 +3403,7 @@ impl Render for TauView {
                                 cx.listener(Self::click_agent),
                             ))
                             .child(composer_pill(
-                                &format!("Model · {}", current_model),
+                                &format!("^ Model · {}", current_model),
                                 "model-button",
                                 self.theme,
                                 cx.listener(Self::click_model),
@@ -3392,19 +3413,20 @@ impl Render for TauView {
                                 div()
                                     .id("send-button")
                                     .debug_selector(|| "send-button".into())
-                                    .px_4()
-                                    .h(px(32.))
+                                    .w(px(28.))
+                                    .h(px(28.))
                                     .flex()
                                     .items_center()
+                                    .justify_center()
                                     .bg(self.theme.accent)
                                     .hover(|style| style.bg(self.theme.accent_hover))
                                     .focusable()
                                     .text_color(rgb(0xffffff))
-                                    .rounded_md()
+                                    .rounded_full()
                                     .cursor_pointer()
                                     .when(send_blocked, |button| button.opacity(0.45))
                                     .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
-                                    .child("Send"),
+                                    .child("→"),
                             ),
                     ),
             )
