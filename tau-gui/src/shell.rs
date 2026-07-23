@@ -136,6 +136,7 @@ pub struct ProjectShell {
     pub create_prompt: Option<CreateProjectPrompt>,
     pub lifecycle: LifecycleStatus,
     pub inactive_choice: Option<(String, String, PathBuf)>,
+    pub menu_open_for: Option<String>,
 }
 
 impl ProjectShell {
@@ -149,6 +150,7 @@ impl ProjectShell {
             create_prompt: None,
             lifecycle: LifecycleStatus::Idle,
             inactive_choice: None,
+            menu_open_for: None,
         }
     }
 
@@ -395,9 +397,12 @@ impl ProjectShell {
                 let id = project.id.clone();
                 let inactive = project.name.ends_with(" (inactive)");
                 let selected = self.selected.as_deref() == Some(project.id.as_str());
+                let menu_open = self.menu_open_for.as_deref() == Some(id.as_str());
+                let menu_id = id.clone();
                 let mut row = div()
                     .id(SharedString::from(project.id.clone()))
                     .debug_selector(|| project.id.clone())
+                    .relative()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -426,22 +431,68 @@ impl ProjectShell {
                                 .child("inactive"),
                         )
                     });
+
+                let menu_trigger_id = menu_id.clone();
+                let debug_trigger_id = menu_trigger_id.clone();
+                let menu_trigger = div()
+                    .id(SharedString::from(format!(
+                        "project-menu-btn-{menu_trigger_id}"
+                    )))
+                    .debug_selector(move || format!("project-menu-btn-{debug_trigger_id}"))
+                    .px_1()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(theme.secondary_text)
+                    .hover(|style| style.bg(theme.elevated).text_color(theme.text))
+                    .cursor_pointer()
+                    .child("⋮")
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        if shell.menu_open_for.as_deref() == Some(menu_trigger_id.as_str()) {
+                            shell.menu_open_for = None;
+                        } else {
+                            shell.menu_open_for = Some(menu_trigger_id.clone());
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }));
+
                 let actions_cluster = div()
                     .flex()
                     .items_center()
                     .gap_1()
-                    .opacity(0.0)
-                    .hover(|style| style.opacity(1.0));
-                if inactive {
-                    let reactivate_id = id.clone();
-                    let new_id = id.clone();
-                    let name = project.name.trim_end_matches(" (inactive)").to_owned();
-                    let reactivate_name = name.clone();
-                    let new_name = name;
-                    let path = project.path.clone();
-                    let reactivate_path = path.clone();
-                    row = row.child(
-                        actions_cluster
+                    .when(!menu_open, |div| {
+                        div.opacity(0.0).hover(|style| style.opacity(1.0))
+                    })
+                    .child(menu_trigger);
+
+                if menu_open {
+                    let mut dropdown = div()
+                        .absolute()
+                        .top_full()
+                        .right_0()
+                        .mt_1()
+                        .w(px(140.0))
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.separator)
+                        .bg(theme.elevated)
+                        .shadow_md();
+
+                    if inactive {
+                        let reactivate_id = id.clone();
+                        let new_id = id.clone();
+                        let name = project.name.trim_end_matches(" (inactive)").to_owned();
+                        let reactivate_name = name.clone();
+                        let new_name = name;
+                        let path = project.path.clone();
+                        let reactivate_path = path.clone();
+                        dropdown = dropdown
                             .child(
                                 div()
                                     .id(SharedString::from(format!("reactivate-{id}")))
@@ -451,6 +502,7 @@ impl ProjectShell {
                                     .text_xs()
                                     .rounded_md()
                                     .text_color(theme.accent)
+                                    .hover(|style| style.bg(theme.selection))
                                     .cursor_pointer()
                                     .child("Reactivate")
                                     .on_click(cx.listener(move |shell, _, _, cx| {
@@ -462,6 +514,7 @@ impl ProjectShell {
                                         let _ = shell.submit_inactive_choice(
                                             InactiveProjectChoice::Reactivate,
                                         );
+                                        shell.menu_open_for = None;
                                         cx.stop_propagation();
                                         cx.notify();
                                     })),
@@ -475,6 +528,7 @@ impl ProjectShell {
                                     .text_xs()
                                     .rounded_md()
                                     .text_color(theme.secondary_text)
+                                    .hover(|style| style.bg(theme.selection))
                                     .cursor_pointer()
                                     .child("New ID")
                                     .on_click(cx.listener(move |shell, _, _, cx| {
@@ -486,18 +540,17 @@ impl ProjectShell {
                                         let _ = shell.submit_inactive_choice(
                                             InactiveProjectChoice::CreateNew,
                                         );
+                                        shell.menu_open_for = None;
                                         cx.stop_propagation();
                                         cx.notify();
                                     })),
-                            ),
-                    );
-                } else {
-                    let update_id = id.clone();
-                    let unregister_id = id.clone();
-                    let update_name = project.name.clone();
-                    let update_path = project.path.clone();
-                    row = row.child(
-                        actions_cluster
+                            );
+                    } else {
+                        let update_id = id.clone();
+                        let unregister_id = id.clone();
+                        let update_name = project.name.clone();
+                        let update_path = project.path.clone();
+                        dropdown = dropdown
                             .child(
                                 div()
                                     .id(SharedString::from(format!("update-{update_id}")))
@@ -505,7 +558,8 @@ impl ProjectShell {
                                     .py_1()
                                     .text_xs()
                                     .rounded_md()
-                                    .text_color(theme.secondary_text)
+                                    .text_color(theme.text)
+                                    .hover(|style| style.bg(theme.selection))
                                     .cursor_pointer()
                                     .child("Update")
                                     .on_click(cx.listener(move |shell, _, _, cx| {
@@ -514,6 +568,7 @@ impl ProjectShell {
                                             update_name.clone(),
                                             update_path.clone(),
                                         );
+                                        shell.menu_open_for = None;
                                         cx.stop_propagation();
                                         cx.notify();
                                     })),
@@ -526,15 +581,22 @@ impl ProjectShell {
                                     .text_xs()
                                     .rounded_md()
                                     .text_color(theme.error_text)
+                                    .hover(|style| style.bg(theme.selection))
                                     .cursor_pointer()
                                     .child("Unregister")
                                     .on_click(cx.listener(move |shell, _, _, cx| {
                                         shell.unregister_project(unregister_id.clone());
+                                        shell.menu_open_for = None;
                                         cx.stop_propagation();
                                         cx.notify();
                                     })),
-                            ),
-                    );
+                            );
+                    }
+                    row = row
+                        .child(actions_cluster)
+                        .child(gpui::deferred(dropdown).with_priority(30));
+                } else {
+                    row = row.child(actions_cluster);
                 }
                 row = row.on_click(cx.listener(move |shell, _, _, cx| {
                     shell.select(id.clone());

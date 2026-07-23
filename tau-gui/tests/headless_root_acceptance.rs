@@ -258,6 +258,12 @@ fn rendered_inactive_controls_dispatch_lifecycle_actions(cx: &mut TestAppContext
         }]))
     });
 
+    let menu_btn = cx
+        .debug_bounds("project-menu-btn-old-id")
+        .expect("Project menu button must be rendered with bounds");
+    cx.simulate_click(menu_btn.center(), Modifiers::none());
+    cx.run_until_parked();
+
     let reactivate = cx
         .debug_bounds("reactivate-old-id")
         .expect("Reactivate control must be rendered with bounds");
@@ -273,6 +279,13 @@ fn rendered_inactive_controls_dispatch_lifecycle_actions(cx: &mut TestAppContext
         shell.choose_inactive("old-id", "Old project", PathBuf::from("/workspace/old"));
     });
     cx.run_until_parked();
+
+    let menu_btn = cx
+        .debug_bounds("project-menu-btn-old-id")
+        .expect("Project menu button must be rendered with bounds");
+    cx.simulate_click(menu_btn.center(), Modifiers::none());
+    cx.run_until_parked();
+
     let new_id = cx
         .debug_bounds("new-id-old-id")
         .expect("New ID control must be rendered with bounds");

@@ -774,6 +774,57 @@ A: "Bounded plus artifacts (Recommended)"
 Q: Should GUI/TUI client preferences use separate KDL files under the platform config directory?
 A: "Separate client KDL (Recommended)"
 
+## Q&A Session: 2026-07-22
+
+Q: Which tool surface must the deterministic provider stress?
+A: "Everything including MCP/LSP"
+
+Q: How should the `test` provider be exposed?
+A: "Environment gated"
+
+Q: What message-to-scenario interface should it use?
+A: "Typed scenario names (Recommended)"
+
+Q: Should destructive/error-path tool cases run only inside disposable temporary workspaces and repositories?
+A: "Always disposable (Recommended)"
+
+## Q&A Session: 2026-07-22 GUI recovery, OAuth, and visual design
+
+Q: How should Codex OAuth coexist with ordinary OpenAI API-key access?
+A: "Separate Codex provider (Recommended)"
+
+Q: What browser authorization UX should Tau provide?
+A: "Open a popup with an explicit oAuth link that, when clicked, opens the browser, and also has a copy button next to it so that users can click it and open the oAuth link at their leisure in their window/browser of choice and complete the auth flow there"
+
+Q: Where should OAuth account state be managed?
+A: "Settings + blocking setup (Recommended)"
+
+Q: Which Apple-inspired appearance should be the target?
+A: "Adaptive macOS style (Recommended)"
+
+Q: How should incompatible daemons and provider failures behave?
+A: "Block and explain (Recommended)"
+
+Q: When Tau finds an incompatible daemon, what ownership policy should apply?
+A: "Restart owned only (Recommended)"
+
+## Q&A Session: 2026-07-22 GUI failure semantics and Codex persistence
+
+Q: ChatGPT subscription access uses an OpenCode/Codex-compatible, non-public backend contract that OpenAI may change. How should Tau present it?
+A: "Stable without warning"
+
+Q: How should refresh and access tokens be persisted?
+A: "Keyring only (Recommended)"
+
+Q: How should the Apple-style information architecture treat the current right-side panels?
+A: "Collapsible inspector (Recommended)"
+
+Q: Where should actionable failures be shown?
+A: "Banner + inline card (Recommended)"
+
+Q: Should the GUI hide metadata that is genuinely unavailable, or show disabled placeholders?
+A: "Hide until available (Recommended)"
+
 ## Behavior Invariants
 
 - The server is a **long-running daemon** (not per-process / not spawned-and-died per client). Long-lived client implementers (e.g. a Discord bridge) must be able to act as ordinary clients over the normal client protocol — no special bridges or side channels. The daemon must be **systemd-registerable as a first-class use case**.
@@ -1051,3 +1102,164 @@ A: "Progressive collapse (Recommended)"
 
 Q: Should the comprehensive redesign be implemented as staged vertical slices?
 A: "Vertical slices (Recommended)"
+
+## Q&A Session: 2026-07-17 22:01
+
+Q: The recovered branches implement the earlier airtight M13 contract, but `main/ROADMAP.md` ends with a newer UI redesign Q&A that adds full projects, nested chats, and a three-pane shell—materially conflicting with the earlier “no project picker” MVP rule. Which scope should this resumed run implement?
+A: "The full redesign was made but has not yet been implemented. We are currently in the process of implementing it. First, merge all the gui branches to ensure a clean starting point. Then, break down the new GUI requirements into a series of vertical slices, and then fork as many subagents as needed to build them in parallel on separate worktrees, each agent owning a single vertical slice"
+
+Q: All six candidate branches diverged from the same old baseline and heavily overlap in `backend.rs`, `chat.rs`, `input.rs`, and `view.rs`. How should their work be preserved?
+A: "Merge back into main"
+
+Q: Each worker committed a four-line `ROADMAP.md`, although the architecture skill says roadmaps must never be committed. What should the resumed run do with those artifacts?
+A: "Exclude from integration (Recommended)"
+
+## Resumed Ultra Run
+
+- [x] **R1 — Reconcile all recovered GUI branches into `main`** — COMPLETED 2026-07-18 via PR #8 (`696722d`)
+  - [x] Airtight? **Yes**
+  - Integrate `gui-runtime-negotiation`, `gui-editor-layout`, `gui-pickers-commands`, `gui-transcript-sidebar`, `gui-interactive-prompts`, and `gui-e2e-tests` into one verified baseline before redesign implementation begins.
+  - Exclude every branch-local committed `ROADMAP.md` from integration while preserving the source branches for provenance. (cite: 2026-07-17 22:01)
+  - Resolve overlapping `backend.rs`, `chat.rs`, `input.rs`, and `view.rs` changes by preserving production-path typed behavior rather than decorative or local-only controls; run workspace and GUI acceptance tests before merging to `main`.
+  - Authorized behavior change: `main` receives all recovered GUI implementation work before the new redesign is decomposed. (cite: 2026-07-17 22:01)
+- [x] **R2 — Decompose and airtight the full GUI/TUI redesign as vertical slices** — AIRTIGHT 2026-07-18 01:10
+  - [x] Airtight? **Yes**
+  - Preserve the redesign Q&A above, reconcile its full-project scope with earlier MVP constraints, and define independently testable end-to-end slices after R1 is merged.
+  - **S1 — Project registry/API — AIRTIGHT (2026-07-18 00:20):** daemon-owned project records with stable IDs, names, canonical workspace paths, registration state, typed lifecycle methods, and mandatory session association.
+    - `tau-core/src/db/sql/v6.sql`, `db/domain.rs`, new `db/projects.rs`, `db/sessions.rs`, and `db/mod.rs`: add projects with `active`, timestamps, and canonical path; active canonical paths are unique while inactive historical rows may share a path; sessions require a non-null valid `project_id`. Existing pre-project sessions/history need not be migrated because the user explicitly authorized ignoring them at this developer stage. (cite: 2026-07-18 00:14, 00:16, 00:20)
+    - Project registration accepts an existing directory or creates exactly one missing final directory when its immediate parent exists, then canonicalizes and validates it. Names may repeat; canonical active paths may not. Rename and repath retain stable project IDs and all session associations. (cite: 2026-07-18 00:14, 00:16, 00:20)
+    - New typed protocol module/API: `project.create`, `project.list`, `project.update`, `project.unregister`, and `project.reactivate`; creating a new ID for an inactive path and reactivating an existing ID are separate explicit requests. Unregister marks inactive and never deletes workspace files or session history. (cite: 2026-07-18 00:10, 00:16, 00:20)
+    - `tau-proto/src/turn.rs`: `TurnStartParams.project_id` is mandatory. `tau-server/src/lib.rs` rejects unknown/inactive project IDs and sessions without a project. `tau-client/src/lib.rs` exposes typed project methods. GUI/TUI/CLI callers must provide project IDs; no cwd-only session creation remains. (cite: 2026-07-18 00:16, 00:20)
+    - Preserve workspace containment and typed acknowledgements; do not infer IDs from rendered labels or cwd. Related tests: DB migration/CRUD/path uniqueness/inactive-history/session-FK tests in `tau-core/src/db/tests.rs`; wire round trips in `tau-proto`; server/client RPC and rejection tests; update every existing `create_session` and `TurnStartParams` fixture to use a registered project.
+    - Validation: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets --all-features`.
+  - **S2 — Project shell — AIRTIGHT:** equivalent GPUI and Ratatui three-pane shells with narrow icon rail, project list, project create/select/update/unregister/reactivate prompts, client-local active project restoration, responsive progressive collapse, and no runtime feature flag; the final redesign integration PR replaces both current shells atomically. Registering an inactive canonical path prompts the user to reactivate the stable ID or explicitly create a new ID. (cite: prior redesign contract; 2026-07-18 00:07, 00:10, 00:14, 00:20, 00:33)
+    - Slice-owned modules: new `tau-gui/src/shell.rs` and `tau-gui/src/projects.rs`; new `tau-tui/src/shell.rs` and `tau-tui/src/projects.rs`; presentation-only selection keys in GUI/TUI local preferences. Keep shared-root edits to `lib.rs`, `view.rs`, `components.rs`, and `state.rs` minimal and delegate data authority to S1 typed APIs.
+    - Tests: pure shell/project view-model tests, Ratatui buffer snapshots, GPUI action reachability, and scripted client action tests proving create/reactivate/new-ID/unregister paths invoke typed project actions rather than mutating local registries.
+  - **S3 — Session navigator — AIRTIGHT:** daemon-owned session create/list/get/rename/archive/restore APIs; New Chat creates a project-bound session immediately; both clients render one flat per-project list with no headings or nesting, newest `updated_at` first, search and create/rename/archive/restore controls, and client-local last-session restoration. (cite: 2026-07-18 00:10, 00:16, 00:33, 01:10)
+    - Slice-owned protocol/core/server/client session types and new `tau-gui/src/sessions.rs` / `tau-tui/src/sessions.rs`. Archived sessions are hidden by default and recoverable; no destructive session deletion. Session history loading is typed and feeds S4 without display-string parsing.
+    - Tests: DB ordering/lifecycle/project filtering, protocol round trips, server/client RPC, GUI/TUI search and action reducers, immediate empty-session creation, and restart-selection behavior.
+  - **S4 — Conversation feed — AIRTIGHT:** equivalent typography-first GUI/TUI feeds for human/assistant/reasoning/tool/policy/question/diff/system/compaction/error events, with avatars or compact role marks, timestamps, readable width, compact metadata, collapsible details/raw JSON, live streaming/follow behavior, and daemon-acknowledged interactive actions. Preserve lossless `TypedEvent`/`SequencedEvent` payloads and all recovered M13 semantics. (cite: prior redesign contract; 2026-07-18 00:33)
+    - Slice-owned `tau-gui/src/feed.rs` and `tau-tui/src/feed.rs`, consuming existing `chat.rs` and `adapter.rs` reducers; root renderers only compose the feed. Do not reparse rendered labels or regress cancellation/replay/policy ownership.
+    - Tests: typed reducer projections, GUI description/action tests, Ratatui snapshots, scripted stream/reconnect/prompt/diff acknowledgements, long content/collapse behavior, and behavior-preservation coverage from existing M13 suites.
+  - **S5 — Composer and selectors — AIRTIGHT:** equivalent GUI/TUI multiline composer, file references, model/agent controls, slash commands/autocomplete, send/cancel, character count, keyboard/clipboard/history/IME behavior where supported, and bottom connection/status strip. Remove the previously inferred embedded Terminal tab from both clients; no terminal, PTY, or command-runner UI is built. (cite: prior redesign contract; 2026-07-18 00:33)
+    - Slice-owned `tau-gui/src/composer.rs` and `tau-tui/src/composer.rs`, reusing `input.rs`, `picker.rs`, and typed turn options. Preserve server/config-backed model/agent identities and mandatory S1 project/session IDs.
+    - Tests: Unicode/grapheme/selection/history/IME preservation, autocomplete and picker actions, file-reference insertion, disabled/streaming/cancel states, GUI action reachability, Ratatui reducer/snapshot coverage, and explicit absence of terminal-tab actions.
+  - **S6 — Operations sidebar — AIRTIGHT:** equivalent GUI/TUI Status/Git/Changes surfaces backed exclusively by typed daemon APIs for repository status, file diff/content, stage, unstage, revert, review-keep, branch list/create/switch, and acknowledgements. Branch switching enforces dirty-worktree safety; revert is explicit/confirmable; Keep is client-local review dismissal keyed to the current file revision and never stages or changes files. (cite: 2026-07-18 00:07, 01:10)
+    - New slice-owned protocol `git` types/module, core repository service extending `tau-core/src/git.rs`, server/client methods, and `tau-gui/src/operations.rs` / `tau-tui/src/operations.rs`; every operation is contained to the active S1 project canonical root. No direct Git or filesystem mutation from either UI.
+    - Tests: temporary-repository status/diff/stage/unstage/revert, dirty branch-switch rejection, branch create/switch, containment/traversal rejection, idempotent acknowledgements, Keep revision invalidation, GPUI action/view-model tests, Ratatui snapshots, and scripted daemon RPC acceptance.
+
+  - [x] **Dogfood GUI interaction correction — AIRTIGHT (completed 2026-07-22):** correct the merged GUI implementation without expanding product scope. Preserve a GUI-owned auto-started daemon for the entire GUI process lifetime; render the project registration prompt as actionable GPUI controls; and ensure every visible GUI button dispatches an observable local state transition or typed daemon request. Existing-daemon and disowned-daemon ownership behavior must remain unchanged. Acceptance requires rendered GPUI listener dispatch and a real subprocess lifetime test; pure descriptions or reducer-only tests are insufficient. Landed through PR #10 (`72f2103`). (cite: existing daemon ownership contract and reopened M13 audit at 2026-07-17; user-reported dogfood regressions 2026-07-20)
+
+  - [x] **Environment-gated deterministic test provider — AIRTIGHT (completed 2026-07-22):** typed `test:filesystem`, `test:integrations`, `test:orchestration`, `test:all-tools`, and `test:error-paths` scenarios validate exact advertised tool schemas and known result-object shapes/values through the real daemon tool-calling loop. The exhaustive scenario covers read/write/edit/bash/glob/grep/list, plan/question/task, and actual MCP/LSP fixture processes in disposable workspaces. The provider is unavailable unless `TAU_ENABLE_TEST_PROVIDER=1`; integration fixtures are selected with `TAU_TEST_INTEGRATION_FIXTURE`. Landed through PR #10 (`72f2103`).
+
+  - [ ] **GUI reliability, Codex OAuth, and adaptive macOS visual system — AIRTIGHT (2026-07-22):** finish the production GUI as a coherent setup-to-conversation flow rather than exposing protocol internals as ordinary content. (cite: 2026-07-22 GUI recovery, OAuth, and visual design; 2026-07-22 GUI failure semantics and Codex persistence)
+    - **Protocol state:** `tau-gui/src/backend.rs` must negotiate `TurnStreaming`, cancellation, replay, and idempotency before caching any client or reporting Ready. A GUI-owned incompatible daemon is restarted automatically once; an external incompatible daemon is never killed and blocks Send with exact restart instructions. Preserve existing disown and independently-started daemon ownership rules.
+    - **Project identity:** `tau-gui/src/view.rs` repository operations send the selected opaque project ID; filesystem roots remain display/context data only. Selection-generation guards compare both ID and root without using roots on the wire.
+    - **Failure projection:** `tau-gui/src/chat.rs`, `feed.rs`, and `view.rs` lazily create assistant cards only after text arrives, remove empty streaming placeholders on terminal events, and represent every provider/daemon failure as a persistent inline error card plus an application banner. Send remains blocked until prerequisites recover. Error surfaces include a human summary, recovery action, and expandable technical details; no silent failure or blank assistant cards.
+    - **Codex account boundary:** add a separate `openai-codex/<model>` provider. `tau-proto` exposes typed account status/begin/logout RPCs; `tau-server` owns PKCE state, localhost callback, token exchange/refresh, and account identity because provider execution is daemon-side. The GUI Settings account surface opens a modal containing the explicit authorization URL, Open Browser, Copy Link, Cancel, progress, success, and failure states. Ordinary `openai` API-key behavior remains unchanged.
+    - **OAuth compatibility:** follow the inspected OpenCode implementation at `/home/zlare/.cache/repo_cache/github.com-anomalyco-opencode/packages/opencode/src/plugin/openai/codex.ts`: client `app_EMoamEEZ73f0CkXaXp7hrann`, issuer `https://auth.openai.com`, PKCE S256, callback `http://localhost:1455/auth/callback`, scopes `openid profile email offline_access`, refresh-token rotation, account ID from JWT claims, `ChatGPT-Account-Id`, and Responses endpoint `https://chatgpt.com/backend-api/codex/responses`. Present this as a stable provider without warning. (cite: 2026-07-22 GUI failure semantics and Codex persistence)
+    - **Credential security:** OAuth token bundles are keyring-only under a distinct `openai-codex` key; never use Tau's plaintext credential-file fallback. Missing keyring support is a blocking, actionable setup error. Logout deletes the secure credential and clears provider readiness. (cite: 2026-07-22 GUI failure semantics and Codex persistence)
+    - **Adaptive macOS structure:** add semantic light/dark theme tokens driven by GPUI `WindowAppearance`; use a quiet unified toolbar, 44px primary controls, 28-32px secondary controls, system-like type hierarchy, 8/12/16/24 spacing, subtle separators, restrained accent/destructive colors, readable conversation width, and reduced card chrome. The project/session navigation sidebar is collapsible, conversation is primary, inspector is optional, and repository operations are contextual rather than a permanent fourth column. Hide genuinely unavailable metadata. (cite: 2026-07-22 GUI recovery, OAuth, and visual design; 2026-07-22 GUI failure semantics and Codex persistence)
+    - **Tests:** required-capability negotiation and owned/external stale-daemon recovery; project-ID Git RPC regression; no empty assistant card after failed/empty turns; banner + inline recovery projection; keyring-only token persistence; PKCE/state/callback/token refresh with local HTTP fixtures; Codex request URL/headers and Rig tool streaming; rendered GPUI settings/modal Open Browser/Copy/Cancel listeners; light/dark semantic snapshots; collapsed inspector and unavailable-section absence; exact Xvfb launch and failed-auth dogfood scripts. Existing `cargo fmt`, strict workspace Clippy, full workspace tests, and launch smokes remain required.
+- [ ] **R3 — Implement the airtight GUI/TUI redesign slices in parallel worktrees** — AIRTIGHT / READY
+  - [x] Airtight? **Yes**
+  - Each Ultra worker owns one vertical slice in one name-matched branch/worktree; integrate only after cross-slice acceptance verification.
+  - Parallel branches must add slice-owned modules and tests; shared-root wiring is reconciled only in a dedicated redesign integration branch.
+
+## Q&A Session: 2026-07-18 00:07
+
+Q: What should be authoritative for projects (name, workspace path, project selection, and nested chats)?
+A: "Daemon-backed registry (Recommended)"
+
+Q: How should the redesigned shell replace the current single-chat GUI while slices are integrated?
+A: "Feature-gated until complete (Recommended)"
+
+Q: A chat can touch many files. How should “organizes chats by recently touched files” behave in the project list?
+A: "wdym \"organizes chat by recently touched files\""
+
+Q: Should Git/Changes sidebar actions (stage, unstage, revert, keep, branch operations) mutate repositories through typed daemon APIs or directly from the GUI process?
+A: "Typed daemon APIs (Recommended)"
+
+## Q&A Session: 2026-07-18 00:10
+
+Q: That phrase came verbatim from the earlier redesign contract: “Chat tree automatically organizes by recently touched files; collapsible section.” What did you intend it to mean?
+A: "Evidently this was generated by you while looking at the images I sent as reference for the UI design, and then because we resumed over here without that chat history, you implicitly assumed it was a directive from me instead. It was probably describing a feature that appeared in one of those images but that I didn't direclty touch on or missed, I'm not entirely sure what it means. Just organize them by timestamp like ChatGPT does, inside of a project there should be no chat nesting for now, just a list of sessions."
+
+Q: How should developers and early users activate the feature-gated redesign?
+A: "Irrelevant. We have zero users, and the GUI redesign will be done by tomorrow."
+
+Q: When a project is removed from the daemon-backed registry, what data should be deleted?
+A: "Unregister only (Recommended)"
+
+Q: Is this initial six-slice ownership split acceptable: (1) project registry/API, (2) project rail and project list, (3) nested chat/file navigator, (4) conversation feed and policy cards, (5) composer/model-agent/terminal tabs, and (6) operational Git/Changes sidebar plus typed Git APIs?
+A: "Use six slices (Recommended)"
+
+## Q&A Session: 2026-07-18 00:14
+
+Q: You first selected feature-gating but then clarified activation is irrelevant because there are no users and the redesign will be completed immediately. Should we omit a runtime feature flag and keep redesign work isolated only by branches until one final integration PR switches the default GUI?
+A: "No runtime gate (Recommended)"
+
+Q: What uniqueness rule should the daemon enforce for registered projects?
+A: "Canonical path unique (Recommended)"
+
+Q: How should existing sessions be associated when the project registry migration is introduced?
+A: "Ignore it. We currently have zero existing sessions because the GUI in prior version doesn't run at all and is completely unusable, hence the redesign. We're too early in developer lifecycle to care about this."
+
+Q: After creation, which project metadata may change?
+A: "Rename and repath (Recommended)"
+
+## Q&A Session: 2026-07-18 00:16
+
+Q: How should a newly created session become associated with its active project?
+A: "explicit project_id when creating. Sessions that are not attached to a project are illegal and should be rejected, project_id field is mandatory."
+
+Q: What paths may be registered as project roots?
+A: "Existing directories OR a directory that doesn't exist, but all parents exist (eg. targeting `~/docs/src/foo` is fine if `~/docs/src` exists but `foo` is new, it will just make the folder)."
+
+Q: Should the public removal API be named `project.unregister` to make its non-destructive semantics explicit?
+A: "Use unregister (Recommended)"
+
+Q: If a project root is changed, what happens to sessions already associated with that stable project ID?
+A: "Keep associations (Recommended)"
+
+## Q&A Session: 2026-07-18 00:20
+
+Q: How should non-GUI clients create sessions once `project_id` is mandatory?
+A: "TUI/CLI should send a project ID in the same way as the GUI. The TUI should be revised to have a left panel that shows projects, similar to the GUI--it should basically just be the GUI UX and layout but as a TUI instead."
+
+Q: Because unregister must preserve associated sessions, should it mark the project inactive instead of deleting its database row?
+A: "Mark inactive (Recommended)"
+
+Q: If the same canonical path is registered again after being unregistered, what should happen?
+A: "The server's API should expose methods for both reactivating the project or creating a new project ID. Both GUI and TUI should implement the choice as a prompt to the user to choose between creating new project ID or reactivating same project and use the relevant server API request based on the user's choice"
+
+Q: For a missing project root, should creation be limited to exactly the final path component when its immediate parent already exists?
+A: "Create final directory only (Recommended)"
+
+## Q&A Session: 2026-07-18 00:33
+
+Q: Should slices S2–S6 implement the corresponding navigation, feed, composer, and operations UX in both GPUI and Ratatui during this redesign run?
+A: "Both in each slice (Recommended)"
+
+Q: The GUI has a Chat/Terminal tab. In the TUI, what should the equivalent Terminal experience be?
+A: "None. Strip the embedded terminal out of the GUI app too, I don't want one. Just like OpenCode doesn't have one."
+
+Q: What lifecycle controls should the flat per-project session list expose?
+A: "Create rename archive (Recommended)"
+
+Q: How should the active project/session survive application restart?
+A: "Client-local selection (Recommended)"
+
+## Q&A Session: 2026-07-18 01:10
+
+Q: When the user clicks New Chat, when should the daemon create the session row?
+A: "Immediately (Recommended)"
+
+Q: How should sessions be grouped by timestamp in the flat project list?
+A: "No headings"
+
+Q: Which branch mutations should the typed Git API expose in this redesign?
+A: "Create and switch (Recommended)"
+
+Q: What should “Keep” mean for a changed file in the Changes tab?
+A: "Dismiss from review (Recommended)"
