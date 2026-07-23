@@ -401,7 +401,7 @@ impl ProjectShell {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .px_2()
+                    .px_3()
                     .py_2()
                     .rounded_md()
                     .cursor_pointer()
@@ -410,7 +410,28 @@ impl ProjectShell {
                     } else {
                         theme.sidebar
                     })
-                    .child(div().flex_1().child(project.name.clone()));
+                    .hover(move |style| {
+                        if selected {
+                            style
+                        } else {
+                            style.bg(theme.elevated)
+                        }
+                    })
+                    .child(div().flex_1().child(project.name.clone()))
+                    .when(inactive, |r| {
+                        r.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.tertiary_text)
+                                .child("inactive"),
+                        )
+                    });
+                let actions_cluster = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .opacity(0.0)
+                    .hover(|style| style.opacity(1.0));
                 if inactive {
                     let reactivate_id = id.clone();
                     let new_id = id.clone();
@@ -419,96 +440,101 @@ impl ProjectShell {
                     let new_name = name;
                     let path = project.path.clone();
                     let reactivate_path = path.clone();
-                    row = row
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("reactivate-{id}")))
-                                .debug_selector(|| format!("reactivate-{id}"))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(theme.success_surface)
-                                .text_color(theme.success_text)
-                                .cursor_pointer()
-                                .child("Reactivate")
-                                .on_click(cx.listener(move |shell, _, _, cx| {
-                                    shell.choose_inactive(
-                                        reactivate_id.clone(),
-                                        reactivate_name.clone(),
-                                        reactivate_path.clone(),
-                                    );
-                                    let _ = shell
-                                        .submit_inactive_choice(InactiveProjectChoice::Reactivate);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("new-id-{new_id}")))
-                                .debug_selector(|| format!("new-id-{new_id}"))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(theme.elevated)
-                                .text_color(theme.text)
-                                .cursor_pointer()
-                                .child("New ID")
-                                .on_click(cx.listener(move |shell, _, _, cx| {
-                                    shell.choose_inactive(
-                                        new_id.clone(),
-                                        new_name.clone(),
-                                        path.clone(),
-                                    );
-                                    let _ = shell
-                                        .submit_inactive_choice(InactiveProjectChoice::CreateNew);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        );
+                    row = row.child(
+                        actions_cluster
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("reactivate-{id}")))
+                                    .debug_selector(|| format!("reactivate-{id}"))
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .rounded_md()
+                                    .text_color(theme.accent)
+                                    .cursor_pointer()
+                                    .child("Reactivate")
+                                    .on_click(cx.listener(move |shell, _, _, cx| {
+                                        shell.choose_inactive(
+                                            reactivate_id.clone(),
+                                            reactivate_name.clone(),
+                                            reactivate_path.clone(),
+                                        );
+                                        let _ = shell.submit_inactive_choice(
+                                            InactiveProjectChoice::Reactivate,
+                                        );
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("new-id-{new_id}")))
+                                    .debug_selector(|| format!("new-id-{new_id}"))
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .rounded_md()
+                                    .text_color(theme.secondary_text)
+                                    .cursor_pointer()
+                                    .child("New ID")
+                                    .on_click(cx.listener(move |shell, _, _, cx| {
+                                        shell.choose_inactive(
+                                            new_id.clone(),
+                                            new_name.clone(),
+                                            path.clone(),
+                                        );
+                                        let _ = shell.submit_inactive_choice(
+                                            InactiveProjectChoice::CreateNew,
+                                        );
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
                 } else {
                     let update_id = id.clone();
                     let unregister_id = id.clone();
                     let update_name = project.name.clone();
                     let update_path = project.path.clone();
-                    row = row
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("update-{update_id}")))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(theme.elevated)
-                                .text_color(theme.text)
-                                .cursor_pointer()
-                                .child("Update")
-                                .on_click(cx.listener(move |shell, _, _, cx| {
-                                    shell.update_project(
-                                        update_id.clone(),
-                                        update_name.clone(),
-                                        update_path.clone(),
-                                    );
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("unregister-{unregister_id}")))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(theme.error_surface)
-                                .text_color(theme.error_text)
-                                .cursor_pointer()
-                                .child("Unregister")
-                                .on_click(cx.listener(move |shell, _, _, cx| {
-                                    shell.unregister_project(unregister_id.clone());
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        );
+                    row = row.child(
+                        actions_cluster
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("update-{update_id}")))
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .rounded_md()
+                                    .text_color(theme.secondary_text)
+                                    .cursor_pointer()
+                                    .child("Update")
+                                    .on_click(cx.listener(move |shell, _, _, cx| {
+                                        shell.update_project(
+                                            update_id.clone(),
+                                            update_name.clone(),
+                                            update_path.clone(),
+                                        );
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("unregister-{unregister_id}")))
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .rounded_md()
+                                    .text_color(theme.error_text)
+                                    .cursor_pointer()
+                                    .child("Unregister")
+                                    .on_click(cx.listener(move |shell, _, _, cx| {
+                                        shell.unregister_project(unregister_id.clone());
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
                 }
                 row = row.on_click(cx.listener(move |shell, _, _, cx| {
                     shell.select(id.clone());

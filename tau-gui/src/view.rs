@@ -1,6 +1,7 @@
 use gpui::{
     App, ClipboardItem, Context, Entity, Focusable, KeyBinding, MouseButton, MouseUpEvent, Render,
-    ScrollHandle, StatefulInteractiveElement, Task, Window, div, prelude::*, px, rgb, rgba,
+    ScrollHandle, StatefulInteractiveElement, Task, Window, deferred, div, prelude::*, px, rgb,
+    rgba,
 };
 use std::path::PathBuf;
 use tau_client::ProjectId;
@@ -1082,51 +1083,67 @@ impl TauView {
             .gap_2()
             .child(
                 div()
-                    .text_base()
+                    .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(self.theme.text)
                     .child("Repository"),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x8994a8))
+                    .text_color(self.theme.tertiary_text)
                     .child(format!("Status · {status}")),
             )
-            .child(div().child(format!("Branch: {branch}")))
-            .child(div().text_xs().child(format!("Ack · {acknowledgement}")))
-            .child(div().text_xs().child(format!("Tab · {active_tab}")))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(self.theme.secondary_text)
+                    .child(format!("Branch: {branch}")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(self.theme.tertiary_text)
+                    .child(format!("Ack · {acknowledgement}")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(self.theme.tertiary_text)
+                    .child(format!("Tab · {active_tab}")),
+            )
             .child(
                 div()
                     .flex()
                     .gap_1()
-                    .child(testable_button(
+                    .child(composer_pill(
                         "Status",
-                        0x33445f,
                         "operations-status",
+                        self.theme,
                         cx.listener(|view, _, _, cx| {
                             view.set_operations_tab(OperationsTab::Status, cx)
                         }),
                     ))
-                    .child(testable_button(
+                    .child(composer_pill(
                         "Git",
-                        0x33445f,
                         "operations-git",
+                        self.theme,
                         cx.listener(|view, _, _, cx| {
                             view.set_operations_tab(OperationsTab::Git, cx)
                         }),
                     ))
-                    .child(testable_button(
+                    .child(composer_pill(
                         "Changes",
-                        0x33445f,
                         "operations-changes",
+                        self.theme,
                         cx.listener(|view, _, _, cx| {
                             view.set_operations_tab(OperationsTab::Changes, cx)
                         }),
                     ))
-                    .child(testable_button(
+                    .child(composer_pill(
                         "Refresh",
-                        0x33445f,
                         "operations-refresh",
+                        self.theme,
                         cx.listener(|view, _, _, cx| view.refresh_operations(cx)),
                     )),
             );
@@ -1136,9 +1153,10 @@ impl TauView {
             div()
                 .flex()
                 .justify_between()
-                .child(toast_button(
+                .child(composer_pill(
                     path,
-                    0x263348,
+                    "operation-file",
+                    self.theme,
                     cx.listener(move |view, _, _, cx| {
                         view.open_operation_file(callback_path.clone(), cx)
                     }),
@@ -1165,7 +1183,7 @@ impl TauView {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().child(format!(
+                .child(div().text_color(self.theme.text).child(format!(
                     "{}\n\nCONTENT\n{}\nDIFF\n{}",
                     file.path, file.content, file.diff
                 )))
@@ -1173,53 +1191,67 @@ impl TauView {
                     div()
                         .flex()
                         .gap_1()
-                        .child(toast_button(
+                        .child(composer_pill(
                             "Stage",
-                            0x33445f,
+                            "op-stage",
+                            self.theme,
                             cx.listener(move |view, _, _, cx| {
                                 view.operation_mutation(stage_path.clone(), "stage", cx)
                             }),
                         ))
-                        .child(toast_button(
+                        .child(composer_pill(
                             "Unstage",
-                            0x33445f,
+                            "op-unstage",
+                            self.theme,
                             cx.listener(move |view, _, _, cx| {
                                 view.operation_mutation(unstage_path.clone(), "unstage", cx)
                             }),
                         ))
-                        .child(toast_button(
+                        .child(mac_button(
                             "Revert (confirm)",
-                            0x7d3b3b,
+                            "op-revert",
+                            false,
+                            self.theme,
                             cx.listener(move |view, _, _, cx| {
                                 view.operation_mutation(revert_path.clone(), "revert", cx)
                             }),
                         ))
-                        .child(toast_button(
+                        .child(composer_pill(
                             keep_label,
-                            0x52627a,
+                            "op-keep",
+                            self.theme,
                             cx.listener(|view, _, _, cx| view.keep_operation(cx)),
                         )),
                 )
-                .child(div().child("Branches"));
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(self.theme.secondary_text)
+                        .child("Branches"),
+                );
             details = details.children(self.operations.branches.iter().map(|branch| {
                 let name = branch.name.clone();
                 let callback_name = name.clone();
-                toast_button(
+                composer_pill(
                     name,
-                    0x263348,
+                    "op-branch",
+                    self.theme,
                     cx.listener(move |view, _, _, cx| {
                         view.switch_operation_branch(callback_name.clone(), cx)
                     }),
                 )
             }));
-            details = details.child(toast_button(
+            details = details.child(composer_pill(
                 "Create tau/gui-review",
-                0x33445f,
+                "op-create-branch",
+                self.theme,
                 cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
             ));
-            details = details.child(toast_button(
+            details = details.child(composer_pill(
                 "Acknowledge",
-                0x52627a,
+                "op-acknowledge",
+                self.theme,
                 cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
             ));
             panel = panel.child(details);
@@ -2477,7 +2509,9 @@ impl TauView {
             div()
                 .mt_2()
                 .p_2()
-                .bg(rgb(0x11151b))
+                .rounded_md()
+                .bg(self.theme.surface)
+                .text_color(self.theme.text)
                 .child(format!("Command: {}", query))
         } else {
             div().mt_2().child(self.picker_input.clone())
@@ -2486,38 +2520,58 @@ impl TauView {
             .absolute()
             .inset_0()
             .flex()
-            .items_center()
+            .items_start()
             .justify_center()
-            .bg(rgb(0x66000000))
+            .pt(px(120.))
+            .bg(rgba(0x00000099))
             .child(
                 div()
                     .key_context("Picker")
-                    .w(px(560.))
+                    .w(px(480.))
                     .max_h(px(520.))
                     .p_4()
-                    .rounded_lg()
-                    .bg(rgb(0x202630))
+                    .rounded_xl()
+                    .bg(self.theme.elevated)
                     .border_1()
-                    .border_color(rgb(0x52627a))
+                    .border_color(self.theme.separator)
+                    .shadow_lg()
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(self.theme.text)
                             .child(title),
                     )
                     .child(search)
                     .children(rows.into_iter().enumerate().map(
                         |(display_index, (row, item_index))| {
                             let selected = item_index == Some(self.picker_index);
+                            let is_header = item_index.is_none();
                             let favorite_model = (kind == PickerKind::Model)
                                 .then(|| item_index.and_then(|index| items.get(index).cloned()))
                                 .flatten();
                             let mut row_view = div()
                                 .id(("picker-row", display_index))
                                 .mt_1()
-                                .p_2()
+                                .px_3()
+                                .py_2()
                                 .rounded_md()
-                                .when(selected, |d| d.bg(rgb(0x34506f)))
+                                .text_color(if is_header {
+                                    self.theme.secondary_text
+                                } else {
+                                    self.theme.text
+                                })
+                                .text_xs()
+                                .when(is_header, |d| {
+                                    d.font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(self.theme.tertiary_text)
+                                })
+                                .when(selected, |d| {
+                                    d.bg(self.theme.accent).text_color(rgb(0xffffff))
+                                })
+                                .when(!is_header && !selected, |d| {
+                                    d.hover(|style| style.bg(self.theme.surface))
+                                })
                                 .when(item_index.is_some(), |d| {
                                     d.cursor_pointer().on_mouse_up(
                                         MouseButton::Left,
@@ -2554,7 +2608,7 @@ impl TauView {
                         div()
                             .mt_3()
                             .text_xs()
-                            .text_color(rgb(0x8994a8))
+                            .text_color(self.theme.tertiary_text)
                             .child("↑↓ navigate  Enter select  Esc close"),
                     ),
             )
@@ -2757,75 +2811,104 @@ impl Render for TauView {
                 })
                 .child(div().flex_1().child(message.to_string()));
             if failed {
-                banner = banner.child(toast_button(
+                banner = banner.child(mac_button(
                     "Retry",
-                    0x52627a,
+                    "banner-retry",
+                    true,
+                    self.theme,
                     cx.listener(Self::retry_runtime),
                 ));
                 if self.backend.owns_daemon() {
-                    banner = banner.child(toast_button(
-                        "Restart Tau Daemon",
-                        0x6a5834,
+                    banner = banner.child(mac_button(
+                        "Restart Daemon",
+                        "banner-restart",
+                        false,
+                        self.theme,
                         cx.listener(Self::restart_runtime),
                     ));
                 }
             }
             if self.backend.owns_daemon() {
-                banner = banner.child(toast_button(
-                    "Disown safely",
-                    0x6a5834,
+                banner = banner.child(mac_button(
+                    "Disown",
+                    "banner-disown",
+                    false,
+                    self.theme,
                     cx.listener(Self::disown_daemon),
                 ));
             }
-            banner.child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui)))
+            banner.child(mac_button(
+                "Quit",
+                "banner-quit",
+                false,
+                self.theme,
+                cx.listener(Self::quit_gui),
+            ))
         });
-        let toast = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .p_3()
-            .bg(rgb(0x463b24))
-            .text_color(rgb(0xf3d28a))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child("tau started the daemon automatically for this GUI session")
-                    .child(div().text_xs().child(
-                        "The daemon will remain owned by this window unless you disown it.",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .id("startup-actions")
-                    .max_h(px(420.))
-                    .overflow_y_scroll()
-                    .gap_2()
-                    .child(toast_button(
-                        "Okay",
-                        0xd8aa4e,
-                        cx.listener(Self::hide_toast),
-                    ))
-                    .child(toast_button(
-                        "Don't show again",
-                        0x6a5834,
-                        cx.listener(Self::never_show_toast),
-                    ))
-                    .child(toast_button(
-                        "Disown",
-                        0x6a5834,
-                        cx.listener(Self::disown_daemon),
-                    ))
-                    .child(toast_button(
-                        "Always disown",
-                        0x6a5834,
-                        cx.listener(Self::always_disown_daemon),
-                    ))
-                    .child(toast_button("Quit", 0x7d3b3b, cx.listener(Self::quit_gui))),
-            );
+        let toast =
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .p_3()
+                .bg(self.theme.elevated)
+                .border_1()
+                .border_color(self.theme.separator)
+                .text_color(self.theme.text)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child("Tau started the daemon automatically for this session.")
+                        .child(div().text_xs().text_color(self.theme.secondary_text).child(
+                            "The daemon remains owned by this window unless you disown it.",
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .id("startup-actions")
+                        .max_h(px(420.))
+                        .overflow_y_scroll()
+                        .gap_2()
+                        .child(mac_button(
+                            "Okay",
+                            "toast-okay",
+                            true,
+                            self.theme,
+                            cx.listener(Self::hide_toast),
+                        ))
+                        .child(mac_button(
+                            "Don't show again",
+                            "toast-never",
+                            false,
+                            self.theme,
+                            cx.listener(Self::never_show_toast),
+                        ))
+                        .child(mac_button(
+                            "Disown",
+                            "toast-disown",
+                            false,
+                            self.theme,
+                            cx.listener(Self::disown_daemon),
+                        ))
+                        .child(mac_button(
+                            "Always disown",
+                            "toast-always",
+                            false,
+                            self.theme,
+                            cx.listener(Self::always_disown_daemon),
+                        ))
+                        .child(mac_button(
+                            "Quit",
+                            "toast-quit",
+                            false,
+                            self.theme,
+                            cx.listener(Self::quit_gui),
+                        )),
+                );
         let transcript = div()
             .id("transcript")
             .track_scroll(&self.transcript_scroll)
@@ -2967,18 +3050,22 @@ impl Render for TauView {
                         div()
                             .flex()
                             .gap_2()
-                            .child(toast_button(
+                            .child(mac_button(
                                 "Retry",
-                                0x0a84ff,
+                                "error-retry",
+                                true,
+                                self.theme,
                                 cx.listener(Self::retry_last_prompt),
                             ))
-                            .child(toast_button(
+                            .child(mac_button(
                                 if expanded {
                                     "Hide Details"
                                 } else {
                                     "Show Details"
                                 },
-                                0x52627a,
+                                "error-toggle",
+                                false,
+                                self.theme,
                                 cx.listener(move |view, event, window, cx| {
                                     view.toggle_error(index, event, window, cx)
                                 }),
@@ -2996,16 +3083,20 @@ impl Render for TauView {
                         div()
                             .flex()
                             .gap_2()
-                            .child(toast_button(
+                            .child(mac_button(
                                 "Accept",
-                                0x39734a,
+                                "diff-accept",
+                                true,
+                                self.theme,
                                 cx.listener(move |view, event, window, cx| {
                                     view.choose_diff(index, true, event, window, cx)
                                 }),
                             ))
-                            .child(toast_button(
+                            .child(mac_button(
                                 "Reject",
-                                0x7d3b3b,
+                                "diff-reject",
+                                false,
+                                self.theme,
                                 cx.listener(move |view, event, window, cx| {
                                     view.choose_diff(index, false, event, window, cx)
                                 }),
@@ -3016,17 +3107,19 @@ impl Render for TauView {
                     card_view = card_view.child(
                         div().flex().gap_2().children(
                             [
-                                (PermissionChoice::AllowOnce, "Allow once", 0x39734a),
-                                (PermissionChoice::AllowAlways, "Always", 0x39734a),
-                                (PermissionChoice::Reject, "Reject", 0x7d3b3b),
-                                (PermissionChoice::Inspect, "Inspect", 0x52627a),
-                                (PermissionChoice::Cancel, "Cancel", 0x52627a),
+                                (PermissionChoice::AllowOnce, "Allow once", true),
+                                (PermissionChoice::AllowAlways, "Always", true),
+                                (PermissionChoice::Reject, "Reject", false),
+                                (PermissionChoice::Inspect, "Inspect", false),
+                                (PermissionChoice::Cancel, "Cancel", false),
                             ]
                             .into_iter()
-                            .map(|(choice, label, color)| {
-                                toast_button(
+                            .map(|(choice, label, primary)| {
+                                mac_button(
                                     label,
-                                    color,
+                                    "permission-choice",
+                                    primary,
+                                    self.theme,
                                     cx.listener(move |view, event, window, cx| {
                                         view.choose_permission(index, choice, event, window, cx)
                                     }),
@@ -3040,16 +3133,20 @@ impl Render for TauView {
                         div()
                             .flex()
                             .gap_2()
-                            .child(toast_button(
+                            .child(mac_button(
                                 "Yes",
-                                0x39734a,
+                                "question-yes",
+                                true,
+                                self.theme,
                                 cx.listener(move |view, event, window, cx| {
                                     view.answer_question(index, "yes", event, window, cx)
                                 }),
                             ))
-                            .child(toast_button(
+                            .child(mac_button(
                                 "No",
-                                0x7d3b3b,
+                                "question-no",
+                                false,
+                                self.theme,
                                 cx.listener(move |view, event, window, cx| {
                                     view.answer_question(index, "no", event, window, cx)
                                 }),
@@ -3079,28 +3176,35 @@ impl Render for TauView {
                             .gap_1()
                             .p_3()
                             .rounded_md()
-                            .bg(rgb(0x202630))
+                            .bg(self.theme.surface)
+                            .border_1()
+                            .border_color(self.theme.separator)
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x8994a8))
+                                    .text_color(self.theme.tertiary_text)
                                     .child(label.clone()),
                             )
-                            .child(feed_body(item.role_mark, item.visible_detail().to_owned()));
+                            .child(
+                                feed_body(item.role_mark, item.visible_detail().to_owned())
+                                    .text_color(self.theme.text),
+                            );
                         if item.actions.permission {
                             item_view = item_view.child(
                                 div().flex().gap_2().children(
                                     [
-                                        (PermissionChoice::AllowOnce, "Allow once", 0x39734a),
-                                        (PermissionChoice::Reject, "Reject", 0x7d3b3b),
+                                        (PermissionChoice::AllowOnce, "Allow once", true),
+                                        (PermissionChoice::Reject, "Reject", false),
                                     ]
                                     .into_iter()
                                     .map(
-                                        |(choice, label, color)| {
+                                        |(choice, label, primary)| {
                                             let request_id = request_id.to_owned();
-                                            toast_button(
+                                            mac_button(
                                                 label,
-                                                color,
+                                                "feed-permission",
+                                                primary,
+                                                self.theme,
                                                 cx.listener(move |view, event, window, cx| {
                                                     if let Some(index) = view
                                                         .card_index_for_request(
@@ -3122,9 +3226,11 @@ impl Render for TauView {
                             item_view = item_view.child(div().flex().gap_2().children(
                                 ["yes", "no"].into_iter().map(|answer| {
                                     let request_id = request_id.to_owned();
-                                    toast_button(
+                                    mac_button(
                                         answer,
-                                        if answer == "yes" { 0x39734a } else { 0x7d3b3b },
+                                        "feed-question",
+                                        answer == "yes",
+                                        self.theme,
                                         cx.listener(move |view, event, window, cx| {
                                             if let Some(index) =
                                                 view.card_index_for_request(&request_id, category)
@@ -3140,13 +3246,15 @@ impl Render for TauView {
                         } else if item.actions.diff {
                             item_view = item_view.child(
                                 div().flex().gap_2().children(
-                                    [(true, "Accept", 0x39734a), (false, "Reject", 0x7d3b3b)]
+                                    [(true, "Accept", true), (false, "Reject", false)]
                                         .into_iter()
-                                        .map(|(approved, label, color)| {
+                                        .map(|(approved, label, primary)| {
                                             let request_id = request_id.to_owned();
-                                            toast_button(
+                                            mac_button(
                                                 label,
-                                                color,
+                                                "feed-diff",
+                                                primary,
+                                                self.theme,
                                                 cx.listener(move |view, event, window, cx| {
                                                     if let Some(index) = view
                                                         .card_index_for_request(
@@ -3213,7 +3321,13 @@ impl Render for TauView {
                     .max_w(px(900.))
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_2()
+                    .p_3()
+                    .rounded_xl()
+                    .bg(self.theme.surface)
+                    .border_1()
+                    .border_color(self.theme.separator)
+                    .shadow_sm()
                     .child(self.input.clone())
                     .child({
                         let input = self.input.read(cx);
@@ -3224,13 +3338,14 @@ impl Render for TauView {
                             .items_center()
                             .gap_2()
                             .text_xs()
-                            .text_color(rgb(0x8994a8))
+                            .text_color(self.theme.tertiary_text)
                             .children(refs.into_iter().map(|reference| {
                                 div()
                                     .px_2()
                                     .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x293b52))
+                                    .rounded_md()
+                                    .bg(self.theme.elevated)
+                                    .text_color(self.theme.secondary_text)
                                     .child(reference)
                             }))
                             .child(format!("{} characters", char_count))
@@ -3238,9 +3353,9 @@ impl Render for TauView {
                     .child(
                         div()
                             .flex()
-                            .items_end()
-                            .gap_3()
-                            .child(testable_button(
+                            .items_center()
+                            .gap_2()
+                            .child(composer_pill(
                                 &format!(
                                     "Agent · {}",
                                     if self.agent.is_empty() {
@@ -3249,27 +3364,30 @@ impl Render for TauView {
                                         &self.agent
                                     }
                                 ),
-                                0x33445f,
                                 "agent-button",
+                                self.theme,
                                 cx.listener(Self::click_agent),
                             ))
-                            .child(testable_button(
+                            .child(composer_pill(
                                 &format!("Model · {}", current_model),
-                                0x33445f,
                                 "model-button",
+                                self.theme,
                                 cx.listener(Self::click_model),
                             ))
+                            .child(div().flex_1())
                             .child(
                                 div()
                                     .id("send-button")
                                     .debug_selector(|| "send-button".into())
                                     .px_4()
-                                    .py_3()
-                                    .bg(rgb(0x85b8ff))
-                                    .hover(|style| style.bg(rgb(0xa8ccff)))
+                                    .h(px(32.))
+                                    .flex()
+                                    .items_center()
+                                    .bg(self.theme.accent)
+                                    .hover(|style| style.bg(self.theme.accent_hover))
                                     .focusable()
-                                    .text_color(rgb(0x10151e))
-                                    .rounded_lg()
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
                                     .cursor_pointer()
                                     .when(send_blocked, |button| button.opacity(0.45))
                                     .on_mouse_up(MouseButton::Left, cx.listener(Self::click_send))
@@ -3281,39 +3399,23 @@ impl Render for TauView {
                 footer.child(
                     div()
                         .id("cancel-button")
+                        .absolute()
+                        .bottom(px(16.))
+                        .right(px(16.))
                         .px_3()
-                        .py_2()
-                        .bg(rgb(0x7d3b3b))
-                        .hover(|style| style.bg(rgb(0xa34c4c)))
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .bg(self.theme.error_surface)
+                        .hover(|style| style.bg(self.theme.error_text))
                         .focusable()
-                        .rounded_lg()
+                        .text_color(self.theme.error_text)
+                        .rounded_md()
                         .cursor_pointer()
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_turn))
                         .child("Cancel"),
                 )
-            })
-            .child(
-                div()
-                    .mt_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(self.theme.separator)
-                    .text_xs()
-                    .text_color(rgb(0x8994a8))
-                    .child(format!(
-                        "Connection · {}",
-                        match self.backend.daemon_status() {
-                            DaemonStatus::Ready => "connected",
-                            DaemonStatus::Absent => "offline",
-                            DaemonStatus::Spawning
-                            | DaemonStatus::Connecting
-                            | DaemonStatus::Negotiating => "connecting",
-                            DaemonStatus::Incompatible
-                            | DaemonStatus::Degraded
-                            | DaemonStatus::Failed => "degraded",
-                        }
-                    )),
-            );
+            });
         let mut root = div()
             .size_full()
             .bg(self.theme.canvas)
@@ -3332,9 +3434,10 @@ impl Render for TauView {
         root = root.on_action(cx.listener(Self::pick_item));
         let command_active = self.picker.is_none() && command_mode(&self.input.read(cx).content());
         if let Some(kind) = self.picker {
-            root = root.child(self.picker_overlay(cx, kind));
+            root = root.child(deferred(self.picker_overlay(cx, kind)).with_priority(10));
         } else if command_active {
-            root = root.child(self.picker_overlay(cx, PickerKind::Command));
+            root = root
+                .child(deferred(self.picker_overlay(cx, PickerKind::Command)).with_priority(10));
         }
         root = root.on_action(cx.listener(Self::toggle_sidebar));
         root = root.on_action(cx.listener(Self::toggle_follow));
@@ -3364,10 +3467,13 @@ impl Render for TauView {
             )
             .child(footer)
             .when(self.toast_visible, |root| {
-                root.child(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
+                root.child(
+                    deferred(toast.absolute().top(px(0.)).left(px(0.)).right(px(0.)))
+                        .with_priority(5),
+                )
             })
             .when(self.account_sheet, |root| {
-                root.child(self.account_sheet(cx))
+                root.child(deferred(self.account_sheet(cx)).with_priority(20))
             })
     }
 }
@@ -3390,13 +3496,21 @@ fn sidebar_card(title: &str, value: &str, theme: Theme) -> impl IntoElement {
         .p_3()
         .rounded_md()
         .bg(theme.surface)
+        .border_1()
+        .border_color(theme.separator)
         .child(
             div()
                 .text_xs()
-                .text_color(theme.secondary_text)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.tertiary_text)
                 .child(title.to_string()),
         )
-        .child(div().text_sm().child(value.to_string()))
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.text)
+                .child(value.to_string()),
+        )
 }
 
 fn mac_button<T>(
@@ -3465,6 +3579,31 @@ where
         .rounded_sm()
         .bg(rgb(color))
         .hover(|style| style.opacity(0.9))
+        .cursor_pointer()
+        .on_mouse_up(MouseButton::Left, callback)
+        .child(label.into())
+}
+
+fn composer_pill<T>(
+    label: impl Into<String>,
+    selector: &'static str,
+    theme: Theme,
+    callback: T,
+) -> impl IntoElement
+where
+    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+{
+    div()
+        .debug_selector(|| selector.into())
+        .h(px(28.))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .bg(theme.elevated)
+        .text_color(theme.secondary_text)
+        .text_xs()
+        .hover(move |style| style.bg(theme.surface))
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, callback)
         .child(label.into())
