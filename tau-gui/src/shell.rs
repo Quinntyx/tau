@@ -548,12 +548,15 @@ impl ProjectShell {
                     } else {
                         let update_id = id.clone();
                         let unregister_id = id.clone();
+                        let update_debug = update_id.clone();
+                        let unregister_debug = unregister_id.clone();
                         let update_name = project.name.clone();
                         let update_path = project.path.clone();
                         dropdown = dropdown
                             .child(
                                 div()
                                     .id(SharedString::from(format!("update-{update_id}")))
+                                    .debug_selector(move || format!("update-{update_debug}"))
                                     .px_2()
                                     .py_1()
                                     .text_xs()
@@ -576,6 +579,9 @@ impl ProjectShell {
                             .child(
                                 div()
                                     .id(SharedString::from(format!("unregister-{unregister_id}")))
+                                    .debug_selector(move || {
+                                        format!("unregister-{unregister_debug}")
+                                    })
                                     .px_2()
                                     .py_1()
                                     .text_xs()
