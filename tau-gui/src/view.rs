@@ -2173,6 +2173,7 @@ impl TauView {
     }
 
     fn retry_runtime(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_auth(cx);
         self.backend.daemon_action(DaemonAction::Retry);
         self.runtime = RuntimeState::NotNegotiated;
         self.chat.status = ChatStatus::Ready;
@@ -2207,7 +2208,17 @@ impl TauView {
             let _ = view.update(cx, |view, cx| {
                 view.auth_loading = false;
                 match result {
-                    Ok(Ok(result)) => view.auth_status = result.status,
+                    Ok(Ok(result)) => {
+                        let signed_in = matches!(result.status, AuthState::SignedIn { .. });
+                        view.auth_status = result.status;
+                        if signed_in {
+                            view.account_sheet = false;
+                            if matches!(&view.runtime, RuntimeState::Failed(msg) if msg.contains("ChatGPT")) {
+                                view.runtime = RuntimeState::NotNegotiated;
+                                view.backend.daemon_action(DaemonAction::Retry);
+                            }
+                        }
+                    }
                     Ok(Err(error)) => view.auth_error = Some(error.to_string()),
                     Err(error) => view.auth_error = Some(error.to_string()),
                 }
@@ -2249,7 +2260,9 @@ impl TauView {
                             view.auth_status = result.status;
                             view.auth_error = None;
                             if signed_in {
+                                view.account_sheet = false;
                                 view.runtime = RuntimeState::NotNegotiated;
+                                view.backend.daemon_action(DaemonAction::Retry);
                             }
                         }
                         Ok(Err(error)) => view.auth_error = Some(error.to_string()),
