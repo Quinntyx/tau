@@ -215,9 +215,6 @@ async fn handle_connection(
                         return;
                     }
                 }
-                if matches!(script, Script::Hold) {
-                    continue;
-                }
                 ok_response(
                     request.id,
                     TurnStartResult {

@@ -1,6 +1,6 @@
 //! `Provider` enum — one variant per supported LLM provider.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rig_core::client::CompletionClient;
 use rig_core::completion::{CompletionError, CompletionRequest};
 use rig_core::providers::{
@@ -34,6 +34,7 @@ pub enum Provider {
     Moonshot(moonshot::CompletionModel),
     Ollama(ollama::CompletionModel),
     OpenAI(openai::responses_api::ResponsesCompletionModel),
+    OpenAICodex(openai::responses_api::ResponsesCompletionModel),
     OpenRouter(openrouter::CompletionModel),
     Perplexity(perplexity::CompletionModel),
     Together(together::CompletionModel),
@@ -89,6 +90,30 @@ macro_rules! make_azure {
 }
 
 impl Provider {
+    pub fn openai_codex(model_id: &str, tokens: &crate::codex::CodexTokenBundle) -> Result<Self> {
+        use rig_core::client::CompletionClient;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static("tau"),
+        );
+        if let Some(account_id) = &tokens.account_id {
+            headers.insert(
+                "chatgpt-account-id",
+                reqwest::header::HeaderValue::from_str(account_id)
+                    .context("invalid ChatGPT account identifier")?,
+            );
+        }
+        let client = openai::Client::builder()
+            .api_key(tokens.access_token.clone())
+            .base_url(crate::codex::CODEX_API_BASE)
+            .http_headers(headers)
+            .build()
+            .context("building Codex provider")?;
+        Ok(Self::OpenAICodex(client.completion_model(model_id)))
+    }
+
     /// Construct the provider-specific completion model.
     ///
     /// `provider_id` is the lowercase id (e.g. `"openai"`), `model_id` is the
@@ -158,6 +183,7 @@ impl Provider {
             Self::Moonshot(m) => super::ops::stream_with_model(m, request).await,
             Self::Ollama(m) => super::ops::stream_with_model(m, request).await,
             Self::OpenAI(m) => super::ops::stream_with_model(m, request).await,
+            Self::OpenAICodex(m) => super::ops::stream_with_model(m, request).await,
             Self::OpenRouter(m) => super::ops::stream_with_model(m, request).await,
             Self::Perplexity(m) => super::ops::stream_with_model(m, request).await,
             Self::Together(m) => super::ops::stream_with_model(m, request).await,

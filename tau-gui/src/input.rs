@@ -4,11 +4,12 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyBinding, LayoutId,
     PaintQuad, Pixels, Render, ShapedLine, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    fill, point, prelude::*, px, relative, rgb,
+    fill, point, prelude::*, px, relative,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::composer::{Composer, ComposerAction, Selection};
+use crate::theme::Theme;
 
 /// GPUI-facing adapter for the canonical, window-independent composer.
 /// GPUI still owns focus, layout, and IME UTF-16 conversion; all editing
@@ -819,7 +820,8 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::for_appearance(window.appearance());
         gpui::div()
             .key_context("TauPromptInput")
             .track_focus(&self.focus_handle(cx))
@@ -848,9 +850,9 @@ impl Render for TextInput {
             .w_full()
             .min_h(px(72.))
             .p(px(12.))
-            .bg(rgb(0x1b1f27))
+            .bg(theme.surface)
             .border_1()
-            .border_color(rgb(0x394354))
+            .border_color(theme.separator)
             .rounded_lg()
             .when(self.disabled(), |element| element.opacity(0.6))
             .child(TextElement { input: cx.entity() })

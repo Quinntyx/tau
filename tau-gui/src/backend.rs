@@ -11,6 +11,10 @@ use tau_client::{
     ActiveSessionStore, CreateSession, ProjectId, SessionHistory, SessionRef, SessionRename,
     SessionSummary,
 };
+use tau_proto::auth::{
+    AuthBeginResult, AuthCancelResult, AuthLogoutResult, AuthProviderParams, AuthState,
+    AuthStatusResult, OPENAI_CODEX_PROVIDER,
+};
 use tau_proto::git::{GitAckResult, GitBranchesResult, GitFileResult, GitStatusResult};
 use tau_proto::prelude::{
     Capability, ClientResponse, IdempotencyKey, ProtocolNegotiateParams, ProtocolVersion,
@@ -82,6 +86,15 @@ pub enum DaemonStatus {
     Degraded,
     Ready,
     Failed,
+}
+
+fn required_capabilities() -> Vec<Capability> {
+    vec![
+        Capability::TurnStreaming,
+        Capability::TurnCancellation,
+        Capability::Idempotency,
+        Capability::EventReplay,
+    ]
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -250,15 +263,7 @@ impl Backend {
     async fn typed_client(&self) -> Result<tau_client::Client> {
         let mut guard = self.session.lock().await;
         if guard.is_none() {
-            *guard = Some(connect_or_start(&self.socket, &self._daemon).await?);
-            guard
-                .as_ref()
-                .unwrap()
-                .negotiate_checked(ProtocolNegotiateParams {
-                    version: ProtocolVersion { major: 1, minor: 0 },
-                    capabilities: vec![],
-                })
-                .await?;
+            *guard = Some(connect_required(&self.socket, &self._daemon, &self.status).await?);
         }
         Ok(guard.as_ref().unwrap().clone())
     }
@@ -312,6 +317,64 @@ impl Backend {
                     include_inactive: Some(include_inactive),
                 })
                 .await
+        })
+    }
+
+    pub fn auth_status(&self) -> tokio::task::JoinHandle<Result<AuthStatusResult>> {
+        self.project_request(|client| async move {
+            client
+                .auth_status(AuthProviderParams {
+                    provider: OPENAI_CODEX_PROVIDER.into(),
+                })
+                .await
+        })
+    }
+
+    pub fn auth_begin(&self) -> tokio::task::JoinHandle<Result<AuthBeginResult>> {
+        self.project_request(|client| async move {
+            client
+                .auth_begin(AuthProviderParams {
+                    provider: OPENAI_CODEX_PROVIDER.into(),
+                })
+                .await
+        })
+    }
+
+    pub fn auth_cancel(&self) -> tokio::task::JoinHandle<Result<AuthCancelResult>> {
+        self.project_request(|client| async move {
+            client
+                .auth_cancel(AuthProviderParams {
+                    provider: OPENAI_CODEX_PROVIDER.into(),
+                })
+                .await
+        })
+    }
+
+    pub fn auth_logout(&self) -> tokio::task::JoinHandle<Result<AuthLogoutResult>> {
+        self.project_request(|client| async move {
+            client
+                .auth_logout(AuthProviderParams {
+                    provider: OPENAI_CODEX_PROVIDER.into(),
+                })
+                .await
+        })
+    }
+
+    pub fn auth_wait(&self) -> tokio::task::JoinHandle<Result<AuthStatusResult>> {
+        let backend = self.clone();
+        self.runtime.spawn(async move {
+            let client = backend.typed_client().await?;
+            loop {
+                let status = client
+                    .auth_status(AuthProviderParams {
+                        provider: OPENAI_CODEX_PROVIDER.into(),
+                    })
+                    .await?;
+                if !matches!(status.status, AuthState::Pending { .. }) {
+                    return Ok(status);
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         })
     }
 
@@ -625,27 +688,7 @@ impl Backend {
             let result = async {
                 let mut guard = session.lock().await;
                 if guard.is_none() {
-                    status
-                        .lock()
-                        .map(|mut s| *s = DaemonStatus::Connecting)
-                        .ok();
-                    *guard = Some(connect_or_start(&socket, &daemon).await?);
-                    status
-                        .lock()
-                        .map(|mut s| *s = DaemonStatus::Negotiating)
-                        .ok();
-                    let report = guard
-                        .as_ref()
-                        .unwrap()
-                        .negotiate_checked(ProtocolNegotiateParams {
-                            version: ProtocolVersion { major: 1, minor: 0 },
-                            capabilities: vec![],
-                        })
-                        .await?;
-                    if !report.is_usable() {
-                        anyhow::bail!("daemon protocol incompatible")
-                    }
-                    status.lock().map(|mut s| *s = DaemonStatus::Ready).ok();
+                    *guard = Some(connect_required(&socket, &daemon, &status).await?);
                 }
                 call(guard.as_ref().unwrap().clone(), project).await
             }
@@ -791,6 +834,10 @@ impl Backend {
                 .and_then(|path| crate::preferences::GuiPreferences::load_from(&path).ok())
                 .map(|preferences| preferences.daemon_warning)
                 .unwrap_or(true)
+    }
+
+    pub fn owns_daemon(&self) -> bool {
+        self._daemon.0.lock().is_ok_and(|daemon| daemon.is_some())
     }
 
     pub fn daemon_status(&self) -> DaemonStatus {
@@ -951,70 +998,13 @@ impl Backend {
         self.cancel();
         let task = self.runtime.spawn(async move {
             let result = async {
-                let mut guard = session.lock().await;
-                if guard.is_none() {
-                    status
-                        .lock()
-                        .map(|mut s| *s = DaemonStatus::Connecting)
-                        .ok();
-                    *guard = Some(connect_or_start(&socket, &daemon).await?);
-                    status
-                        .lock()
-                        .map(|mut s| *s = DaemonStatus::Negotiating)
-                        .ok();
-                    let report = match tokio::time::timeout(
-                        Duration::from_secs(1),
-                        guard
-                            .as_ref()
-                            .expect("session initialized")
-                            .negotiate_checked(ProtocolNegotiateParams {
-                                version: ProtocolVersion { major: 1, minor: 0 },
-                                capabilities: vec![
-                                    Capability::TurnStreaming,
-                                    Capability::TurnCancellation,
-                                    Capability::Idempotency,
-                                    Capability::EventReplay,
-                                ],
-                            }),
-                    )
-                    .await
-                    .context("protocol negotiation timed out")?
-                    {
-                        Ok(report) => report,
-                        Err(error) => {
-                            status
-                                .lock()
-                                .map(|mut s| *s = DaemonStatus::Incompatible)
-                                .ok();
-                            guard.take();
-                            return Err(error);
-                        }
-                    };
-                    if report.compatibility == tau_client::ProtocolCompatibility::Incompatible {
-                        status
-                            .lock()
-                            .map(|mut s| *s = DaemonStatus::Incompatible)
-                            .ok();
-                        guard.take();
-                        anyhow::bail!(
-                            "daemon protocol incompatible; missing {:?}",
-                            report.missing_capabilities
-                        );
+                let client = {
+                    let mut guard = session.lock().await;
+                    if guard.is_none() {
+                        *guard = Some(connect_required(&socket, &daemon, &status).await?);
                     }
-                    status
-                        .lock()
-                        .map(|mut s| {
-                            *s = if report.compatibility
-                                == tau_client::ProtocolCompatibility::Degraded
-                            {
-                                DaemonStatus::Degraded
-                            } else {
-                                DaemonStatus::Ready
-                            }
-                        })
-                        .ok();
-                }
-                let client = guard.as_mut().expect("session initialized");
+                    guard.as_ref().expect("session initialized").clone()
+                };
                 let params = TurnRequest {
                     prompt,
                     session_id,
@@ -1023,34 +1013,44 @@ impl Backend {
                     agent,
                 }
                 .into_params(cwd, String::new())?;
+                let mut events = client.events();
                 let mut stream = client.turn_start(params).await?;
-                while let Some(event) = stream.next().await {
-                    let event = event?;
-                    if let TurnStreamEvent::Event(ref sequenced) = event {
-                        if let tau_proto::prelude::TurnEvent::TurnStarted { turn_id } =
-                            &sequenced.event
-                        {
-                            if let Ok(mut active) = active_turn.lock() {
-                                let context = (
-                                    client.clone(),
-                                    sequenced.session_id.clone(),
-                                    turn_id.clone(),
-                                );
-                                *active = Some(context.clone());
-                                if let Ok(mut response) = response_context.lock() {
-                                    *response = Some(context);
-                                }
-                            }
-                        }
+                let started = loop {
+                    let event = stream
+                        .next()
+                        .await
+                        .context("turn admission stream closed")??;
+                    if let TurnStreamEvent::Complete(started) = event {
+                        break started;
                     }
-                    let complete = matches!(event, TurnStreamEvent::Complete(_));
+                };
+                let context = (
+                    client.clone(),
+                    started.session_id.clone(),
+                    started.turn_id.clone(),
+                );
+                if let Ok(mut active) = active_turn.lock() {
+                    *active = Some(context.clone());
+                }
+                if let Ok(mut response) = response_context.lock() {
+                    *response = Some(context);
+                }
+                while let Some(event) = events.next().await {
+                    let event = event?;
+                    if event.session_id != started.session_id {
+                        continue;
+                    }
+                    let terminal = terminal_for_turn(&event.event, &started.turn_id);
                     sender
-                        .send(Ok(event))
+                        .send(Ok(TurnStreamEvent::Event(event)))
                         .map_err(|_| anyhow::anyhow!("GUI closed"))?;
-                    if complete {
+                    if terminal {
                         if let Ok(mut active) = active_turn.lock() {
                             active.take();
                         }
+                        sender
+                            .send(Ok(TurnStreamEvent::Complete(started)))
+                            .map_err(|_| anyhow::anyhow!("GUI closed"))?;
                         break;
                     }
                 }
@@ -1160,54 +1160,7 @@ impl Backend {
             let result = async {
                 let mut guard = session.lock().await;
                 if guard.is_none() {
-                    status
-                        .lock()
-                        .map(|mut s| *s = DaemonStatus::Connecting)
-                        .ok();
-                    *guard = Some(connect_or_start(&socket, &daemon).await?);
-                    status
-                        .lock()
-                        .map(|mut s| *s = DaemonStatus::Negotiating)
-                        .ok();
-                    let report = match guard
-                        .as_ref()
-                        .unwrap()
-                        .negotiate_checked(ProtocolNegotiateParams {
-                            version: ProtocolVersion { major: 1, minor: 0 },
-                            capabilities: vec![Capability::EventReplay],
-                        })
-                        .await
-                    {
-                        Ok(report) => report,
-                        Err(error) => {
-                            status
-                                .lock()
-                                .map(|mut s| *s = DaemonStatus::Incompatible)
-                                .ok();
-                            guard.take();
-                            return Err(error);
-                        }
-                    };
-                    if !report.is_usable() {
-                        status
-                            .lock()
-                            .map(|mut s| *s = DaemonStatus::Incompatible)
-                            .ok();
-                        guard.take();
-                        anyhow::bail!("daemon protocol incompatible")
-                    }
-                    status
-                        .lock()
-                        .map(|mut s| {
-                            *s = if report.compatibility
-                                == tau_client::ProtocolCompatibility::Degraded
-                            {
-                                DaemonStatus::Degraded
-                            } else {
-                                DaemonStatus::Ready
-                            }
-                        })
-                        .ok();
+                    *guard = Some(connect_required(&socket, &daemon, &status).await?);
                 }
                 let client = guard.as_ref().unwrap();
                 client
@@ -1223,6 +1176,19 @@ impl Backend {
             let _ = tx.send(result);
         });
         rx
+    }
+}
+
+fn terminal_for_turn(event: &tau_proto::prelude::TurnEvent, turn_id: &str) -> bool {
+    match event {
+        tau_proto::prelude::TurnEvent::TurnCompleted {
+            turn_id: event_id, ..
+        }
+        | tau_proto::prelude::TurnEvent::TurnFailed {
+            turn_id: event_id, ..
+        }
+        | tau_proto::prelude::TurnEvent::TurnCancelled { turn_id: event_id } => event_id == turn_id,
+        _ => false,
     }
 }
 
@@ -1277,6 +1243,84 @@ async fn connect_or_start(
             None => Err(connect_error),
         },
     }
+}
+
+async fn connect_required(
+    socket: &PathBuf,
+    owned_daemon: &Arc<DaemonLifetime>,
+    status: &Arc<Mutex<DaemonStatus>>,
+) -> Result<tau_client::Client> {
+    let mut failure = String::new();
+    for attempt in 0..2 {
+        status
+            .lock()
+            .map(|mut value| *value = DaemonStatus::Connecting)
+            .ok();
+        let client = connect_or_start(socket, owned_daemon).await?;
+        status
+            .lock()
+            .map(|mut value| *value = DaemonStatus::Negotiating)
+            .ok();
+        let negotiation = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.negotiate_checked(ProtocolNegotiateParams {
+                version: ProtocolVersion { major: 1, minor: 0 },
+                capabilities: required_capabilities(),
+            }),
+        )
+        .await;
+        match negotiation {
+            Ok(Ok(report)) if report.is_usable() => {
+                status
+                    .lock()
+                    .map(|mut value| {
+                        *value =
+                            if report.compatibility == tau_client::ProtocolCompatibility::Degraded {
+                                DaemonStatus::Degraded
+                            } else {
+                                DaemonStatus::Ready
+                            }
+                    })
+                    .ok();
+                return Ok(client);
+            }
+            Ok(Ok(report)) => {
+                failure = format!("missing capabilities: {:?}", report.missing_capabilities);
+            }
+            Ok(Err(error)) => failure = error.to_string(),
+            Err(_) => failure = "protocol negotiation timed out".into(),
+        }
+
+        let stopped_owned = if attempt == 0 {
+            owned_daemon
+                .0
+                .lock()
+                .ok()
+                .and_then(|mut daemon| daemon.take())
+                .map(|mut child| {
+                    stop_child(&mut child);
+                    true
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if stopped_owned {
+            status
+                .lock()
+                .map(|mut value| *value = DaemonStatus::Absent)
+                .ok();
+            continue;
+        }
+        break;
+    }
+    status
+        .lock()
+        .map(|mut value| *value = DaemonStatus::Incompatible)
+        .ok();
+    anyhow::bail!(
+        "Tau cannot use the running daemon: {failure}. If it was started separately, stop it and run `tau serve`, then choose Retry."
+    )
 }
 
 async fn daemon_reachable(socket: &PathBuf) -> bool {

@@ -58,6 +58,10 @@ fd-lock = "4"
 tempfile = "3"
 toml = "0.8"
 keyring = "3"
+base64 = "0.22"
+sha2 = "0.10"
+url = "2"
+reqwest = { version = "0.13", features = ["form", "json"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 rusqlite_migration = "2.5"
 uuid = { version = "1", features = ["v4"] }

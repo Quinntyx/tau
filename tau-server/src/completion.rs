@@ -66,18 +66,23 @@ async fn execute_inner(state: &AppState, job: &TurnJob) -> Result<Option<i64>> {
     let provider = match state.provider_override().cloned() {
         Some(provider) => provider,
         None => {
-            let provider_config = state.config().providers.get(provider_id);
             let credentials = CredentialStore::new()?;
-            let key = credentials.get(
-                provider_id,
-                provider_config.and_then(|c| c.api_key_env.as_deref()),
-            );
-            Provider::new(
-                provider_id,
-                model_id,
-                key.as_deref(),
-                provider_config.and_then(|c| c.api_base.as_deref()),
-            )?
+            if provider_id == OPENAI_CODEX_PROVIDER {
+                let tokens = tau_core::codex::fresh_tokens(&credentials).await?;
+                Provider::openai_codex(model_id, &tokens)?
+            } else {
+                let provider_config = state.config().providers.get(provider_id);
+                let key = credentials.get(
+                    provider_id,
+                    provider_config.and_then(|c| c.api_key_env.as_deref()),
+                );
+                Provider::new(
+                    provider_id,
+                    model_id,
+                    key.as_deref(),
+                    provider_config.and_then(|c| c.api_base.as_deref()),
+                )?
+            }
         }
     };
 

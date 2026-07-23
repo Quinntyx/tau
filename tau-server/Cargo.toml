@@ -21,6 +21,7 @@ fd-lock.workspace = true
 rig-core.workspace = true
 futures.workspace = true
 uuid.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tau-client.workspace = true

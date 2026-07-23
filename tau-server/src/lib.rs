@@ -24,6 +24,7 @@ use tokio::{
 };
 
 mod completion;
+mod oauth;
 pub mod runtime;
 
 /// Per-process server state shared with every connection.
@@ -38,6 +39,7 @@ pub struct AppState {
     policy: Arc<PolicyBroker>,
     provider_override: Option<tau_core::provider::Provider>,
     git_acks: Arc<Mutex<HashMap<String, bool>>>,
+    oauth: oauth::OAuthManager,
 }
 
 struct PolicyBroker {
@@ -85,6 +87,7 @@ impl AppState {
             policy: Arc::new(PolicyBroker::new()),
             provider_override: None,
             git_acks: Arc::new(Mutex::new(HashMap::new())),
+            oauth: oauth::OAuthManager::new(),
         }
     }
 
@@ -377,6 +380,10 @@ async fn handle_request(
         METHOD_PROJECT_UNREGISTER => project_unregister(id, req.params, state).await,
         METHOD_PROJECT_REACTIVATE => project_reactivate(id, req.params, state).await,
         METHOD_PROJECT_NEW_ID => project_new_id(id, req.params, state).await,
+        METHOD_AUTH_STATUS => auth_status(id, req.params, state).await,
+        METHOD_AUTH_BEGIN => auth_begin(id, req.params, state).await,
+        METHOD_AUTH_CANCEL => auth_cancel(id, req.params, state).await,
+        METHOD_AUTH_LOGOUT => auth_logout(id, req.params, state).await,
         METHOD_TURN_START => {
             if let Some(error) =
                 require_capability(id.clone(), negotiated, Capability::TurnStreaming).await
@@ -461,6 +468,54 @@ fn rpc_error(id: Id, code: i32, message: impl Into<String>) -> String {
         message.into(),
     ))
     .unwrap_or_default()
+}
+
+fn auth_params(id: &Id, params: Option<serde_json::Value>) -> Result<AuthProviderParams, String> {
+    let params = params
+        .and_then(|value| serde_json::from_value::<AuthProviderParams>(value).ok())
+        .ok_or_else(|| rpc_error(id.clone(), INVALID_PARAMS, "invalid account parameters"))?;
+    if params.provider != OPENAI_CODEX_PROVIDER {
+        return Err(rpc_error(
+            id.clone(),
+            INVALID_PARAMS,
+            format!("unsupported account provider: {}", params.provider),
+        ));
+    }
+    Ok(params)
+}
+
+async fn auth_status(id: Id, params: Option<serde_json::Value>, state: &AppState) -> String {
+    if let Err(error) = auth_params(&id, params) {
+        return error;
+    }
+    serde_json::to_string(&Response::ok(id, state.oauth.status().await)).unwrap_or_default()
+}
+
+async fn auth_begin(id: Id, params: Option<serde_json::Value>, state: &AppState) -> String {
+    if let Err(error) = auth_params(&id, params) {
+        return error;
+    }
+    match state.oauth.begin().await {
+        Ok(result) => serde_json::to_string(&Response::ok(id, result)).unwrap_or_default(),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
+}
+
+async fn auth_cancel(id: Id, params: Option<serde_json::Value>, state: &AppState) -> String {
+    if let Err(error) = auth_params(&id, params) {
+        return error;
+    }
+    serde_json::to_string(&Response::ok(id, state.oauth.cancel().await)).unwrap_or_default()
+}
+
+async fn auth_logout(id: Id, params: Option<serde_json::Value>, state: &AppState) -> String {
+    if let Err(error) = auth_params(&id, params) {
+        return error;
+    }
+    match state.oauth.logout().await {
+        Ok(result) => serde_json::to_string(&Response::ok(id, result)).unwrap_or_default(),
+        Err(error) => rpc_error(id, INTERNAL_ERROR, error.to_string()),
+    }
 }
 
 fn git_error(id: Id, error: impl std::fmt::Display) -> String {

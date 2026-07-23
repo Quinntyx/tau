@@ -1,6 +1,7 @@
 //! Convenience re-exports — `use tau_proto::prelude::*` pulls in the everyday
 //! protocol surface.
 
+pub use crate::auth::*;
 pub use crate::completion::{
     CompletionDelta, CompletionStreamParams, CompletionStreamResult, METHOD_COMPLETION_DELTA,
     METHOD_COMPLETION_STREAM, UsageSummary,

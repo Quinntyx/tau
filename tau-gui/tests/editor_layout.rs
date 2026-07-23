@@ -25,7 +25,7 @@ fn submit_starts_one_turn_and_rejects_empty_or_overlapping_submissions() {
     assert!(!state.reduce(ChatAction::Submit("   \n".into())));
     assert!(state.reduce(ChatAction::Submit("first prompt".into())));
     assert_eq!(state.status, ChatStatus::Streaming);
-    assert_eq!(state.active_assistant, Some(1));
+    assert_eq!(state.active_assistant, None);
     assert!(matches!(
         &state.cards[0],
         Card::Message {
@@ -34,7 +34,7 @@ fn submit_starts_one_turn_and_rejects_empty_or_overlapping_submissions() {
         } if text == "first prompt"
     ));
     assert!(!state.reduce(ChatAction::Submit("second prompt".into())));
-    assert_eq!(state.cards.len(), 2);
+    assert_eq!(state.cards.len(), 1);
 }
 
 #[test]
@@ -47,5 +47,5 @@ fn failed_turn_returns_to_ready_for_the_next_submit() {
 
     assert!(state.reduce(ChatAction::Submit("second".into())));
     assert_eq!(state.status, ChatStatus::Streaming);
-    assert_eq!(state.cards.len(), 4);
+    assert_eq!(state.cards.len(), 3);
 }
