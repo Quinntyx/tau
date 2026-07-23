@@ -822,6 +822,7 @@ pub fn bind_keys(cx: &mut App) {
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        let is_empty = self.content().is_empty();
         gpui::div()
             .key_context("TauPromptInput")
             .track_focus(&self.focus_handle(cx))
@@ -846,15 +847,22 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::history_previous_action))
             .on_action(cx.listener(Self::history_next_action))
             .cursor(gpui::CursorStyle::IBeam)
+            .relative()
             .flex()
             .w_full()
-            .min_h(px(72.))
-            .p(px(12.))
-            .bg(theme.surface)
-            .border_1()
-            .border_color(theme.separator)
-            .rounded_lg()
+            .min_h(px(48.))
+            .p_1()
             .when(self.disabled(), |element| element.opacity(0.6))
+            .when(is_empty, |element| {
+                element.child(
+                    gpui::div()
+                        .absolute()
+                        .top_1()
+                        .left_1()
+                        .text_color(theme.tertiary_text)
+                        .child("Ask anything (⌘L), @ to mention, / for workflows"),
+                )
+            })
             .child(TextElement { input: cx.entity() })
     }
 }

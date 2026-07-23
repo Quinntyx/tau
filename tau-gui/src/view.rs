@@ -3342,27 +3342,36 @@ impl Render for TauView {
                     .border_color(self.theme.separator)
                     .shadow_sm()
                     .child(self.input.clone())
-                    .child({
-                        let input = self.input.read(cx);
-                        let refs = input.file_references();
-                        let char_count = input.char_count();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(self.theme.tertiary_text)
-                            .children(refs.into_iter().map(|reference| {
+                    .when_some(
+                        {
+                            let input = self.input.read(cx);
+                            let refs = input.file_references();
+                            let char_count = input.char_count();
+                            (!refs.is_empty() || char_count > 0).then(|| (refs, char_count))
+                        },
+                        |card, (refs, char_count)| {
+                            card.child(
                                 div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(self.theme.elevated)
-                                    .text_color(self.theme.secondary_text)
-                                    .child(reference)
-                            }))
-                            .child(format!("{} characters", char_count))
-                    })
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(self.theme.tertiary_text)
+                                    .children(refs.into_iter().map(|reference| {
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(self.theme.elevated)
+                                            .text_color(self.theme.secondary_text)
+                                            .child(reference)
+                                    }))
+                                    .when(char_count > 0, |div| {
+                                        div.child(format!("{} characters", char_count))
+                                    }),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .flex()
