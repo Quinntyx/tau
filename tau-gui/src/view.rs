@@ -497,9 +497,14 @@ impl TauView {
         // retain the configured backend model and every configured preference
         // entry so a recent/favorite flag cannot hide otherwise valid models.
         let mut models = vec![backend.model().to_owned()];
-        let codex_model = format!("{OPENAI_CODEX_PROVIDER}/gpt-5.4");
-        if !models.iter().any(|candidate| candidate == &codex_model) {
-            models.push(codex_model);
+        let codex_models = [
+            format!("{OPENAI_CODEX_PROVIDER}/gpt-5.6-sol"),
+            format!("{OPENAI_CODEX_PROVIDER}/gpt-5.6"),
+        ];
+        for codex_model in &codex_models {
+            if !models.iter().any(|candidate| candidate == codex_model) {
+                models.push(codex_model.clone());
+            }
         }
         for model in preferences
             .favorites
@@ -507,11 +512,22 @@ impl TauView {
             .chain(preferences.recent_models.iter())
             .chain(preferences.selected_model.iter())
         {
-            if !models.iter().any(|candidate| candidate == model) {
-                models.push(model.clone());
+            let model = if model.contains("gpt-5.4") {
+                model.replace("gpt-5.4", "gpt-5.6-sol")
+            } else {
+                model.clone()
+            };
+            if !models.iter().any(|candidate| candidate == &model) {
+                models.push(model);
             }
         }
-        let selected_model = preferences.selected_model.clone();
+        let selected_model = preferences.selected_model.as_ref().map(|m| {
+            if m.contains("gpt-5.4") {
+                m.replace("gpt-5.4", "gpt-5.6-sol")
+            } else {
+                m.clone()
+            }
+        });
         let selected_agent = preferences.selected_agent.clone();
         let default_model = backend.model().to_owned();
         let models = models;
