@@ -12,6 +12,7 @@ use tau_proto::prelude::{
 
 use crate::backend::{Backend, DaemonAction, DaemonStatus};
 use crate::chat::{Card, ChatAction, ChatState, ChatStatus, EventKind, PermissionChoice, Role};
+use crate::components::*;
 use crate::composer::ComposerAction;
 use crate::feed;
 use crate::input::{TextInput, command_mode};
@@ -24,6 +25,7 @@ use crate::sessions::{
     Navigator, ProjectId as NavigatorProjectId, SessionSummary as NavigatorSession,
 };
 use crate::theme::Theme;
+use crate::views;
 
 gpui::actions!(
     tau_view,
@@ -1064,376 +1066,58 @@ impl TauView {
     }
 
     fn operations_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = if self.operations_loading {
-            "Loading…"
-        } else if let Some(error) = &self.operations_error {
-            error.as_str()
-        } else {
-            "Ready"
+        let tab = match self.operations_tab {
+            OperationsTab::Status => views::operations::OperationsTab::Status,
+            OperationsTab::Git => views::operations::OperationsTab::Git,
+            OperationsTab::Changes => views::operations::OperationsTab::Changes,
         };
-        let branch = if self.operations.branch.is_empty() {
-            "(unknown)"
-        } else {
-            &self.operations.branch
-        };
-        let acknowledgement = self
-            .operations
-            .acknowledgement
-            .map(|value| {
-                if value {
-                    "acknowledged"
-                } else {
-                    "not acknowledged"
-                }
-            })
-            .unwrap_or("—");
-        let active_tab = match self.operations_tab {
-            OperationsTab::Status => "Status",
-            OperationsTab::Git => "Git",
-            OperationsTab::Changes => "Changes",
-        };
-        let mut panel = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(self.theme.text)
-                    .child("Repository"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(self.theme.tertiary_text)
-                    .child(format!("Status · {status}")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(self.theme.secondary_text)
-                    .child(format!("Branch: {branch}")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(self.theme.tertiary_text)
-                    .child(format!("Ack · {acknowledgement}")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(self.theme.tertiary_text)
-                    .child(format!("Tab · {active_tab}")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(composer_pill(
-                        "Status",
-                        "operations-status",
-                        self.theme,
-                        cx.listener(|view, _, _, cx| {
-                            view.set_operations_tab(OperationsTab::Status, cx)
-                        }),
-                    ))
-                    .child(composer_pill(
-                        "Git",
-                        "operations-git",
-                        self.theme,
-                        cx.listener(|view, _, _, cx| {
-                            view.set_operations_tab(OperationsTab::Git, cx)
-                        }),
-                    ))
-                    .child(composer_pill(
-                        "Changes",
-                        "operations-changes",
-                        self.theme,
-                        cx.listener(|view, _, _, cx| {
-                            view.set_operations_tab(OperationsTab::Changes, cx)
-                        }),
-                    ))
-                    .child(composer_pill(
-                        "Refresh",
-                        "operations-refresh",
-                        self.theme,
-                        cx.listener(|view, _, _, cx| view.refresh_operations(cx)),
-                    )),
-            );
-        panel = panel.children(self.operations.files.iter().map(|file| {
-            let path = file.path.clone();
-            let callback_path = path.clone();
-            div()
-                .flex()
-                .justify_between()
-                .child(composer_pill(
-                    path,
-                    "operation-file",
-                    self.theme,
-                    cx.listener(move |view, _, _, cx| {
-                        view.open_operation_file(callback_path.clone(), cx)
-                    }),
-                ))
-                .child(if file.staged {
-                    "staged"
-                } else if file.untracked {
-                    "untracked"
-                } else {
-                    "modified"
-                })
-        }));
-        if let Some(file) = &self.operations.selected {
-            let stage_path = file.path.clone();
-            let unstage_path = file.path.clone();
-            let revert_path = file.path.clone();
-            let revision = crate::operations::content_revision(&file.content);
-            let keep_label = if self.operations.is_kept(&file.path, &revision) {
-                "Unkeep"
-            } else {
-                "Keep"
-            };
-            let mut details = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().text_color(self.theme.text).child(format!(
-                    "{}\n\nCONTENT\n{}\nDIFF\n{}",
-                    file.path, file.content, file.diff
-                )))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(composer_pill(
-                            "Stage",
-                            "op-stage",
-                            self.theme,
-                            cx.listener(move |view, _, _, cx| {
-                                view.operation_mutation(stage_path.clone(), "stage", cx)
-                            }),
-                        ))
-                        .child(composer_pill(
-                            "Unstage",
-                            "op-unstage",
-                            self.theme,
-                            cx.listener(move |view, _, _, cx| {
-                                view.operation_mutation(unstage_path.clone(), "unstage", cx)
-                            }),
-                        ))
-                        .child(mac_button(
-                            "Revert (confirm)",
-                            "op-revert",
-                            false,
-                            self.theme,
-                            cx.listener(move |view, _, _, cx| {
-                                view.operation_mutation(revert_path.clone(), "revert", cx)
-                            }),
-                        ))
-                        .child(composer_pill(
-                            keep_label,
-                            "op-keep",
-                            self.theme,
-                            cx.listener(|view, _, _, cx| view.keep_operation(cx)),
-                        )),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(self.theme.secondary_text)
-                        .child("Branches"),
-                );
-            details = details.children(self.operations.branches.iter().map(|branch| {
-                let name = branch.name.clone();
+        views::operations::render_operations_panel(
+            &self.operations,
+            self.operations_loading,
+            self.operations_error.as_deref(),
+            tab,
+            self.theme,
+            cx.listener(|view, _, _, cx| view.set_operations_tab(OperationsTab::Status, cx)),
+            cx.listener(|view, _, _, cx| view.set_operations_tab(OperationsTab::Git, cx)),
+            cx.listener(|view, _, _, cx| view.set_operations_tab(OperationsTab::Changes, cx)),
+            cx.listener(|view, _, _, cx| view.refresh_operations(cx)),
+            |path| {
+                let callback_path = path.clone();
+                Box::new(cx.listener(move |view, _, _, cx| {
+                    view.open_operation_file(callback_path.clone(), cx)
+                }))
+            },
+            |path, action| {
+                let callback_path = path.clone();
+                Box::new(cx.listener(move |view, _, _, cx| {
+                    view.operation_mutation(callback_path.clone(), action, cx)
+                }))
+            },
+            cx.listener(|view, _, _, cx| view.keep_operation(cx)),
+            |name| {
                 let callback_name = name.clone();
-                composer_pill(
-                    name,
-                    "op-branch",
-                    self.theme,
-                    cx.listener(move |view, _, _, cx| {
-                        view.switch_operation_branch(callback_name.clone(), cx)
-                    }),
-                )
-            }));
-            details = details.child(composer_pill(
-                "Create tau/gui-review",
-                "op-create-branch",
-                self.theme,
-                cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
-            ));
-            details = details.child(composer_pill(
-                "Acknowledge",
-                "op-acknowledge",
-                self.theme,
-                cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
-            ));
-            panel = panel.child(details);
-        }
-        panel
+                Box::new(cx.listener(move |view, _, _, cx| {
+                    view.switch_operation_branch(callback_name.clone(), cx)
+                }))
+            },
+            cx.listener(|view, _, _, cx| view.create_operation_branch(cx)),
+            cx.listener(|view, _, _, cx| view.acknowledge_operation(cx)),
+        )
     }
 
     fn account_sheet(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = div()
-            .w(px(520.))
-            .max_w_full()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .p_6()
-            .rounded_xl()
-            .border_1()
-            .border_color(self.theme.separator)
-            .bg(self.theme.elevated)
-            .text_color(self.theme.text)
-            .shadow_lg()
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_xl().child("ChatGPT account"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(self.theme.secondary_text)
-                                    .child("Use your Plus or Pro subscription with Codex."),
-                            ),
-                    )
-                    .child(mac_button(
-                        "Close",
-                        "account-close",
-                        false,
-                        self.theme,
-                        cx.listener(Self::close_account),
-                    )),
-            )
-            .when_some(self.auth_error.clone(), |view, error| {
-                view.child(
-                    div()
-                        .p_3()
-                        .rounded_md()
-                        .bg(self.theme.error_surface)
-                        .text_color(self.theme.error_text)
-                        .child(error),
-                )
-            });
-        let content = match &self.auth_status {
-            AuthState::SignedOut => content
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(self.theme.secondary_text)
-                        .child("Tau will open a secure browser authorization page. Your password is never visible to Tau."),
-                )
-                .child(mac_button(
-                    if self.auth_loading { "Connecting..." } else { "Connect ChatGPT" },
-                    "account-connect",
-                    true,
-                    self.theme,
-                    cx.listener(Self::begin_auth),
-                )),
-            AuthState::Pending { authorize_url } => content
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(div().text_sm().child("Authorization is waiting in your browser."))
-                        .child(
-                            div()
-                                .p_3()
-                                .rounded_md()
-                                .bg(self.theme.canvas)
-                                .text_xs()
-                                .text_color(self.theme.accent)
-                                .child(authorize_url.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(mac_button(
-                            "Open Browser",
-                            "account-open-browser",
-                            true,
-                            self.theme,
-                            cx.listener(Self::open_auth_url),
-                        ))
-                        .child(mac_button(
-                            "Copy Link",
-                            "account-copy-link",
-                            false,
-                            self.theme,
-                            cx.listener(Self::copy_auth_url),
-                        ))
-                        .child(mac_button(
-                            "Cancel",
-                            "account-cancel",
-                            false,
-                            self.theme,
-                            cx.listener(Self::cancel_auth),
-                        )),
-                ),
-            AuthState::SignedIn { email, account_id } => content
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .p_3()
-                        .rounded_md()
-                        .bg(self.theme.success_surface)
-                        .text_color(self.theme.success_text)
-                        .child("Connected")
-                        .children(email.iter().cloned().map(|value| div().text_sm().child(value)))
-                        .children(account_id.iter().cloned().map(|value| {
-                            div()
-                                .text_xs()
-                                .text_color(self.theme.secondary_text)
-                                .child(value)
-                        })),
-                )
-                .child(testable_button(
-                    "Sign Out",
-                    0x8b3038,
-                    "account-logout",
-                    cx.listener(Self::logout_auth),
-                )),
-            AuthState::Failed { message } => content
-                .child(
-                    div()
-                        .p_3()
-                        .rounded_md()
-                        .bg(self.theme.error_surface)
-                        .text_color(self.theme.error_text)
-                        .child(message.clone()),
-                )
-                .child(mac_button(
-                    "Try Again",
-                    "account-retry",
-                    true,
-                    self.theme,
-                    cx.listener(Self::begin_auth),
-                )),
-        };
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p_6()
-            .bg(rgba(0x00000099))
-            .child(content)
+        views::account::render_account_sheet(
+            &self.auth_status,
+            self.auth_loading,
+            self.auth_error.as_deref(),
+            self.theme,
+            cx.listener(Self::close_account),
+            cx.listener(Self::begin_auth),
+            cx.listener(Self::open_auth_url),
+            cx.listener(Self::copy_auth_url),
+            cx.listener(Self::cancel_auth),
+            cx.listener(Self::logout_auth),
+        )
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -2700,108 +2384,29 @@ impl Render for TauView {
         if self.follow_output {
             self.transcript_scroll.scroll_to_bottom();
         }
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .h(px(52.))
-            .px_4()
-            .border_b_1()
-            .border_color(self.theme.separator)
-            .bg(self.theme.toolbar)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Tau"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(mac_button(
-                        "New Chat",
-                        "new-chat-button",
-                        true,
-                        self.theme,
-                        cx.listener(Self::new_chat),
-                    ))
-                    .child(mac_button(
-                        if self.sessions_open {
-                            "Hide sessions"
-                        } else {
-                            "Sessions"
-                        },
-                        "sessions-button",
-                        false,
-                        self.theme,
-                        cx.listener(Self::toggle_sessions),
-                    ))
-                    .child(mac_button(
-                        if self.sidebar_visible {
-                            "Hide Inspector"
-                        } else {
-                            "Show Inspector"
-                        },
-                        "sidebar-button",
-                        false,
-                        self.theme,
-                        cx.listener(|view, _, _, cx| {
-                            view.sidebar_visible = next_sidebar_visibility(view.sidebar_visible);
-                            cx.notify();
-                        }),
-                    ))
-                    .child(mac_button(
-                        if self.follow_output {
-                            "Following"
-                        } else {
-                            "Follow output"
-                        },
-                        "follow-button",
-                        false,
-                        self.theme,
-                        cx.listener(|view, _, _, cx| {
-                            view.follow_output = next_follow_state(view.follow_output);
-                            if view.follow_output {
-                                view.transcript_scroll.scroll_to_bottom();
-                            }
-                            cx.notify();
-                        }),
-                    ))
-                    .child(mac_button(
-                        "Settings",
-                        "settings-button",
-                        false,
-                        self.theme,
-                        cx.listener(Self::open_account),
-                    ))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(self.theme.secondary_text)
-                            .cursor_pointer()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::click_model))
-                            .child(format!(
-                                "{}  ·  {}",
-                                current_model,
-                                match self.backend.daemon_status() {
-                                    DaemonStatus::Absent => "Absent",
-                                    DaemonStatus::Spawning => "Spawning",
-                                    DaemonStatus::Connecting => "Connecting",
-                                    DaemonStatus::Negotiating => "Negotiating",
-                                    DaemonStatus::Incompatible => "Incompatible",
-                                    DaemonStatus::Degraded => "Degraded",
-                                    DaemonStatus::Ready => match &self.chat.status {
-                                        ChatStatus::Ready => "Ready",
-                                        ChatStatus::Streaming => "Thinking...",
-                                        ChatStatus::Failed(_) => "Request failed",
-                                    },
-                                    DaemonStatus::Failed => "Failed",
-                                }
-                            )),
-                    ),
-            );
+        let header = views::header::render_header(
+            current_model,
+            self.sessions_open,
+            self.sidebar_visible,
+            self.follow_output,
+            self.backend.daemon_status(),
+            self.theme,
+            cx.listener(Self::new_chat),
+            cx.listener(Self::toggle_sessions),
+            cx.listener(|view, _, _, cx| {
+                view.sidebar_visible = next_sidebar_visibility(view.sidebar_visible);
+                cx.notify();
+            }),
+            cx.listener(|view, _, _, cx| {
+                view.follow_output = next_follow_state(view.follow_output);
+                if view.follow_output {
+                    view.transcript_scroll.scroll_to_bottom();
+                }
+                cx.notify();
+            }),
+            cx.listener(Self::open_account),
+            cx.listener(Self::click_model),
+        );
         let runtime_banner = match &self.runtime {
             RuntimeState::NotNegotiated => Some((
                 "Runtime is not negotiated. Send a message to begin protocol negotiation.",
@@ -3363,7 +2968,7 @@ impl Render for TauView {
                             let input = self.input.read(cx);
                             let refs = input.file_references();
                             let char_count = input.char_count();
-                            (!refs.is_empty() || char_count > 0).then(|| (refs, char_count))
+                            (!refs.is_empty() || char_count > 0).then_some((refs, char_count))
                         },
                         |card, (refs, char_count)| {
                             card.child(
@@ -3552,127 +3157,6 @@ fn to_navigator_session(session: tau_client::SessionSummary) -> NavigatorSession
         updated_at: session.updated_at,
         archived: session.archived_at.is_some(),
     }
-}
-
-fn sidebar_card(title: &str, value: &str, theme: Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_3()
-        .rounded_md()
-        .bg(theme.surface)
-        .border_1()
-        .border_color(theme.separator)
-        .child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.tertiary_text)
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.text)
-                .child(value.to_string()),
-        )
-}
-
-fn mac_button<T>(
-    label: impl Into<String>,
-    selector: &'static str,
-    primary: bool,
-    theme: Theme,
-    callback: T,
-) -> impl IntoElement
-where
-    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
-{
-    div()
-        .debug_selector(|| selector.into())
-        .h(px(32.))
-        .px_3()
-        .flex()
-        .items_center()
-        .rounded_md()
-        .bg(if primary {
-            theme.accent
-        } else {
-            theme.elevated
-        })
-        .text_color(if primary { rgb(0xffffff) } else { theme.text })
-        .hover(move |style| {
-            style.bg(if primary {
-                theme.accent_hover
-            } else {
-                theme.surface
-            })
-        })
-        .cursor_pointer()
-        .on_mouse_up(MouseButton::Left, callback)
-        .child(label.into())
-}
-
-fn toast_button<T>(label: impl Into<String>, color: u32, callback: T) -> impl IntoElement
-where
-    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
-{
-    div()
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .bg(rgb(color))
-        .hover(|style| style.opacity(0.9))
-        .cursor_pointer()
-        .on_mouse_up(MouseButton::Left, callback)
-        .child(label.into())
-}
-
-fn testable_button<T>(
-    label: impl Into<String>,
-    color: u32,
-    selector: &'static str,
-    callback: T,
-) -> impl IntoElement
-where
-    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
-{
-    div()
-        .debug_selector(|| selector.into())
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .bg(rgb(color))
-        .hover(|style| style.opacity(0.9))
-        .cursor_pointer()
-        .on_mouse_up(MouseButton::Left, callback)
-        .child(label.into())
-}
-
-fn composer_pill<T>(
-    label: impl Into<String>,
-    selector: &'static str,
-    theme: Theme,
-    callback: T,
-) -> impl IntoElement
-where
-    T: Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
-{
-    div()
-        .debug_selector(|| selector.into())
-        .h(px(28.))
-        .px_3()
-        .flex()
-        .items_center()
-        .rounded_md()
-        .bg(theme.elevated)
-        .text_color(theme.secondary_text)
-        .text_xs()
-        .hover(move |style| style.bg(theme.surface))
-        .cursor_pointer()
-        .on_mouse_up(MouseButton::Left, callback)
-        .child(label.into())
 }
 
 #[cfg(test)]

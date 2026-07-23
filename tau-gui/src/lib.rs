@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod chat;
+pub mod components;
 pub mod composer;
 pub mod feed;
 pub mod input;
@@ -13,6 +14,7 @@ pub mod sessions;
 pub mod shell;
 pub mod theme;
 pub mod view;
+pub mod views;
 
 use std::path::PathBuf;
 
